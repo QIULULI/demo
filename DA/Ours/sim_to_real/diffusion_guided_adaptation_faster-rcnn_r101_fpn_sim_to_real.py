@@ -1,7 +1,7 @@
 _base_ = [  # 指定要继承的基础配置列表
     '../../_base_/models/diffusion_guided_adaptation_faster_rcnn_r101_fpn.py',  # 基础模型结构定义
     '../../_base_/da_setting/semi_20k.py',  # 半监督域自适应训练调度
-    '../../_base_/datasets/sim_to_real/semi_drone_rgb_aug.py'  # 新增的仿真到真实数据配置
+    '../../_base_/datasets/sim_to_real/semi_drone_ir_rgb_aug.py'  # 新增的仿真到真实数据配置
 ]  # 结束基础配置定义
 detector = _base_.model  # 从基础配置拷贝域自适应检测器设置
 detector.data_preprocessor = dict(  # 重写数据预处理模块
