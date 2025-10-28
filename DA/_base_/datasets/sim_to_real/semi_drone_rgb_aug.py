@@ -65,7 +65,7 @@ weak_pipeline = [  # 定义弱增广流水线供教师模型使用
         meta_keys=(  # 所需元信息
             'img_id', 'img_path', 'ori_shape', 'img_shape', 'scale_factor', 'flip', 'flip_direction', 'homography_matrix')),  # 保留基础元数据
 ]  # 结束弱增广流水线
-sup_pipeline = [  # 定义监督数据基础流水线
+sup_pipeline_rgb = [  # 定义监督数据基础流水线（RGB）
     dict(type='LoadImageFromFile', backend_args=backend_args),  # 读取源域图像
     dict(type='LoadAnnotations', with_bbox=True),  # 加载边界框标注
     dict(type='Resize', scale=(1600, 900), keep_ratio=True),  # 调整分辨率并保持纵横比
@@ -81,6 +81,11 @@ sup_pipeline = [  # 定义监督数据基础流水线
         branch_field=branch_field,  # 指定分支名称
         sup=sup_aug_pipeline),  # 监督分支使用额外增广
 ]  # 结束监督流水线
+sup_pipeline_ir = sup_pipeline_rgb.copy()
+sup_pipeline_ir[0] = dict(  # IR 图像加载需要显式展开通道
+    type='LoadImageFromFile',
+    backend_args=backend_args,
+    color_type='color_ignore_orientation')
 unsup_pipeline = [  # 定义无监督数据流水线
     dict(type='LoadImageFromFile', backend_args=backend_args),  # 读取目标域图像
     dict(type='LoadEmptyAnnotations'),  # 不加载标注，仅占位
@@ -107,14 +112,25 @@ test_pipeline = [  # 定义验证测试流水线
 ]  # 结束测试流水线
 batch_size = 16  # 设置训练批大小
 num_workers = 16  # 设置加载线程数
-labeled_dataset = dict(  # 定义带标注源域数据集
+labeled_dataset_rgb = dict(  # 定义仿真RGB带标注数据集
     type=dataset_type,  # 使用 COCO 数据集类
     data_root=data_root,  # 指定数据根目录
     metainfo=dict(classes=classes),  # 设置类别信息
-    ann_file='sim_drone_ann/rgb/train.json',  # 指向仿真源域训练标注
-    data_prefix=dict(img='sim_drone_rgb/Town01_Opt/carla_data/'),  # 指向仿真图像目录
+    ann_file='sim_drone_ann/rgb/train.json',  # 指向仿真RGB训练标注
+    data_prefix=dict(img='sim_drone_rgb/Town01_Opt/carla_data/images_rgb/'),  # 指向RGB图像目录
     filter_cfg=dict(filter_empty_gt=True),  # 过滤无标注图像
-    pipeline=sup_pipeline)  # 采用监督流水线
+    pipeline=sup_pipeline_rgb)  # 采用RGB监督流水线
+labeled_dataset_ir = dict(  # 定义仿真IR带标注数据集
+    type=dataset_type,  # 使用 COCO 数据集类
+    data_root=data_root,  # 指定数据根目录
+    metainfo=dict(classes=classes),  # 设置类别信息
+    ann_file='sim_drone_ann/ir/train.json',  # 指向仿真IR训练标注
+    data_prefix=dict(img='sim_drone_ir/Town01_Opt/carla_data/images_ir/'),  # 指向IR图像目录
+    filter_cfg=dict(filter_empty_gt=True),  # 过滤无标注图像
+    pipeline=sup_pipeline_ir)  # 采用IR监督流水线
+labeled_dataset = dict(  # 组合仿真RGB与IR数据集
+    type='ConcatDataset',
+    datasets=[labeled_dataset_rgb, labeled_dataset_ir])
 unlabeled_dataset = dict(  # 定义无标注目标域数据集
     type=dataset_type,  # 使用 COCO 数据集类
     data_root=data_root,  # 指定数据根目录
