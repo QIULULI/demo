@@ -143,8 +143,20 @@ sh ./tools/dist_train.sh DG/Ours/cityscapes/diffusion_guided_generalization_fast
 For ***Diffusion Guided Adaptation Detector***  and  *Note* : you should check and set the *detector.diff_model.config* and *detector.diff_model.pretrained_model* correctly in [diffuison_guided_adaptation_faster-rcnn_r101_fpn_city_to_foggy.py](DA/Ours/city_to_foggy/diffuison_guided_adaptation_faster-rcnn_r101_fpn_city_to_foggy.py).
 
 ```shell
-sh ./tools/dist_train.sh DA/Ours/city_to_foggy/diffuison_guided_adaptation_faster-rcnn_r101_fpn_city_to_foggy.py  2  
+sh ./tools/dist_train.sh DA/Ours/city_to_foggy/diffuison_guided_adaptation_faster-rcnn_r101_fpn_city_to_foggy.py  2
 ```
+
+### 🧭 Drone diffusion-guided pipeline checkpoints
+
+The drone configs rely on a consistent set of checkpoint names so that every stage can locate its teacher without manual edits:
+
+| Stage | Config | Expected checkpoint |
+|-------|--------|---------------------|
+| 1. IR diffusion detector | `DG/Ours/drone/diffusion_detector_drone_ir_clear_day.py` | `work_dirs/DD_IR.pth` |
+| 2. IR diffusion-guided generalization | `DG/Ours/drone/diffusion_guided_generalization_faster-rcnn_r101_fpn_drone_ir.py` | `work_dirs/IR_DiffusionGuided_IR.pth` |
+| 3. RGB adaptation (sim→real) | `DA/Ours/sim_to_real/diffusion_guided_adaptation_faster-rcnn_r101_fpn_drone_sim_to_real.py` and `DA/Ours/ir_to_rgb/diffusion_guided_adaptation_faster-rcnn_r101_fpn_drone_ir_to_rgb.py` | `work_dirs/IR_DiffusionGuided_RGB.pth` |
+
+Ensure each stage exports its weights using the table above so downstream configs can discover the teacher checkpoints automatically.
 
 For ***COCO Generalization Benchmark*** , please see here `configs/diff/`
 
