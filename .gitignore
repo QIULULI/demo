@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
+*.ckpt
+*.pth
+*.pt
+data/
+outputs/
+work_dirs/
+stable-diffusion-1-5/

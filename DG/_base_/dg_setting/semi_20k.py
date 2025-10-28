@@ -6,7 +6,12 @@ default_hooks = dict(
     checkpoint=dict(type='CheckpointHook', interval=1000, by_epoch=False,
                     max_keep_ckpts=3, save_best=['teacher/coco/bbox_mAP_50', 'student/coco/bbox_mAP_50']),
     sampler_seed=dict(type='DistSamplerSeedHook'),
-    visualization=dict(type='DetVisualizationHook'))
+    visualization=dict(
+        type='DetVisualizationHook',
+        draw=True,              # 训练阶段也画
+        interval=100,           # 每 200 iter 画一批（可按需要加大/减小）
+        test_out_dir='work_dirs/drone_vis'  # 验证/测试结果统一落盘到这里
+    ))
 
 # env_cfg = dict(
 #     cudnn_benchmark=False,
@@ -34,7 +39,7 @@ resume = False
 # 如果burn_up_iters>max_iters, 则模型只进行源域训练
 
 burn_up_iters = 0
-train_cfg = dict(type='IterBasedTrainLoop', max_iters=20000, val_interval=1000)
+train_cfg = dict(type='IterBasedTrainLoop', max_iters=5000, val_interval=1000)
 val_cfg = dict(type='TeacherStudentValLoop')
 test_cfg = dict(type='TestLoop')
 param_scheduler = [
@@ -42,9 +47,9 @@ param_scheduler = [
     dict(
         type='MultiStepLR',
         begin=0,
-        end=20000,
+        end=5000,
         by_epoch=False,
-        milestones=[18000],
+        milestones=[3000, 4500], #18000
         gamma=0.1)
 ]
 

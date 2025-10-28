@@ -13,8 +13,8 @@ detector.data_preprocessor = dict(
     pad_size_divisor=64)
 
 detector.detector.roi_head.bbox_head.num_classes = 8
-detector.diff_model.config = 'DG/Ours/cityscapes/diffusion_detector_cityscapes.py'
-detector.diff_model.pretrained_model = '.pth'
+detector.diff_model.config = None#'DG/Ours/cityscapes/diffusion_detector_cityscapes.py'
+detector.diff_model.pretrained_model = None#'/userhome/liqiulu/code/Fitness-Generalization-Transferability/work_dirs/cityscapes_diffdg_r101/best_coco_bbox_mAP_50_iter_19000.pth'
 
 model = dict(
     _delete_=True,

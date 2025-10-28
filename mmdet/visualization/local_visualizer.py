@@ -125,6 +125,8 @@ class DetLocalVisualizer(Visualizer):
 
         if 'bboxes' in instances and instances.bboxes.sum() > 0:
             bboxes = instances.bboxes
+            if hasattr(bboxes, 'tensor'):    # 兼容 HorizontalBoxes/BaseBoxes
+                bboxes = bboxes.tensor
             labels = instances.labels
 
             max_label = int(max(labels) if len(labels) > 0 else 0)

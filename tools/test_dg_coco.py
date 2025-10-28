@@ -69,24 +69,25 @@ def main():
     args = parse_args()
 
     config_list = [
-        'DG/_base_/datasets/domain_generalization_coco/test_cityscapes.py',
-        'DG/_base_/datasets/domain_generalization_coco/test_bdd100k.py',
-        'DG/_base_/datasets/domain_generalization_coco/test_voc.py',
-        ###############################################################
-        'DG/_base_/datasets/domain_generalization_coco/test_foggy_cityscapes.py',
-        # 'DG/_base_/datasets/domain_generalization_coco/test_rainy_cityscapes.py',
-        ###############################################################
-        # 'DG/_base_/datasets/domain_generalization_coco/test_sim10k.py',
-        ###############################################################
-        'DG/_base_/datasets/domain_generalization_coco/test_clipart.py',
-        'DG/_base_/datasets/domain_generalization_coco/test_comic.py',
-        'DG/_base_/datasets/domain_generalization_coco/test_watercolor.py',
-        ###############################################################
-        'DG/_base_/datasets/domain_generalization_coco/test_daytime-foggy.py',
-        # 'DG/_base_/datasets/domain_generalization_coco/test_daytime-sunny.py',
-        'DG/_base_/datasets/domain_generalization_coco/test_dusk-rainy.py',
-        'DG/_base_/datasets/domain_generalization_coco/test_night-rainy.py',
-        'DG/_base_/datasets/domain_generalization_coco/test_night-sunny.py'
+        # 'DG/_base_/datasets/domain_generalization_coco/test_cityscapes.py',
+        # 'DG/_base_/datasets/domain_generalization_coco/test_bdd100k.py',
+        # 'DG/_base_/datasets/domain_generalization_coco/test_voc.py',
+        # ###############################################################
+        # 'DG/_base_/datasets/domain_generalization_coco/test_foggy_cityscapes.py',
+        # # 'DG/_base_/datasets/domain_generalization_coco/test_rainy_cityscapes.py',
+        # ###############################################################
+        # # 'DG/_base_/datasets/domain_generalization_coco/test_sim10k.py',
+        # ###############################################################
+        # 'DG/_base_/datasets/domain_generalization_coco/test_clipart.py',
+        # 'DG/_base_/datasets/domain_generalization_coco/test_comic.py',
+        # 'DG/_base_/datasets/domain_generalization_coco/test_watercolor.py',
+        # ###############################################################
+        # 'DG/_base_/datasets/domain_generalization_coco/test_daytime-foggy.py',
+        # # 'DG/_base_/datasets/domain_generalization_coco/test_daytime-sunny.py',
+        # 'DG/_base_/datasets/domain_generalization_coco/test_dusk-rainy.py',
+        # 'DG/_base_/datasets/domain_generalization_coco/test_night-rainy.py',
+        # 'DG/_base_/datasets/domain_generalization_coco/test_night-sunny.py',
+        'DG/_base_/datasets/domain_generalization_coco/test_drone_coco.py'
     ]
 
     for test_config in config_list:

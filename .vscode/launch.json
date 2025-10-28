@@ -1,0 +1,44 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Drone3D→COCO（正式）",
+      "type": "python",
+      "request": "launch",
+      "program": "/userhome/liqiulu/code/Fitness-Generalization-Transferability/tools/dataset_converters/drone3d_to_coco.py",
+      "args": [
+        "/userhome/liqiulu/data/drone_sim/data_collect/data_collect/Town01_Opt/carla_data",
+        "-o", "data/drone_sim_coco",
+        "--camera", "rgb",
+        "--train-ratio", "0.9",
+        "--vis", "10"
+      ],
+      "cwd": "/userhome/liqiulu/code/Fitness-Generalization-Transferability",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    },
+    {
+      "name": "Drone3D→COCO（快速调试，限前50张）",
+      "type": "python",
+      "request": "launch",
+      "program": "/userhome/liqiulu/code/Fitness-Generalization-Transferability/tools/dataset_converters/drone3d_to_coco.py",
+      "args": [
+        "/userhome/liqiulu/data/drone_sim/data_collect/data_collect/Town01_Opt/carla_data",
+        "-o", "data/drone_sim_coco_debug",
+        "--camera", "rgb",
+        "--train-ratio", "0.9",
+        "--vis", "10",
+        "--max-images", "50"
+      ],
+      "cwd": "/userhome/liqiulu/code/Fitness-Generalization-Transferability",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    }
+  ]
+}

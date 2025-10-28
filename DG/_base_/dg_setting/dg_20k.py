@@ -7,7 +7,12 @@ default_hooks = dict(
         type='CheckpointHook', interval=1000, by_epoch=False,
         max_keep_ckpts=3, save_best=['coco/bbox_mAP_50']),
     sampler_seed=dict(type='DistSamplerSeedHook'),
-    visualization=dict(type='DetVisualizationHook'))
+    visualization=dict(
+        type='DetVisualizationHook',
+        draw=True,              # 训练阶段也画
+        interval=500,           # 每 500 iter 画一批（可按需要加大/减小）
+        test_out_dir='drone_vis'  # 验证/测试结果统一落盘到这里
+    ))
 
 # env_cfg = dict(
 #     cudnn_benchmark=False,
@@ -39,9 +44,11 @@ param_scheduler = [
         begin=0,
         end=20000,
         by_epoch=False,
-        milestones=[18000],
+        milestones=[18000],#[3000, 4500], #18000
         gamma=0.1)
 ]
+
+
 
 optim_wrapper = dict(
     type='OptimWrapper',

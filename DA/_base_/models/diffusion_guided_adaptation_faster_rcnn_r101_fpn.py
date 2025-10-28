@@ -21,11 +21,11 @@ model = dict(
         data_preprocessor=detector.data_preprocessor),
     semi_train_cfg=dict(
         student_pretrained=None,
-        freeze_teacher=True,
+        freeze_teacher=True, #try False
         sup_weight=1.0,
         unsup_weight=1.0,
-        cls_pseudo_thr=0.5,
+        cls_pseudo_thr=0.5, #try 0.3
         min_pseudo_bbox_wh=(1e-2, 1e-2)),
-    semi_test_cfg=dict(predict_on='teacher'),
+    semi_test_cfg=dict(predict_on='teacher'), #try student
 
 )
