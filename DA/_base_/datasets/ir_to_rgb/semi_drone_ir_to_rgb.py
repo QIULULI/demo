@@ -191,10 +191,10 @@ classes = ('drone',)  # 定义单类别列表
 backend_args = None  # 使用默认文件读取后端
 branch_field = ['sup', 'unsup_teacher', 'unsup_student']  # 定义多分支流水线的键名
 # ----------------------------------------------------------------------------------------------------
-ir_img_prefix = '/userhome/liqiulu/data/drone_ir_clear_day/00001'  # 定义IR图像目录
-rgb_day_img_prefix = '/userhome/liqiulu/data/drone_rgb_clear_day/00001'  # 定义晴天RGB图像目录
-rgb_night_img_prefix = '/userhome/liqiulu/data/drone_rgb_clear_night/00001'  # 定义夜间RGB图像目录
-rgb_snow_day_img_prefix = '/userhome/liqiulu/data/drone_rgb_snow_day/00001'  # 定义雪天RGB图像目录
+ir_img_prefix = 'real_drone_ir/train/'  # 真实红外训练图像目录
+rgb_day_img_prefix = 'real_drone_rgb/train/'  # 真实可见光训练图像目录
+rgb_night_img_prefix = 'real_drone_rgb/val/'  # 真实可见光验证图像目录
+rgb_snow_day_img_prefix = 'real_drone_rgb/test/'  # 真实可见光测试图像目录
 # ----------------------------------------------------------------------------------------------------
 color_space_light = [  # 定义轻量颜色增强空间
     [dict(type='AutoContrast')],  # 自动对比度增强
@@ -311,7 +311,7 @@ labeled_dataset = dict(  # 定义有标签数据集
     type=dataset_type,  # COCO格式
     data_root=data_root,  # 标注根目录
     metainfo=dict(classes=classes),  # 类别信息
-    ann_file='drone_ann/single_clear_day_ir/train.json',  # IR训练标注
+    ann_file='real_drone_ann/train_infrared.json',  # IR训练标注
     data_prefix=dict(img=ir_img_prefix),  # IR图像目录
     filter_cfg=dict(filter_empty_gt=True),  # 过滤无目标
     pipeline=sup_pipeline)  # 使用监督流水线
@@ -320,7 +320,7 @@ unlabeled_dataset = dict(  # 定义无标签数据集
     type=dataset_type,  # COCO格式
     data_root=data_root,  # 标注根目录
     metainfo=dict(classes=classes),  # 类别信息
-    ann_file='drone_ann/single_clear_day_rgb/train.json',  # RGB伪标注占位文件
+    ann_file='real_drone_ann/train_visible.json',  # RGB伪标注占位文件
     data_prefix=dict(img=rgb_day_img_prefix),  # RGB图像目录
     pipeline=unsup_pipeline)  # 使用无标签流水线
 # ----------------------------------------------------------------------------------------------------
@@ -331,7 +331,7 @@ train_dataloader = dict(  # 定义训练数据加载器
     sampler=dict(type='GroupMultiSourceSampler', batch_size=batch_size, source_ratio=[1, 1]),  # 定义源目标1:1采样
     dataset=dict(type='ConcatDataset', datasets=[labeled_dataset, unlabeled_dataset]))  # 拼接两种数据集
 # ----------------------------------------------------------------------------------------------------
-val_dataloader = dict(  # 定义验证数据加载器（晴天RGB）
+val_dataloader = dict(  # 定义真实域验证数据加载器
     batch_size=1,  # 单张评估
     num_workers=8,  # 工作进程
     persistent_workers=True,  # 复用线程
@@ -341,36 +341,39 @@ val_dataloader = dict(  # 定义验证数据加载器（晴天RGB）
         type=dataset_type,  # COCO格式
         data_root=data_root,  # 标注根目录
         metainfo=dict(classes=classes),  # 类别信息
-        ann_file='drone_ann/single_clear_day_rgb/val.json',  # 晴天RGB验证标注
-        data_prefix=dict(img=rgb_day_img_prefix),  # 晴天图像目录
+        ann_file='real_drone_ann/val_visible.json',  # 可见光验证标注
+        data_prefix=dict(img=rgb_night_img_prefix),  # 可见光验证图像目录
         test_mode=True,  # 测试模式
         filter_cfg=dict(filter_empty_gt=True),  # 过滤无目标
         pipeline=test_pipeline))  # 使用测试流水线
 # ----------------------------------------------------------------------------------------------------
-test_dataloader = dict(  # 定义夜间测试数据加载器
+test_dataloader = dict(  # 定义真实域测试数据加载器
     batch_size=1,  # 单张评估
     num_workers=8,  # 工作进程
     persistent_workers=True,  # 复用线程
     drop_last=False,  # 不丢弃尾批
     sampler=dict(type='DefaultSampler', shuffle=False),  # 顺序采样
-    dataset=dict(  # 定义夜间测试数据集
+    dataset=dict(  # 定义测试数据集
         type=dataset_type,  # COCO格式
         data_root=data_root,  # 标注根目录
         metainfo=dict(classes=classes),  # 类别信息
-        ann_file='drone_ann/single_clear_day_rgb/val.json',  # 雪天RGB验证标注
-        #data_prefix=dict(img=rgb_night_img_prefix),  # 夜间图像目录
-        data_prefix=dict(img=rgb_day_img_prefix),  # 雪天图像目录
+        ann_file='real_drone_ann/test_visible.json',  # 可见光测试标注
+        data_prefix=dict(img=rgb_snow_day_img_prefix),  # 可见光测试图像目录
         test_mode=True,  # 测试模式
         filter_cfg=dict(filter_empty_gt=True),  # 过滤无目标
         pipeline=test_pipeline))  # 使用测试流水线
 # ----------------------------------------------------------------------------------------------------
-val_evaluator = dict(  # 定义晴天验证评估器
+val_evaluator = dict(  # 定义验证评估器
     type='CocoMetric',  # COCO指标
-    ann_file=data_root + 'drone_ann/single_clear_day_rgb/val.json',  # 晴天标注路径
+    ann_file=data_root + 'real_drone_ann/val_visible.json',  # 验证标注路径
     metric='bbox',  # 边界框指标
     format_only=False)  # 直接计算指标
 # ----------------------------------------------------------------------------------------------------
-test_evaluator = val_evaluator
+test_evaluator = dict(  # 定义测试评估器
+    type='CocoMetric',  # COCO指标
+    ann_file=data_root + 'real_drone_ann/test_visible.json',  # 测试标注路径
+    metric='bbox',  # 边界框指标
+    format_only=False)  # 直接计算指标
 # test_evaluator = dict(  # 定义夜间测试评估器
 #     type='CocoMetric',  # COCO指标
 #     ann_file=data_root + 'drone_ann/single_snow_day_rgb/val.json',  # 夜间标注路径
