@@ -173,70 +173,70 @@ class GroupMultiSourceSampler(MultiSourceSampler):
             shuffle=shuffle,
             seed=seed)
 
-        self._get_source_group_info()
-        num_sources = len(dataset.datasets)
-        self.group_source2inds = [{
-            source:
-            self._indices_of_rank(
-                self.group2size_per_source[source].get(group, 0))
-            for source in range(num_sources)
-        } for group in range(len(self.group_sizes))]
+        self._get_source_group_info()  # 调用内部方法以根据数据源收集分组统计信息
+        num_sources = len(dataset.datasets)  # 记录数据源的数量以便后续根据源索引迭代
+        self.group_source2inds = [{  # 为每一个分组构建一个字典存放对应数据源的索引迭代器
+            source:  # 当前数据源的索引键
+            self._indices_of_rank(  # 基于分布式环境切分无限索引流
+                self.group2size_per_source[source].get(group, 0))  # 使用该分组在当前源中的样本数作为迭代器长度
+            for source in range(num_sources)  # 遍历所有数据源以生成对应的迭代器
+        } for group in range(len(self.group_sizes))]  # 对所有出现过的分组进行上述映射构建
 
     def _get_source_group_info(self) -> None:
-        num_sources = len(self.dataset.datasets)
-        self.group2size_per_source = [
-            defaultdict(int) for _ in range(num_sources)
+        num_sources = len(self.dataset.datasets)  # 计算数据源数量以便初始化按源划分的结构
+        self.group2size_per_source = [  # 按数据源维护的分组样本计数字典列表
+            defaultdict(int) for _ in range(num_sources)  # 为每个数据源创建默认值为0的计数字典
         ]
-        self.group2inds_per_source = [
-            defaultdict(list) for _ in range(num_sources)
+        self.group2inds_per_source = [  # 按数据源维护的分组索引列表字典
+            defaultdict(list) for _ in range(num_sources)  # 为每个数据源创建默认值为空列表的索引容器
         ]
-        for source, dataset in enumerate(self.dataset.datasets):
-            for idx in range(len(dataset)):
-                data_info = dataset.get_data_info(idx)
-                width, height = data_info['width'], data_info['height']
-                group = 0 if width < height else 1
-                self.group2size_per_source[source][group] += 1
-                self.group2inds_per_source[source][group].append(idx)
+        for source, dataset in enumerate(self.dataset.datasets):  # 遍历每个数据源及其数据集
+            for idx in range(len(dataset)):  # 遍历当前数据源内的每一条样本索引
+                data_info = dataset.get_data_info(idx)  # 读取样本信息以获取图像尺寸
+                width, height = data_info['width'], data_info['height']  # 解包宽高信息
+                group = 0 if width < height else 1  # 按照纵横比规则确定分组编号
+                self.group2size_per_source[source][group] += 1  # 累加当前分组在该数据源内的样本数量
+                self.group2inds_per_source[source][group].append(idx)  # 记录当前样本在该分组的原始索引
 
-        if num_sources == 0:
-            self.group_sizes = np.zeros(0, dtype=np.int64)
-            self.group_ratio = np.zeros(0, dtype=np.float64)
-            return
+        if num_sources == 0:  # 当没有任何数据源时直接初始化空的分组统计并提前返回
+            self.group_sizes = np.zeros(0, dtype=np.int64)  # 使用空数组表示没有分组样本数
+            self.group_ratio = np.zeros(0, dtype=np.float64)  # 使用空数组表示没有分组概率
+            return  # 无需继续统计
 
-        max_group = 0
-        for group2size in self.group2size_per_source:
-            if group2size:
-                max_group = max(max_group, max(group2size.keys()))
+        max_group = 0  # 记录出现过的最大分组编号用于确定数组长度
+        for group2size in self.group2size_per_source:  # 遍历每个数据源的分组计数
+            if group2size:  # 当该数据源存在分组数据时
+                max_group = max(max_group, max(group2size.keys()))  # 更新最大分组编号
 
-        self.group_sizes = np.zeros(max_group + 1, dtype=np.int64)
-        for group2size in self.group2size_per_source:
-            for group, size in group2size.items():
-                self.group_sizes[group] += size
-        total = int(self.group_sizes.sum())
-        if total == 0:
-            raise ValueError('All groups are empty, unable to sample data.')
-        self.group_ratio = self.group_sizes / total
+        self.group_sizes = np.zeros(max_group + 1, dtype=np.int64)  # 根据最大分组编号初始化总计数数组
+        for group2size in self.group2size_per_source:  # 再次遍历每个数据源的分组计数
+            for group, size in group2size.items():  # 累加每个分组在该数据源中的样本数
+                self.group_sizes[group] += size  # 写入分组总样本数
+        total = int(self.group_sizes.sum())  # 计算所有分组样本数之和
+        if total == 0:  # 若总体样本数为零表示无可采样数据
+            raise ValueError('All groups are empty, unable to sample data.')  # 抛出异常提示
+        self.group_ratio = self.group_sizes / total  # 将每个分组样本数归一化得到采样概率
 
     def __iter__(self) -> Iterator[int]:
-        if len(self.group_ratio) == 0:
-            raise RuntimeError('No group information available for sampling.')
-        batch_buffer = []
-        while True:
-            group = np.random.choice(
-                list(range(len(self.group_ratio))), p=self.group_ratio)
-            for source, num in enumerate(self.num_per_source):
-                batch_buffer_per_source = []
-                group_indices = self.group2inds_per_source[source].get(
-                    group, [])
-                if not group_indices and num == 0:
-                    continue
-                for idx in self.group_source2inds[group][source]:
-                    if idx >= len(group_indices):
-                        break
-                    idx = group_indices[idx] + self.cumulative_sizes[source]
-                    batch_buffer_per_source.append(idx)
-                    if len(batch_buffer_per_source) == num:
-                        batch_buffer += batch_buffer_per_source
-                        break
-            yield from batch_buffer
-            batch_buffer = []
+        if len(self.group_ratio) == 0:  # 当分组概率为空时无法进行采样
+            raise RuntimeError('No group information available for sampling.')  # 抛出异常提示调用方
+        batch_buffer = []  # 初始化批次缓存列表
+        while True:  # 构造无限迭代器以持续提供索引
+            group = np.random.choice(  # 按照分组概率随机选择当前批次所属的分组
+                list(range(len(self.group_ratio))), p=self.group_ratio)  # 提供所有分组编号以及对应概率
+            for source, num in enumerate(self.num_per_source):  # 遍历每个数据源及其在批次中的采样数
+                batch_buffer_per_source = []  # 初始化当前数据源的采样缓存
+                group_indices = self.group2inds_per_source[source].get(  # 获取当前分组在该数据源中的全部样本索引列表
+                    group, [])  # 若不存在该分组则返回空列表
+                if not group_indices and num == 0:  # 当该数据源不需要采样且没有可用索引时直接跳过
+                    continue  # 进入下一个数据源
+                for idx in self.group_source2inds[group][source]:  # 通过预生成的无限索引流获取候选样本
+                    if idx >= len(group_indices):  # 若索引超出该分组可用样本范围则停止
+                        break  # 中断当前数据源的采样循环
+                    idx = group_indices[idx] + self.cumulative_sizes[source]  # 将局部索引转换为全局ConcatDataset索引
+                    batch_buffer_per_source.append(idx)  # 追加到当前数据源的批次缓存
+                    if len(batch_buffer_per_source) == num:  # 当达到该数据源需要的样本数量时
+                        batch_buffer += batch_buffer_per_source  # 合并到整体批次缓存
+                        break  # 结束当前数据源的采样循环
+            yield from batch_buffer  # 将完整批次的索引依次产出
+            batch_buffer = []  # 清空批次缓存以便生成下一批
