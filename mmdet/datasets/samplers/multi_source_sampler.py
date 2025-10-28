@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import itertools
+from collections import defaultdict
 from typing import Iterator, List, Optional, Sized, Union
 
 import numpy as np
@@ -173,15 +174,22 @@ class GroupMultiSourceSampler(MultiSourceSampler):
             seed=seed)
 
         self._get_source_group_info()
+        num_sources = len(dataset.datasets)
         self.group_source2inds = [{
             source:
-            self._indices_of_rank(self.group2size_per_source[source][group])
-            for source in range(len(dataset.datasets))
-        } for group in range(len(self.group_ratio))]
+            self._indices_of_rank(
+                self.group2size_per_source[source].get(group, 0))
+            for source in range(num_sources)
+        } for group in range(len(self.group_sizes))]
 
     def _get_source_group_info(self) -> None:
-        self.group2size_per_source = [{0: 0, 1: 0}, {0: 0, 1: 0}]
-        self.group2inds_per_source = [{0: [], 1: []}, {0: [], 1: []}]
+        num_sources = len(self.dataset.datasets)
+        self.group2size_per_source = [
+            defaultdict(int) for _ in range(num_sources)
+        ]
+        self.group2inds_per_source = [
+            defaultdict(list) for _ in range(num_sources)
+        ]
         for source, dataset in enumerate(self.dataset.datasets):
             for idx in range(len(dataset)):
                 data_info = dataset.get_data_info(idx)
@@ -190,22 +198,42 @@ class GroupMultiSourceSampler(MultiSourceSampler):
                 self.group2size_per_source[source][group] += 1
                 self.group2inds_per_source[source][group].append(idx)
 
-        self.group_sizes = np.zeros(2, dtype=np.int64)
+        if num_sources == 0:
+            self.group_sizes = np.zeros(0, dtype=np.int64)
+            self.group_ratio = np.zeros(0, dtype=np.float64)
+            return
+
+        max_group = 0
+        for group2size in self.group2size_per_source:
+            if group2size:
+                max_group = max(max_group, max(group2size.keys()))
+
+        self.group_sizes = np.zeros(max_group + 1, dtype=np.int64)
         for group2size in self.group2size_per_source:
             for group, size in group2size.items():
                 self.group_sizes[group] += size
-        self.group_ratio = self.group_sizes / sum(self.group_sizes)
+        total = int(self.group_sizes.sum())
+        if total == 0:
+            raise ValueError('All groups are empty, unable to sample data.')
+        self.group_ratio = self.group_sizes / total
 
     def __iter__(self) -> Iterator[int]:
+        if len(self.group_ratio) == 0:
+            raise RuntimeError('No group information available for sampling.')
         batch_buffer = []
         while True:
             group = np.random.choice(
                 list(range(len(self.group_ratio))), p=self.group_ratio)
             for source, num in enumerate(self.num_per_source):
                 batch_buffer_per_source = []
+                group_indices = self.group2inds_per_source[source].get(
+                    group, [])
+                if not group_indices and num == 0:
+                    continue
                 for idx in self.group_source2inds[group][source]:
-                    idx = self.group2inds_per_source[source][group][
-                        idx] + self.cumulative_sizes[source]
+                    if idx >= len(group_indices):
+                        break
+                    idx = group_indices[idx] + self.cumulative_sizes[source]
                     batch_buffer_per_source.append(idx)
                     if len(batch_buffer_per_source) == num:
                         batch_buffer += batch_buffer_per_source
