@@ -52,16 +52,25 @@ class SemiBaseDiffDetector(BaseDetector):
 
         self.student = MODELS.build(detector.deepcopy())
         self.teacher = MODELS.build(detector.deepcopy())
-        self.diff_detector = None
-        if diff_model.config:
-            teacher_config = Config.fromfile(diff_model.config)
-            self.diff_detector = MODELS.build(teacher_config['model'])
-            if diff_model.pretrained_model:
-                load_checkpoint(self.diff_detector, diff_model.pretrained_model, map_location='cpu', strict=True)
-                self.diff_detector.cuda()
-                self.freeze(self.diff_detector)
-        if self.diff_detector is None:
-            self.diff_detector = self.student
+        self.diff_detector = None  # 初始化扩散教师占位符，默认为空
+        self.diff_teacher_bank = {}  # 初始化扩散教师字典，后续按传感器标签填充
+        parsed_diff_configs = self._normalize_diff_teacher_configs(diff_model)  # 解析输入配置，统一为{sensor:配置}格式
+        for sensor_tag, teacher_cfg in parsed_diff_configs.items():  # 遍历每个传感器的教师配置，逐一构建模型
+            config_path = teacher_cfg.get('config')  # 读取配置文件路径，用于后续构建模型
+            if not config_path:  # 若未提供配置文件，则跳过该教师，保持兼容旧逻辑
+                continue  # 跳过无效配置，避免错误构建
+            teacher_config = Config.fromfile(config_path)  # 根据配置文件加载完整的模型配置
+            teacher_model = MODELS.build(teacher_config['model'])  # 使用配置构建对应的扩散教师模型
+            pretrained_path = teacher_cfg.get('pretrained_model')  # 读取预训练权重路径，便于恢复已训练的教师
+            if pretrained_path:  # 若提供了预训练权重
+                load_checkpoint(teacher_model, pretrained_path, map_location='cpu', strict=True)  # 严格加载权重，确保结构匹配
+            teacher_model.cuda()  # 将教师模型搬移到GPU，以便推理时使用
+            self.freeze(teacher_model)  # 冻结教师参数，防止其在训练过程中被更新
+            self.diff_teacher_bank[sensor_tag] = teacher_model  # 将构建完成的教师注册到字典，键为传感器标签
+        if self.diff_teacher_bank:  # 若成功构建了至少一个扩散教师
+            self.diff_detector = next(iter(self.diff_teacher_bank.values()))  # 默认使用首个教师作为diff_detector，兼容旧接口
+        if self.diff_detector is None:  # 若未构建任何教师，则回退使用学生模型
+            self.diff_detector = self.student  # 保持旧逻辑，在无教师时直接使用学生模型
 
         self.semi_train_cfg = semi_train_cfg
         self.semi_test_cfg = semi_test_cfg
@@ -75,21 +84,86 @@ class SemiBaseDiffDetector(BaseDetector):
         for param in model.parameters():
             param.requires_grad = False
 
-    def cuda(self, device: Optional[str] = None) -> nn.Module:
+    @staticmethod
+    def _fetch_config_value(config_entry: Any, key: str, default=None):  # 工具函数：统一读取配置对象中的指定字段
+        if isinstance(config_entry, dict) and key in config_entry:  # 若配置是字典且存在对应键
+            return config_entry.get(key, default)  # 直接从字典获取对应值
+        if hasattr(config_entry, key):  # 若配置对象以属性形式存储
+            return getattr(config_entry, key)  # 通过属性访问取出目标值
+        if hasattr(config_entry, 'get'):  # 若配置对象实现了get方法（如ConfigDict）
+            try:  # 使用try避免异常导致流程中断
+                return config_entry.get(key, default)  # 调用get方法获取值
+            except Exception:  # 捕获潜在异常，保证稳健性
+                return default  # 出现异常时返回默认值
+        return default  # 若无法读取则返回默认值
+
+    @staticmethod
+    def _is_single_diff_config(config_entry: Any) -> bool:  # 判断给定对象是否描述单个教师配置
+        return any(  # 只要存在关键字段即可视为单个教师配置
+            SemiBaseDiffDetector._fetch_config_value(config_entry, key) is not None  # 检查关键字段是否存在
+            for key in ('config', 'pretrained_model', 'pretrained', 'sensor')  # 关键字段集合
+        )
+
+    def _normalize_diff_teacher_configs(self, diff_model: ConfigType) -> Dict[str, dict]:  # 解析diff教师配置并输出标准字典
+        normalized_configs = {}  # 存放解析后的结果，键为传感器标签
+        if diff_model is None:  # 若未提供扩散教师配置
+            return normalized_configs  # 直接返回空字典
+        parsing_queue: List[Tuple[Any, Optional[str]]] = []  # 初始化解析队列，元素包含配置对象及备用传感器标签
+        if isinstance(diff_model, (list, tuple)):  # 若输入为列表/元组
+            for item in diff_model:  # 遍历每个元素
+                parsing_queue.append((item, None))  # 加入队列，暂不指定传感器标签
+        else:  # 输入非序列
+            parsing_queue.append((diff_model, None))  # 统一加入队列处理
+        while parsing_queue:  # 逐个弹出进行解析
+            current_cfg, fallback_sensor = parsing_queue.pop(0)  # 取出当前配置及备用传感器标签
+            if isinstance(current_cfg, dict) and not self._is_single_diff_config(current_cfg):  # 若是嵌套字典且非单教师描述
+                for sensor_key, nested_cfg in current_cfg.items():  # 遍历子配置
+                    parsing_queue.append((nested_cfg, sensor_key))  # 将子配置加入队列，并携带上层传感器标签
+                continue  # 继续处理队列中的其他元素
+            if isinstance(current_cfg, (list, tuple)):  # 若当前项仍是列表/元组
+                for nested_cfg in current_cfg:  # 遍历内部元素
+                    parsing_queue.append((nested_cfg, fallback_sensor))  # 保留备用传感器标签递归处理
+                continue  # 跳过后续步骤，等待下次循环
+            sensor_key = self._fetch_config_value(current_cfg, 'sensor', fallback_sensor)  # 优先从配置中读取传感器标签
+            if sensor_key is None:  # 若仍未获得标签
+                sensor_key = 'default'  # 使用default作为占位标签，兼容旧逻辑
+            config_path = self._fetch_config_value(current_cfg, 'config')  # 提取配置文件路径
+            pretrained_path = self._fetch_config_value(current_cfg, 'pretrained_model')  # 提取预训练权重路径
+            if pretrained_path is None:  # 若未使用新字段名
+                pretrained_path = self._fetch_config_value(current_cfg, 'pretrained')  # 兼容旧字段名称
+            normalized_configs[sensor_key] = {  # 汇总解析结果
+                'config': config_path,  # 存储配置文件路径
+                'pretrained_model': pretrained_path  # 存储预训练权重路径
+            }
+        return normalized_configs  # 返回标准化后的配置字典
+
+    def cuda(self, device: Optional[str] = None) -> nn.Module:  # 重载cuda方法，确保所有扩散教师迁移到指定设备
         """Since teacher is registered as a plain object, it is necessary to
         put the teacher model to cuda when calling ``cuda`` function."""
-        self.diff_detector.cuda(device=device)
+        if self.diff_teacher_bank:  # 若存在多传感器扩散教师
+            for teacher_model in self.diff_teacher_bank.values():  # 遍历所有教师模型
+                teacher_model.cuda(device=device)  # 将每个教师迁移到指定设备
+        else:  # 若仅存在单一路径教师
+            self.diff_detector.cuda(device=device)  # 仅迁移默认的diff_detector，保持旧逻辑
         return super().cuda(device=device)
 
-    def to(self, device: Optional[str] = None) -> nn.Module:
+    def to(self, device: Optional[str] = None) -> nn.Module:  # 重载to方法，兼容多教师场景下的设备转换
         """Since teacher is registered as a plain object, it is necessary to
         put the teacher model to other device when calling ``to`` function."""
-        self.diff_detector.to(device=device)
+        if self.diff_teacher_bank:  # 若使用教师字典
+            for teacher_model in self.diff_teacher_bank.values():  # 遍历教师集合
+                teacher_model.to(device=device)  # 将教师迁移到目标设备
+        else:  # 若仍沿用旧逻辑
+            self.diff_detector.to(device=device)  # 转移默认的diff_detector
         return super().to(device=device)
 
-    def train(self, mode: bool = True) -> None:
+    def train(self, mode: bool = True) -> None:  # 重载train方法，统一保持教师处于评估模式
         """Set the same train mode for teacher and student model."""
-        self.diff_detector.train(False)
+        if self.diff_teacher_bank:  # 若启用了多教师架构
+            for teacher_model in self.diff_teacher_bank.values():  # 遍历所有教师
+                teacher_model.train(False)  # 强制教师维持评估模式，避免梯度更新
+        else:  # 若只有单教师
+            self.diff_detector.train(False)  # 保持默认教师在评估模式
         super().train(mode)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -233,17 +307,69 @@ class SemiBaseDiffDetector(BaseDetector):
             self, batch_inputs: Tensor, batch_data_samples: SampleList
     ) -> Tuple[SampleList, Optional[dict]]:
         """Get pseudo instances from teacher model."""
-        self.diff_detector.eval()
-        results_list, diff_feature = self.diff_detector.predict(
-            batch_inputs, batch_data_samples, rescale=False, return_feature=True)
-        batch_info = {}
-        for data_samples, results in zip(batch_data_samples, results_list):
-            data_samples.gt_instances = results.pred_instances
-            data_samples.gt_instances.bboxes = bbox_project(
-                data_samples.gt_instances.bboxes,
-                torch.from_numpy(data_samples.homography_matrix).inverse().to(
-                    self.data_preprocessor.device), data_samples.ori_shape)
-        return batch_data_samples, batch_info, diff_feature
+        if not self.diff_teacher_bank:  # 若未启用多教师，直接沿用默认diff_detector逻辑
+            self.diff_detector.eval()  # 将默认教师设置为评估模式
+            results_list, diff_feature = self.diff_detector.predict(  # 使用默认教师生成伪标签与特征
+                batch_inputs, batch_data_samples, rescale=False, return_feature=True)  # 传入批量数据并要求返回特征
+            batch_info = {}  # 初始化批处理信息占位符
+            for data_samples, results in zip(batch_data_samples, results_list):  # 遍历样本与预测结果
+                data_samples.gt_instances = results.pred_instances  # 写入伪实例以供后续训练
+                data_samples.gt_instances.bboxes = bbox_project(  # 将预测框映射回原图坐标系
+                    data_samples.gt_instances.bboxes,
+                    torch.from_numpy(data_samples.homography_matrix).inverse().to(
+                        self.data_preprocessor.device), data_samples.ori_shape)
+            if isinstance(diff_feature, (list, tuple)):  # 若返回的是按样本排列的特征序列
+                primary_features = list(diff_feature)  # 转换为列表以便后续统一封装
+            else:  # 若返回单一张量
+                primary_features = [diff_feature for _ in range(len(batch_data_samples))]  # 为每个样本复制一份引用
+            distill_feature = {  # 构造与多教师一致的返回结构
+                'primary': primary_features,  # 主教师特征列表
+                'peer': [dict() for _ in range(len(batch_data_samples))]  # 同伴特征占位，保持兼容
+            }
+            return batch_data_samples, batch_info, distill_feature  # 返回伪标签、批信息与特征
+
+        for teacher_model in self.diff_teacher_bank.values():  # 若存在多教师，先统一切换至评估模式
+            teacher_model.eval()  # 设置教师为评估模式，确保推理一致性
+        batch_info = {}  # 初始化批处理信息占位符
+        sample_count = len(batch_data_samples)  # 记录样本数量，便于构造输出容器
+        primary_feature_list: List[Any] = [None] * sample_count  # 为主教师特征预留位置
+        peer_feature_list: List[Dict[str, Any]] = [dict() for _ in range(sample_count)]  # 初始化同伴特征字典列表
+        sensor_to_indices: Dict[str, List[int]] = {}  # 构建传感器到样本索引的映射
+        for idx, data_samples in enumerate(batch_data_samples):  # 遍历批次中的每个样本
+            if not hasattr(data_samples, 'metainfo') or 'sensor' not in data_samples.metainfo:  # 若样本缺少传感器标签
+                raise KeyError(f'伪标签生成失败：第{idx}个数据样本缺失sensor标签。')  # 抛出清晰错误提示
+            sensor_tag = data_samples.metainfo['sensor']  # 读取传感器标签
+            if sensor_tag not in self.diff_teacher_bank:  # 若未找到对应教师
+                raise KeyError(f'伪标签生成失败：未找到传感器"{sensor_tag}"对应的扩散教师。')  # 抛出错误提示
+            sensor_to_indices.setdefault(sensor_tag, []).append(idx)  # 将样本索引归类到对应传感器
+        for sensor_tag, sample_indices in sensor_to_indices.items():  # 遍历每个传感器分组
+            teacher_model = self.diff_teacher_bank[sensor_tag]  # 获取当前传感器的主教师
+            group_inputs = batch_inputs[sample_indices]  # 按索引提取对应图像张量
+            group_samples_for_pred = [copy.deepcopy(batch_data_samples[i]) for i in sample_indices]  # 复制数据样本供教师推理使用
+            primary_results, primary_feature = teacher_model.predict(  # 使用主教师进行预测并返回特征
+                group_inputs, group_samples_for_pred, rescale=False, return_feature=True)
+            for local_idx, sample_idx in enumerate(sample_indices):  # 遍历组内样本
+                origin_sample = batch_data_samples[sample_idx]  # 获取原始数据样本
+                origin_sample.gt_instances = primary_results[local_idx].pred_instances  # 写入伪标签实例
+                origin_sample.gt_instances.bboxes = bbox_project(  # 逆映射预测框到原图空间
+                    origin_sample.gt_instances.bboxes,
+                    torch.from_numpy(origin_sample.homography_matrix).inverse().to(
+                        self.data_preprocessor.device), origin_sample.ori_shape)
+                primary_feature_list[sample_idx] = primary_feature[local_idx]  # 记录主教师特征，按原批序填充
+            for peer_sensor, peer_teacher in self.diff_teacher_bank.items():  # 遍历其它教师以获取交叉特征
+                if peer_sensor == sensor_tag:  # 跳过主教师自身
+                    continue  # 仅处理同伴教师
+                peer_inputs = batch_inputs[sample_indices]  # 使用相同图像张量作为输入
+                peer_samples = [copy.deepcopy(batch_data_samples[i]) for i in sample_indices]  # 复制样本以避免状态污染
+                _, peer_feature = peer_teacher.predict(  # 调用同伴教师获取特征
+                    peer_inputs, peer_samples, rescale=False, return_feature=True)
+                for local_idx, sample_idx in enumerate(sample_indices):  # 将同伴特征写入对应位置
+                    peer_feature_list[sample_idx][peer_sensor] = peer_feature[local_idx]  # 按传感器标签归档特征
+        distill_feature = {  # 汇总主教师与同伴教师特征
+            'primary': primary_feature_list,  # 主教师特征列表，顺序与批输入一致
+            'peer': peer_feature_list  # 同伴特征字典列表，每个元素对应一个样本
+        }
+        return batch_data_samples, batch_info, distill_feature  # 返回伪标签、批信息与多教师特征
 
     def project_pseudo_instances(self, batch_pseudo_instances: SampleList,
                                  batch_data_samples: SampleList) -> SampleList:
