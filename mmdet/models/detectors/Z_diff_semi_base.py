@@ -151,13 +151,14 @@ class SemiBaseDiffDetector(BaseDetector):
         losses.update(**self.loss_by_gt_instances(
             multi_batch_inputs['sup'], multi_batch_data_samples['sup']))
         origin_pseudo_data_samples, batch_info, diff_feature = self.get_pseudo_instances_diff(
-            multi_batch_inputs['unsup_teacher'], multi_batch_data_samples['unsup_teacher'])
+            multi_batch_inputs['unsup_teacher'], multi_batch_data_samples['unsup_teacher'])  # 中文注释：获取伪标签、批次信息以及原始的特征打包结果
+        parsed_diff_feature = self._parse_diff_feature(diff_feature, batch_info)  # 中文注释：对返回的特征结构进行标准化解析并在必要时补充批次信息
         multi_batch_data_samples['unsup_student'] = self.project_pseudo_instances(
             origin_pseudo_data_samples, multi_batch_data_samples['unsup_student'])
 
         losses.update(**self.loss_by_pseudo_instances(multi_batch_inputs['unsup_student'],
-                                                      multi_batch_data_samples['unsup_student'], batch_info))
-        return losses, diff_feature
+                                                      multi_batch_data_samples['unsup_student'], batch_info))  # 中文注释：计算学生分支伪标签损失并合并
+        return losses, parsed_diff_feature  # 中文注释：返回损失字典与解析后的特征包
 
     def loss_by_gt_instances(self, batch_inputs: Tensor,
                              batch_data_samples: SampleList) -> dict:
@@ -244,6 +245,25 @@ class SemiBaseDiffDetector(BaseDetector):
                 torch.from_numpy(data_samples.homography_matrix).inverse().to(
                     self.data_preprocessor.device), data_samples.ori_shape)
         return batch_data_samples, batch_info, diff_feature
+
+    def _parse_diff_feature(self, diff_feature: Any, batch_info: dict) -> dict:
+        """中文注释：将扩散教师返回的特征结构统一整理便于后续蒸馏使用。"""
+        main_teacher_feature = diff_feature  # 中文注释：默认主教师特征直接等于原始特征
+        cross_teacher_info = None  # 中文注释：初始化交叉教师信息为空
+        if isinstance(diff_feature, dict):  # 中文注释：当特征以字典形式提供时按约定键解析
+            main_teacher_feature = diff_feature.get('main_teacher', diff_feature.get('teacher_feature'))  # 中文注释：优先读取主教师特征键
+            cross_teacher_info = diff_feature.get('cross_teacher')  # 中文注释：获取交叉教师相关信息块
+        parsed_feature = {'main_teacher': main_teacher_feature}  # 中文注释：构建标准化返回字典并写入主教师特征
+        if cross_teacher_info is not None:  # 中文注释：若存在交叉教师信息则进一步整理
+            if isinstance(cross_teacher_info, dict):  # 中文注释：仅在结构为字典时尝试补充批次信息
+                cross_sensor = cross_teacher_info.get('sensor', 'cross_teacher')  # 中文注释：读取交叉教师的传感器标识若缺省则给默认值
+                cross_predictions = cross_teacher_info.get('predictions')  # 中文注释：获取交叉教师的预测结果用于下游组件
+                if cross_predictions is not None:  # 中文注释：当存在预测结果时写入批次信息供后续使用
+                    batch_info.setdefault('cross_teacher', {})  # 中文注释：确保批次信息中存在交叉教师条目
+                    batch_info['cross_teacher']['predictions'] = cross_predictions  # 中文注释：记录交叉教师的预测数据
+                    batch_info['cross_teacher']['sensor'] = cross_sensor  # 中文注释：补充交叉教师的传感器名称便于诊断
+            parsed_feature['cross_teacher'] = cross_teacher_info  # 中文注释：在标准化结果中保留完整的交叉教师信息
+        return parsed_feature  # 中文注释：返回解析后的特征字典
 
     def project_pseudo_instances(self, batch_pseudo_instances: SampleList,
                                  batch_data_samples: SampleList) -> SampleList:
