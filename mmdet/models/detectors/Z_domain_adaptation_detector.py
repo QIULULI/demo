@@ -1,6 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple  # 中文注释：引入Any用于处理动态结构的特征信息
 import torch
 from torch import Tensor
 
@@ -51,12 +51,25 @@ class DomainAdaptationDetector(BaseDetector):
         self.detector_name = detector.get('type')
         self.train_cfg = train_cfg
         
-        self.feature_loss_type = self.train_cfg.feature_loss_cfg.get(
-            'feature_loss_type')
-        self.feature_loss_weight = self.train_cfg.feature_loss_cfg.get(
-            'feature_loss_weight')
+        feature_loss_cfg = self.train_cfg.feature_loss_cfg  # 中文注释：提取特征蒸馏配置方便后续多次使用
+        self.feature_loss_type = feature_loss_cfg.get(
+            'feature_loss_type')  # 中文注释：读取主教师特征蒸馏所采用的损失类型
+        self.feature_loss_weight = feature_loss_cfg.get(
+            'feature_loss_weight')  # 中文注释：读取主教师特征蒸馏的损失权重
         self.feature_loss = KDLoss(
-            loss_weight=self.feature_loss_weight, loss_type=self.feature_loss_type)
+            loss_weight=self.feature_loss_weight, loss_type=self.feature_loss_type)  # 中文注释：构建主教师特征蒸馏损失实例
+        self.cross_feature_loss_weight = feature_loss_cfg.get(
+            'cross_feature_loss_weight', 0.0)  # 中文注释：读取交叉教师特征蒸馏的权重默认0保持兼容
+        self.cross_feature_loss = None  # 中文注释：初始化交叉教师特征蒸馏损失为空以便按需启用
+        if self.cross_feature_loss_weight > 0:  # 中文注释：仅当配置权重大于0时才实例化交叉教师损失
+            self.cross_feature_loss = KDLoss(
+                loss_weight=self.cross_feature_loss_weight, loss_type=self.feature_loss_type)  # 中文注释：构建交叉教师特征蒸馏损失
+        self.cross_consistency_cfg = feature_loss_cfg.get(
+            'cross_consistency_cfg', {})  # 中文注释：读取交叉教师分类与回归一致性配置默认空字典
+        self.cross_cls_loss_weight = self.cross_consistency_cfg.get(
+            'cls_weight', 0.0)  # 中文注释：获取交叉教师分类一致性损失的权重默认关闭
+        self.cross_reg_loss_weight = self.cross_consistency_cfg.get(
+            'reg_weight', 0.0)  # 中文注释：获取交叉教师回归一致性损失的权重默认关闭
         self.burn_up_iters = self.train_cfg.detector_cfg.get('burn_up_iters', 0)
         self.local_iter = 0
 
@@ -219,17 +232,65 @@ class DomainAdaptationDetector(BaseDetector):
         Returns:
             dict: A dictionary of loss components
         """
-        student_x = self.model.student.extract_feat(batch_inputs)
-        diff_x = diff_feature
-        losses = dict()
-        feature_loss = dict()
-        feature_loss['pkd_feature_loss'] = 0
-        for i, (student_feature, diff_feature) in enumerate(zip(student_x, diff_x)):
-            layer_loss = self.feature_loss(
-                student_feature, diff_feature)
-            feature_loss['pkd_feature_loss'] += layer_loss/len(diff_x)
-        losses.update(feature_loss)
-        return losses
+        student_x = self.model.student.extract_feat(batch_inputs)  # 中文注释：提取学生模型在输入图像上的多尺度特征
+        main_teacher_feature = diff_feature  # 中文注释：默认将传入特征视作主教师特征
+        cross_teacher_info = None  # 中文注释：初始化交叉教师信息为None
+        if isinstance(diff_feature, dict):  # 中文注释：当传入结构为字典时按约定键拆分主教师与交叉教师
+            main_teacher_feature = diff_feature.get('main_teacher')  # 中文注释：提取主教师的多尺度特征集合
+            cross_teacher_info = diff_feature.get('cross_teacher')  # 中文注释：提取交叉教师相关信息块
+        losses = dict()  # 中文注释：初始化最终损失字典
+        feature_loss = dict()  # 中文注释：准备记录特征蒸馏相关损失
+        feature_loss['pkd_feature_loss'] = 0  # 中文注释：初始化主教师特征蒸馏损失累积值
+        if main_teacher_feature is not None:  # 中文注释：仅在主教师特征有效时计算蒸馏损失
+            if isinstance(main_teacher_feature, (list, tuple)):  # 中文注释：当主教师特征为序列时直接使用
+                teacher_feature_list = main_teacher_feature  # 中文注释：记录主教师特征列表
+            else:  # 中文注释：若主教师特征非序列则包装成单元素列表保持统一
+                teacher_feature_list = [main_teacher_feature]  # 中文注释：构建仅含单层特征的列表
+            num_teacher_layers = max(len(teacher_feature_list), 1)  # 中文注释：计算主教师特征层数避免除零
+            for student_feature, teacher_feature in zip(student_x, teacher_feature_list):  # 中文注释：遍历对应层特征计算蒸馏损失
+                layer_loss = self.feature_loss(
+                    student_feature, teacher_feature)  # 中文注释：计算学生特征与主教师特征的蒸馏损失
+                feature_loss['pkd_feature_loss'] = feature_loss['pkd_feature_loss'] + layer_loss / num_teacher_layers  # 中文注释：将损失按层数平均累积
+        if cross_teacher_info is not None and self.cross_feature_loss is not None:  # 中文注释：若交叉教师信息存在且开启权重则计算额外特征蒸馏
+            cross_features = None  # 中文注释：初始化交叉教师特征容器
+            if isinstance(cross_teacher_info, dict):  # 中文注释：交叉教师信息为字典时尝试读取标准键
+                cross_features = cross_teacher_info.get('features', cross_teacher_info.get('main_feature'))  # 中文注释：读取交叉教师提供的多尺度特征
+            elif isinstance(cross_teacher_info, (list, tuple)):  # 中文注释：若直接给出序列则直接使用
+                cross_features = cross_teacher_info  # 中文注释：直接记录交叉教师特征序列
+            if cross_features is not None:  # 中文注释：仅当获取到有效的交叉教师特征时计算蒸馏损失
+                cross_feature_list = cross_features if isinstance(cross_features, (list, tuple)) else [cross_features]  # 中文注释：确保交叉特征以列表形式处理
+                num_cross_layers = max(len(cross_feature_list), 1)  # 中文注释：记录交叉教师特征层数避免除零
+                cross_loss_value = 0  # 中文注释：初始化交叉特征损失累计值
+                for student_feature, cross_feature in zip(student_x, cross_feature_list):  # 中文注释：遍历学生与交叉教师对应层
+                    layer_loss = self.cross_feature_loss(
+                        student_feature, cross_feature)  # 中文注释：计算每层的交叉教师特征蒸馏损失
+                    cross_loss_value = cross_loss_value + layer_loss / num_cross_layers  # 中文注释：按层数平均累积交叉特征损失
+                feature_loss['pkd_cross_feature_loss'] = cross_loss_value  # 中文注释：将交叉教师特征蒸馏损失写入结果字典
+        if cross_teacher_info is not None:  # 中文注释：若存在交叉教师附加信息则进一步计算一致性损失
+            feature_loss.update(self.loss_cross_feature(cross_teacher_info))  # 中文注释：调用辅助函数计算分类与回归一致性损失
+        losses.update(feature_loss)  # 中文注释：将所有特征相关损失合并到最终输出
+        return losses  # 中文注释：返回损失字典供训练流程使用
+
+    def loss_cross_feature(self, cross_teacher_info: Any) -> dict:
+        """中文注释：计算交叉教师提供的分类与回归一致性损失。"""
+        losses = dict()  # 中文注释：初始化一致性损失字典
+        if not isinstance(cross_teacher_info, dict):  # 中文注释：当交叉教师信息非字典时直接返回空损失
+            return losses  # 中文注释：保持接口兼容返回空结果
+        if self.cross_cls_loss_weight > 0:  # 中文注释：仅在分类一致性权重大于0时计算
+            cls_value = cross_teacher_info.get('cls_consistency')  # 中文注释：优先读取顶层分类一致性数值
+            if cls_value is None:  # 中文注释：若顶层缺失则尝试从嵌套结构读取
+                consistency_block = cross_teacher_info.get('consistency', {})  # 中文注释：获取可能的嵌套一致性字典
+                cls_value = consistency_block.get('cls')  # 中文注释：从嵌套字典读取分类一致性项
+            if cls_value is not None:  # 中文注释：只有在成功取得数值时才写入损失
+                losses['cross_cls_consistency_loss'] = cls_value * self.cross_cls_loss_weight  # 中文注释：按配置权重缩放分类一致性损失
+        if self.cross_reg_loss_weight > 0:  # 中文注释：仅在回归一致性权重大于0时计算
+            reg_value = cross_teacher_info.get('reg_consistency')  # 中文注释：优先读取顶层回归一致性数值
+            if reg_value is None:  # 中文注释：若未提供则尝试从嵌套结构读取
+                consistency_block = cross_teacher_info.get('consistency', {})  # 中文注释：获取可能的嵌套一致性字典
+                reg_value = consistency_block.get('reg')  # 中文注释：从嵌套字典读取回归一致性项
+            if reg_value is not None:  # 中文注释：确保存在有效数值再写入结果
+                losses['cross_reg_consistency_loss'] = reg_value * self.cross_reg_loss_weight  # 中文注释：按权重缩放回归一致性损失
+        return losses  # 中文注释：返回交叉教师一致性损失字典
 
 
 

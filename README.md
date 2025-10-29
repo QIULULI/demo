@@ -146,6 +146,14 @@ For ***Diffusion Guided Adaptation Detector***  and  *Note* : you should check a
 sh ./tools/dist_train.sh DA/Ours/city_to_foggy/diffuison_guided_adaptation_faster-rcnn_r101_fpn_city_to_foggy.py  2
 ```
 
+### 特征蒸馏配置说明
+
+- `feature_loss_cfg.cross_feature_loss_weight`：交叉教师特征蒸馏的权重，默认值为 `0.0`，保持旧版配置不变时该项自动跳过，仅在需要对交叉教师特征做额外约束时开启。
+- `feature_loss_cfg.cross_consistency_cfg.cls_weight`：交叉教师分类一致性损失权重，默认值为 `0.0`，用于控制交叉教师分类对齐信号的强弱。
+- `feature_loss_cfg.cross_consistency_cfg.reg_weight`：交叉教师回归一致性损失权重，默认值为 `0.0`，用于控制交叉教师回归对齐信号的强弱。
+
+以上新增字段全部默认关闭，可逐项调节并互相独立；当启用交叉教师时，其预测结果会带有 `sensor` 识别字段写入 `batch_info.cross_teacher`，方便后续诊断与扩展。
+
 ### 🧭 Drone diffusion-guided pipeline checkpoints
 
 The drone configs rely on a consistent set of checkpoint names so that every stage can locate its teacher without manual edits:

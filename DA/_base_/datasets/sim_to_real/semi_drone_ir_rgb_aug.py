@@ -71,6 +71,7 @@ def build_sup_aug_pipeline(  # 定义监督增强流水线构建函数
                 'flip',  # 元信息：是否翻转
                 'flip_direction',  # 元信息：翻转方向
                 'homography_matrix',  # 元信息：单应矩阵
+                'sensor',  # 元信息：传感器标识确保后续流程感知域来源
             ),  # 元信息字段元组结束
         ),  # PackDetInputs配置结束
     ])  # 通用后处理步骤添加完成
@@ -116,6 +117,7 @@ strong_pipeline = [  # 定义学生分支强增强流水线
             'flip',  # 元信息：是否翻转
             'flip_direction',  # 元信息：翻转方向
             'homography_matrix',  # 元信息：单应矩阵
+            'sensor',  # 元信息：传感器标识同步到强增强分支
         ),  # 元信息字段元组结束
     ),  # PackDetInputs配置结束
 ]  # 学生分支强增强流水线定义完成
@@ -133,6 +135,7 @@ weak_pipeline = [  # 定义教师分支弱增强流水线
             'flip',  # 元信息：是否翻转
             'flip_direction',  # 元信息：翻转方向
             'homography_matrix',  # 元信息：单应矩阵
+            'sensor',  # 元信息：传感器标识同步到弱增强分支
         ),  # 元信息字段元组结束
     ),  # PackDetInputs配置结束
 ]  # 教师分支弱增强流水线定义完成
@@ -154,16 +157,23 @@ sup_pipeline_template = [  # 构建监督分支通用流程
 # ------------------------------  # 分隔线
 # 通过模板构建完整监督流水线并插入多分支增强  # 说明下方函数
 # ------------------------------  # 占位分隔防止空行
-def build_sup_pipeline(branch_aug_pipeline):  # 定义函数根据增强流水线生成完整配置
+def build_sup_pipeline(branch_aug_pipeline, sensor_tag):  # 定义函数根据增强流水线生成完整配置并指定传感器标记
     pipeline = deepcopy(sup_pipeline_template)  # 深拷贝模板防止共享引用
+    pipeline.append(  # 在多分支处理前写入传感器标记
+        dict(  # 构造自定义传感器标记变换配置
+            type='SetSensorTag',  # 指定调用自定义SetSensorTag组件
+            sensor=sensor_tag,  # 设置当前监督分支对应的传感器名称
+        )  # SetSensorTag配置结束
+    )  # 追加操作结束
+    # 提示：未来新增监督分支步骤时务必维持逐行中文注释规范以便团队审阅
     pipeline.append(  # 向流水线末尾追加多分支模块
         dict(type='MultiBranch', branch_field=branch_field, sup=branch_aug_pipeline)  # 指定监督分支增强配置
     )  # 追加操作结束
     return pipeline  # 返回完整监督流水线
 # ------------------------------  # 分隔线
 # 生成RGB和IR监督流水线实例  # 说明下面赋值
-rgb_sup_pipeline = build_sup_pipeline(rgb_sup_aug_pipeline)  # 获取RGB监督流水线
-ir_sup_pipeline = build_sup_pipeline(ir_sup_aug_pipeline)  # 获取IR监督流水线
+rgb_sup_pipeline = build_sup_pipeline(rgb_sup_aug_pipeline, sensor_tag='sim_rgb')  # 获取RGB监督流水线并标记仿真RGB传感器
+ir_sup_pipeline = build_sup_pipeline(ir_sup_aug_pipeline, sensor_tag='sim_ir')  # 获取IR监督流水线并标记仿真IR传感器
 # ------------------------------  # 分隔线
 # 定义无监督分支整体流水线  # 说明下方列表
 unsup_pipeline = [  # 构建无监督流水线
@@ -178,6 +188,11 @@ unsup_pipeline = [  # 构建无监督流水线
         allow_negative_crop=True,  # 允许裁剪后无目标
     ),  # RandomCrop配置结束
     dict(type='RandomFlip', prob=0.5),  # 以0.5概率翻转
+    dict(  # 在分支拆分前统一标记真实RGB传感器来源
+        type='SetSensorTag',  # 调用自定义SetSensorTag组件
+        sensor='real_rgb',  # 指定无监督真实RGB样本的传感器名称
+    ),  # SetSensorTag配置结束
+    # 提示：更新无监督流水线时也需保持每行中文注释以延续当前规范
     dict(  # 多分支包装器
         type='MultiBranch',  # 指定多分支模块
         branch_field=branch_field,  # 指定分支标签
@@ -192,7 +207,7 @@ test_pipeline = [  # 构建测试阶段流水线
     dict(type='Resize', scale=(1600, 900), keep_ratio=True),  # 调整尺寸保持比例
     dict(  # 打包推理输入
         type='PackDetInputs',  # 使用PackDetInputs组件
-        meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape', 'scale_factor'),  # 指定保留元信息
+        meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape', 'scale_factor', 'sensor'),  # 指定保留元信息并追加传感器字段
     ),  # PackDetInputs配置结束
 ]  # 测试流水线定义完成
 # ------------------------------  # 分隔线
