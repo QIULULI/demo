@@ -193,7 +193,7 @@ For ***COCO Generalization Benchmark*** , please see config here `configs/diff` 
 ```shell
 sh ./tools/dist_test_dg_coco.sh ${CONFIG_FILE} ${CHECKPOINT_FILE} ${GPU_NUM}  # CONFIG_FILE is the configuration file you want to use, CHECKPOINT_FILE is the checkpoint file you want to use, GPU_NUM is the number of GPUs used
 ```
-## <a id="acknowledgments"></a> 🙏 Acknowledgments 
+## <a id="acknowledgments"></a> 🙏 Acknowledgments
 This work draws inspiration from the following code and settings as references. We extend our gratitude to these remarkable contributions:
 
 - [GDD](https://github.com/heboyong/Generalized-Diffusion-Detector)
@@ -202,6 +202,15 @@ This work draws inspiration from the following code and settings as references. 
 - [Diffusion-HyperFeature](https://github.com/Flamm64/GTA-V-World-Map)
 - [OA-DG](https://github.com/WoojuLee24/OA-DG)
 - [DivAlign](https://github.com/msohaildanish/DivAlign)
+
+## 🚀 双模态扩散教师训练与回流说明
+1. **训练命令**：使用下述指令启动双教师扩散蒸馏训练（默认GPU数量为8，可按需调整）。
+   ```bash
+   python tools/train.py DG/Ours/drone/diffusion_detector_drone_dual_ir_rgb.py --cfg-options work_dir=work_dirs/drone_dual_ir_rgb
+   ```
+2. **产物命名**：建议将最佳权重保存在`work_dirs/drone_dual_ir_rgb/best_dual_teacher_iterXXXX.pth`，便于后续域适应阶段在`detector.diff_model.teachers`中快速替换。
+3. **结果回流**：完成训练后，将上述权重路径回填到域适应配置（例如`DG/Ours/drone/diffusion_guided_generalization_faster-rcnn_r101_fpn_drone_ir.py`）的`detector.diff_model`字段，即可实现跨阶段知识迁移。
+4. **测试提示**：若仅执行评估或部署，请在运行前将`diffusion_detector_drone_dual_ir_rgb.py`中`detector.diff_model`字段清空（或通过`--cfg-options detector.diff_model.main_teacher=''`覆盖），避免冗余教师加载带来额外显存开销。
 
 
 ## <a id="license"></a> 🎫 License

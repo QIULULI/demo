@@ -50,27 +50,50 @@ class SemiBaseDiffDetector(BaseDetector):
         super().__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
 
-        self.student = MODELS.build(detector.deepcopy())
-        self.teacher = MODELS.build(detector.deepcopy())
-        self.diff_detector = None  # 初始化扩散教师占位符，默认为空
-        self.diff_teacher_bank = {}  # 初始化扩散教师字典，后续按传感器标签填充
-        parsed_diff_configs = self._normalize_diff_teacher_configs(diff_model)  # 解析输入配置，统一为{sensor:配置}格式
-        for sensor_tag, teacher_cfg in parsed_diff_configs.items():  # 遍历每个传感器的教师配置，逐一构建模型
-            config_path = teacher_cfg.get('config')  # 读取配置文件路径，用于后续构建模型
-            if not config_path:  # 若未提供配置文件，则跳过该教师，保持兼容旧逻辑
-                continue  # 跳过无效配置，避免错误构建
-            teacher_config = Config.fromfile(config_path)  # 根据配置文件加载完整的模型配置
-            teacher_model = MODELS.build(teacher_config['model'])  # 使用配置构建对应的扩散教师模型
-            pretrained_path = teacher_cfg.get('pretrained_model')  # 读取预训练权重路径，便于恢复已训练的教师
-            if pretrained_path:  # 若提供了预训练权重
-                load_checkpoint(teacher_model, pretrained_path, map_location='cpu', strict=True)  # 严格加载权重，确保结构匹配
-            teacher_model.cuda()  # 将教师模型搬移到GPU，以便推理时使用
-            self.freeze(teacher_model)  # 冻结教师参数，防止其在训练过程中被更新
-            self.diff_teacher_bank[sensor_tag] = teacher_model  # 将构建完成的教师注册到字典，键为传感器标签
-        if self.diff_teacher_bank:  # 若成功构建了至少一个扩散教师
-            self.diff_detector = next(iter(self.diff_teacher_bank.values()))  # 默认使用首个教师作为diff_detector，兼容旧接口
-        if self.diff_detector is None:  # 若未构建任何教师，则回退使用学生模型
-            self.diff_detector = self.student  # 保持旧逻辑，在无教师时直接使用学生模型
+        self.student = MODELS.build(detector.deepcopy())  # 构建学生模型副本
+        self.teacher = MODELS.build(detector.deepcopy())  # 构建教师模型副本
+        self.diff_detector = None  # 初始化当前启用的扩散教师指针
+        self.diff_detectors = dict()  # 构建一个字典用于缓存所有扩散教师
+        self.active_diff_key = None  # 记录当前激活的扩散教师标识
+        teacher_pool = None  # 初始化教师配置池占位
+        if isinstance(diff_model, dict):  # 当diff_model为常规字典或ConfigDict时提取多教师配置
+            teacher_pool = diff_model.get('teachers', None)  # 读取teachers列表
+        if teacher_pool:  # 若提供多教师配置列表
+            for teacher_cfg in teacher_pool:  # 遍历每个教师配置条目
+                teacher_name = teacher_cfg.get('name')  # 读取教师名称（区分IR/RGB）
+                if not teacher_name:  # 若缺失名称则跳过以避免键冲突
+                    continue  # 直接跳过当前教师
+                teacher_config_path = teacher_cfg.get('config', '')  # 读取教师对应的配置文件路径
+                built_teacher = None  # 初始化教师模型占位
+                if teacher_config_path:  # 若提供独立配置文件
+                    teacher_config = Config.fromfile(teacher_config_path)  # 通过配置文件构建Config对象
+                    built_teacher = MODELS.build(teacher_config['model'])  # 根据配置构建教师模型
+                else:  # 若未提供配置则退回当前检测器结构
+                    built_teacher = MODELS.build(detector.deepcopy())  # 直接拷贝主检测器结构
+                pretrained_path = teacher_cfg.get('pretrained_model') or teacher_cfg.get('checkpoint')  # 读取权重路径
+                if pretrained_path:  # 若提供预训练权重
+                    load_checkpoint(built_teacher, pretrained_path, map_location='cpu', strict=True)  # 加载对应权重
+                built_teacher.cuda()  # 将教师模型放置到GPU上
+                self.freeze(built_teacher)  # 冻结教师模型参数
+                self.diff_detectors[teacher_name] = built_teacher  # 将教师模型缓存到字典中
+            if self.diff_detectors:  # 若成功构建至少一个教师
+                self.active_diff_key = diff_model.get('main_teacher') if isinstance(diff_model, dict) else None  # 读取首选教师标识
+                if not self.active_diff_key or self.active_diff_key not in self.diff_detectors:  # 若未指定或名称非法
+                    self.active_diff_key = next(iter(self.diff_detectors.keys()))  # 回退到字典第一个教师
+                self.diff_detector = self.diff_detectors[self.active_diff_key]  # 设置当前激活教师
+        if self.diff_detector is None and getattr(diff_model, 'config', None):  # 若尚未成功加载教师且存在旧式配置
+            teacher_config = Config.fromfile(diff_model.config)  # 解析旧式单教师配置
+            self.diff_detector = MODELS.build(teacher_config['model'])  # 构建扩散教师模型
+            if diff_model.pretrained_model:  # 若提供对应权重
+                load_checkpoint(self.diff_detector, diff_model.pretrained_model, map_location='cpu', strict=True)  # 加载权重
+                self.diff_detector.cuda()  # 将教师迁移到GPU
+                self.freeze(self.diff_detector)  # 冻结教师参数
+            self.diff_detectors['default'] = self.diff_detector  # 将单教师也放入缓存字典
+            self.active_diff_key = 'default'  # 记录当前教师标识
+        if self.diff_detector is None:  # 若仍未找到有效教师
+            self.diff_detector = self.student  # 使用学生模型作为退路教师
+            self.diff_detectors['student'] = self.student  # 将学生注册进教师字典
+            self.active_diff_key = 'student'  # 记录当前教师标识
 
         self.semi_train_cfg = semi_train_cfg
         self.semi_test_cfg = semi_test_cfg
@@ -140,30 +163,21 @@ class SemiBaseDiffDetector(BaseDetector):
     def cuda(self, device: Optional[str] = None) -> nn.Module:  # 重载cuda方法，确保所有扩散教师迁移到指定设备
         """Since teacher is registered as a plain object, it is necessary to
         put the teacher model to cuda when calling ``cuda`` function."""
-        if self.diff_teacher_bank:  # 若存在多传感器扩散教师
-            for teacher_model in self.diff_teacher_bank.values():  # 遍历所有教师模型
-                teacher_model.cuda(device=device)  # 将每个教师迁移到指定设备
-        else:  # 若仅存在单一路径教师
-            self.diff_detector.cuda(device=device)  # 仅迁移默认的diff_detector，保持旧逻辑
+        for detector_name, detector_module in getattr(self, 'diff_detectors', {}).items():  # 遍历所有扩散教师模块
+            detector_module.cuda(device=device)  # 将每个扩散教师迁移到指定设备
         return super().cuda(device=device)
 
     def to(self, device: Optional[str] = None) -> nn.Module:  # 重载to方法，兼容多教师场景下的设备转换
         """Since teacher is registered as a plain object, it is necessary to
         put the teacher model to other device when calling ``to`` function."""
-        if self.diff_teacher_bank:  # 若使用教师字典
-            for teacher_model in self.diff_teacher_bank.values():  # 遍历教师集合
-                teacher_model.to(device=device)  # 将教师迁移到目标设备
-        else:  # 若仍沿用旧逻辑
-            self.diff_detector.to(device=device)  # 转移默认的diff_detector
+        for detector_name, detector_module in getattr(self, 'diff_detectors', {}).items():  # 遍历全部扩散教师
+            detector_module.to(device=device)  # 将每个扩散教师迁移到目标设备
         return super().to(device=device)
 
     def train(self, mode: bool = True) -> None:  # 重载train方法，统一保持教师处于评估模式
         """Set the same train mode for teacher and student model."""
-        if self.diff_teacher_bank:  # 若启用了多教师架构
-            for teacher_model in self.diff_teacher_bank.values():  # 遍历所有教师
-                teacher_model.train(False)  # 强制教师维持评估模式，避免梯度更新
-        else:  # 若只有单教师
-            self.diff_detector.train(False)  # 保持默认教师在评估模式
+        for detector_name, detector_module in getattr(self, 'diff_detectors', {}).items():  # 遍历所有扩散教师
+            detector_module.train(False)  # 强制所有扩散教师保持评估模式
         super().train(mode)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -174,10 +188,20 @@ class SemiBaseDiffDetector(BaseDetector):
         the teacher parameters will not show up when calling
         ``self.parameters``, ``self.modules``, ``self.children`` methods.
         """
-        if name == 'diff_detector':
+        if name in ['diff_detector', 'diff_detectors']:
             object.__setattr__(self, name, value)
         else:
             super().__setattr__(name, value)
+
+    def set_active_diff_detector(self, name: str) -> None:
+        """根据名称切换当前使用的扩散教师模型。"""
+        if not hasattr(self, 'diff_detectors'):  # 若尚未初始化教师字典则直接返回
+            return  # 无需进一步处理
+        if name not in self.diff_detectors:  # 若指定名称不存在
+            return  # 忽略非法请求
+        object.__setattr__(self, 'diff_detector', self.diff_detectors[name])  # 直接替换当前扩散教师引用
+        self.active_diff_key = name  # 更新当前教师标识
+        self.diff_detector.train(False)  # 确保新教师保持评估模式
 
     def loss(self, multi_batch_inputs: Dict[str, Tensor],
              multi_batch_data_samples: Dict[str, SampleList]) -> dict:
