@@ -93,8 +93,10 @@ class DomainGeneralizationDetector(BaseDetector):
         self.local_iter += 1
         return losses
 
-    def predict(self, batch_inputs: Tensor,
-                batch_data_samples: SampleList) -> SampleList:
+    def predict(self, batch_inputs: Tensor,  # 新增中文注释：输入的图像张量
+                batch_data_samples: SampleList,  # 新增中文注释：输入的样本信息列表
+                rescale: bool = True,  # 新增中文注释：是否对最终预测结果进行还原缩放
+                return_feature: bool = False) -> SampleList:  # 新增中文注释：是否返回特征用于后续蒸馏等操作
         """Predict results from a batch of inputs and data samples with post-
         processing.
 
@@ -105,12 +107,16 @@ class DomainGeneralizationDetector(BaseDetector):
                 `gt_instance`, `gt_panoptic_seg` and `gt_sem_seg`.
             rescale (bool): Whether to rescale the results.
                 Defaults to True.
+            return_feature (bool): Whether to return additional feature
+                representations from detector heads when supported.
+                Defaults to False.
 
         Returns:
-            list[:obj:`DetDataSample`]: Return the detection results of the
-            input images. The returns value is DetDataSample,
-            which usually contain 'pred_instances'. And the
-            ``pred_instances`` usually contains following keys.
+            list[:obj:`DetDataSample`] or tuple: When ``return_feature`` is
+            False, returns only the detection results. When True, returns
+            a tuple containing detection results list and corresponding
+            feature representations compatible with
+            ``SemiBaseDiffDetector.get_pseudo_instances_diff``.
 
                 - scores (Tensor): Classification scores, has a shape
                     (num_instance, )
@@ -120,15 +126,41 @@ class DomainGeneralizationDetector(BaseDetector):
                     the last dimension 4 arrange as (x1, y1, x2, y2).
                 - masks (Tensor): Has a shape (num_instances, H, W).
         """
-        if self.with_student:
-            if self.model.semi_test_cfg.get('predict_on', 'teacher') == 'teacher':
-                return self.model.teacher(batch_inputs, batch_data_samples, mode='predict')
-            elif self.model.semi_test_cfg.get('predict_on', 'teacher') == 'student':
-                return self.model.student(batch_inputs, batch_data_samples, mode='predict')
-            elif self.model.semi_test_cfg.get('predict_on', 'teacher') == 'diff_detector':
-                return self.model.diff_detector(batch_inputs, batch_data_samples, mode='predict')
-        else:
-            return self.model(batch_inputs, batch_data_samples, mode='predict')
+        result = None  # 新增中文注释：初始化预测结果变量
+        if self.with_student:  # 新增中文注释：判断当前模型是否包含学生模型分支
+            predict_on = self.model.semi_test_cfg.get('predict_on', 'teacher')  # 新增中文注释：获取推理时应使用的模型分支
+            if predict_on == 'teacher':  # 新增中文注释：若选择教师模型进行预测
+                result = self.model.teacher(  # 新增中文注释：调用教师模型并传递缩放及特征返回参数
+                    batch_inputs,  # 新增中文注释：教师模型的图像输入
+                    batch_data_samples,  # 新增中文注释：教师模型的样本数据输入
+                    mode='predict',  # 新增中文注释：指定教师模型处于预测模式
+                    rescale=rescale,  # 新增中文注释：传递是否还原缩放的标志
+                    return_feature=return_feature)  # 新增中文注释：传递是否返回特征的开关
+            elif predict_on == 'student':  # 新增中文注释：若选择学生模型进行预测
+                result = self.model.student(  # 新增中文注释：调用学生模型并传递相同参数
+                    batch_inputs,  # 新增中文注释：学生模型的图像输入
+                    batch_data_samples,  # 新增中文注释：学生模型的样本数据输入
+                    mode='predict',  # 新增中文注释：指定学生模型处于预测模式
+                    rescale=rescale,  # 新增中文注释：传递是否还原缩放的标志
+                    return_feature=return_feature)  # 新增中文注释：传递是否返回特征的开关
+            elif predict_on == 'diff_detector':  # 新增中文注释：若选择扩散检测器进行预测
+                result = self.model.diff_detector(  # 新增中文注释：调用扩散检测器并传递相同参数
+                    batch_inputs,  # 新增中文注释：扩散检测器的图像输入
+                    batch_data_samples,  # 新增中文注释：扩散检测器的样本数据输入
+                    mode='predict',  # 新增中文注释：指定扩散检测器处于预测模式
+                    rescale=rescale,  # 新增中文注释：传递是否还原缩放的标志
+                    return_feature=return_feature)  # 新增中文注释：传递是否返回特征的开关
+        else:  # 新增中文注释：若不存在师生结构则直接调用底层模型
+            result = self.model(  # 新增中文注释：调用基础模型并传递缩放与特征开关参数
+                batch_inputs,  # 新增中文注释：基础模型的图像输入
+                batch_data_samples,  # 新增中文注释：基础模型的样本数据输入
+                mode='predict',  # 新增中文注释：指定基础模型处于预测模式
+                rescale=rescale,  # 新增中文注释：传递是否还原缩放的标志
+                return_feature=return_feature)  # 新增中文注释：传递是否返回特征的开关
+
+        if return_feature and not isinstance(result, tuple):  # 新增中文注释：当需要特征且返回值非元组时进行兼容性处理
+            result = (result, None)  # 新增中文注释：包装为包含预测结果及占位特征的元组
+        return result  # 新增中文注释：返回最终的预测结果（及可选特征）
 
     def _forward(self, batch_inputs: Tensor,
                  batch_data_samples: SampleList) -> SampleList:

@@ -1,123 +1,3 @@
-# _base_ = [
-#     '../cityscapes/diffusion_detector_cityscapes.py',
-# ]
-
-# classes = ('drone',)
-
-# dataset_type = 'CocoDataset'
-# data_root = '/userhome/liqiulu/code/Fitness-Generalization-Transferability/data/'
-
-# img_prefix = '/userhome/liqiulu/data/drone_ir_clear_day/00001'
-# ann_prefix = 'drone_ann/single_clear_day_ir/'
-# backend_args = None
-
-# color_space_light = [
-#     [dict(type='AutoContrast')],
-#     [dict(type='Equalize')],
-#     [dict(type='Color')],
-#     [dict(type='Contrast')],
-#     [dict(type='Brightness')],
-#     [dict(type='Sharpness')],
-# ]
-
-# train_pipeline = [
-#     dict(type='LoadImageFromFile', backend_args=backend_args),
-#     dict(type='LoadAnnotations', with_bbox=True),
-#     dict(type='Resize', scale=(1600, 960), keep_ratio=True),
-#     dict(
-#         type='RandomCrop',
-#         crop_type='absolute',
-#         crop_size=(640, 640),
-#         recompute_bbox=True,
-#         allow_negative_crop=True,
-#     ),
-#     dict(type='FilterAnnotations', min_gt_bbox_wh=(1e-2, 1e-2)),
-#     dict(type='RandomFlip', prob=0.5),
-#     dict(type='RandAugment', aug_space=color_space_light, aug_num=1),
-#     dict(
-#         type='PackDetInputs',
-#         meta_keys=(
-#             'img_id',
-#             'img_path',
-#             'ori_shape',
-#             'img_shape',
-#             'scale_factor',
-#             'flip',
-#             'flip_direction',
-#             'homography_matrix',
-#         ),
-#     ),
-# ]
-
-# test_pipeline = [
-#     dict(type='LoadImageFromFile', backend_args=backend_args),
-#     dict(type='Resize', scale=(1600, 960), keep_ratio=True),
-#     dict(type='LoadAnnotations', with_bbox=True),
-#     dict(
-#         type='PackDetInputs',
-#         meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape', 'scale_factor'),
-#     ),
-# ]
-
-# train_dataloader = dict(
-#     batch_size=8,
-#     num_workers=8,
-#     persistent_workers=True,
-#     sampler=dict(type='DefaultSampler', shuffle=True),
-#     batch_sampler=dict(type='AspectRatioBatchSampler'),
-#     dataset=dict(
-#         type=dataset_type,
-#         data_root=data_root,
-#         metainfo=dict(classes=classes),
-#         ann_file=ann_prefix+'train.json',
-#         data_prefix=dict(img=img_prefix),
-#         filter_cfg=dict(filter_empty_gt=True),
-#         pipeline=train_pipeline,
-#     ),
-# )
-
-# val_dataloader = dict(
-#     batch_size=1,
-#     num_workers=8,
-#     persistent_workers=True,
-#     drop_last=False,
-#     sampler=dict(type='DefaultSampler', shuffle=False),
-#     dataset=dict(
-#         type=dataset_type,
-#         data_root=data_root,
-#         metainfo=dict(classes=classes),
-#         ann_file=ann_prefix+'val.json',
-#         data_prefix=dict(img=img_prefix),
-#         test_mode=True,
-#         filter_cfg=dict(filter_empty_gt=True),
-#         pipeline=test_pipeline,
-#     ),
-# )
-
-# test_dataloader = val_dataloader
-
-# val_evaluator = dict(
-#     type='CocoMetric',
-#     ann_file=data_root + ann_prefix + 'val.json',
-#     metric='bbox',
-#     format_only=False,
-# )
-
-# test_evaluator = val_evaluator
-
-# model = dict(
-#     roi_head=dict(bbox_head=dict(num_classes=1)),
-#     backbone=dict(diff_config=dict(classes=classes)),
-#     rpn_head=dict(
-#         anchor_generator=dict(
-#             type='AnchorGenerator',
-#             scales=[2, 4, 8],
-#             ratios=[0.33, 0.5, 1.0, 2.0],
-#             strides=[4, 8, 16, 32, 64],
-#         ),
-#     ),
-# )
-
 _base_ = [  # 指定需要继承的基础配置列表
     '../../_base_/models/faster-rcnn_diff_fpn.py',  # 继承扩散检测器的两阶段结构
     '../../_base_/dg_setting/dg_20k.py',  # 继承DG训练调度和可视化设置
@@ -127,7 +7,7 @@ classes = ('drone',)  # 定义单类别列表
 # ----------------------------------------------------------------------------------------------------
 dataset_type = 'CocoDataset'  # 指明数据集采用COCO标注格式
 data_root = 'data/'  # 设置标注文件的相对根目录
-ir_img_prefix = '/userhome/liqiulu/data/drone_ir_clear_day/00001'  # 定义IR图像所在的绝对目录
+ir_img_prefix = 'sim_drone_ir/Town01_Opt/carla_data/'  # 定义IR图像所在的绝对目录
 backend_args = None  # 关闭后端参数配置，使用默认文件读取方式
 # ----------------------------------------------------------------------------------------------------
 color_space_light = [  # 定义轻量级颜色增强操作空间
@@ -188,7 +68,7 @@ train_dataloader = dict(  # 配置训练数据加载器
         type=dataset_type,  # 使用COCO格式数据集
         data_root=data_root,  # 设置标注根目录
         metainfo=dict(classes=classes),  # 传入类别元信息
-        ann_file='drone_ann/single_clear_day_ir/train.json',  # 指定IR训练标注文件
+        ann_file='sim_drone_ann/ir/train.json',  # 指定IR训练标注文件
         data_prefix=dict(img=ir_img_prefix),  # 指定图像目录
         filter_cfg=dict(filter_empty_gt=True),  # 过滤无标注图片
         pipeline=train_pipeline))  # 使用前面定义的训练流水线
@@ -203,7 +83,7 @@ val_dataloader = dict(  # 配置验证数据加载器
         type=dataset_type,  # 同样使用COCO格式
         data_root=data_root,  # 指定标注根目录
         metainfo=dict(classes=classes),  # 指定类别信息
-        ann_file='drone_ann/single_clear_day_ir/val.json',  # 读取IR验证标注
+        ann_file='sim_drone_ann/ir/val.json',  # 读取IR验证标注
         data_prefix=dict(img=ir_img_prefix),  # 指定IR验证图像目录
         test_mode=True,  # 标记为测试模式
         filter_cfg=dict(filter_empty_gt=True),  # 过滤无标注样本
@@ -213,7 +93,7 @@ test_dataloader = val_dataloader  # 将测试配置与验证保持一致，方�
 # ----------------------------------------------------------------------------------------------------
 val_evaluator = dict(  # 定义验证指标
     type='CocoMetric',  # 使用COCO检测指标
-    ann_file=data_root + 'drone_ann/single_clear_day_ir/val.json',  # 指定验证标注文件完整路径
+    ann_file=data_root + 'sim_drone_ann/ir/val.json',  # 指定验证标注文件完整路径
     metric='bbox',  # 评估边界框指标
     format_only=False)  # 直接计算指标而非仅导出结果
 # ----------------------------------------------------------------------------------------------------

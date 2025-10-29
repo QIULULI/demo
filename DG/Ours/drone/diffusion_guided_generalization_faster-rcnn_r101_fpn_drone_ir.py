@@ -9,7 +9,7 @@ dataset_type = 'CocoDataset'  # 指定数据集类型为COCO格式
 
 data_root = 'data/'  # 定义默认数据根目录
 
-ir_img_prefix = '/userhome/liqiulu/data/drone_ir_clear_day/00001'  # 指定红外图像所在路径前缀
+ir_img_prefix = '/mnt/ssd/lql/Fitness-Generalization-Transferability/data/sim_drone_ir/Town01_Opt/carla_data'  # 指定红外图像所在路径前缀
 
 backend_args = None  # 指定图像加载后端参数为None以使用默认行为
 
@@ -71,7 +71,7 @@ train_dataloader = dict(  # 定义训练数据加载器
         type=dataset_type,  # 使用前面定义的COCO数据集类型
         data_root=data_root,  # 指定数据根目录
         metainfo=dict(classes=classes),  # 写入类别元信息
-        ann_file='drone_ann/single_clear_day_ir/train.json',  # 指定训练标注文件
+        ann_file='sim_drone_ann/ir/train.json',  # 指定训练标注文件
         data_prefix=dict(img=ir_img_prefix),  # 设置图像路径前缀
         filter_cfg=dict(filter_empty_gt=True),  # 过滤掉没有目标的图片
         pipeline=train_pipeline,  # 引用训练数据处理流水线
@@ -88,7 +88,7 @@ val_dataloader = dict(  # 定义验证数据加载器
         type=dataset_type,  # 指定数据集类型
         data_root=data_root,  # 指定数据根目录
         metainfo=dict(classes=classes),  # 写入类别元信息
-        ann_file='drone_ann/single_clear_day_ir/val.json',  # 指定验证标注文件
+        ann_file='sim_drone_ann/ir/val.json',  # 指定验证标注文件
         data_prefix=dict(img=ir_img_prefix),  # 设置图像路径前缀
         test_mode=True,  # 启用测试模式以跳过某些训练增强
         filter_cfg=dict(filter_empty_gt=True),  # 过滤没有目标的样本
@@ -100,7 +100,7 @@ test_dataloader = val_dataloader  # 复用验证数据加载器作为测试加�
 
 val_evaluator = dict(  # 定义验证评估器
     type='CocoMetric',  # 指定评估器类型为COCO指标
-    ann_file=data_root + 'drone_ann/single_clear_day_ir/val.json',  # 指定验证标注路径
+    ann_file=data_root + 'sim_drone_ann/ir/val.json',  # 指定验证标注路径
     metric='bbox',  # 指定评估指标为边界框
     format_only=False,  # 指定同时输出指标而非仅格式化结果
 )  # 验证评估器定义结束
@@ -129,7 +129,7 @@ detector.detector.rpn_head.anchor_generator = dict(  # 重设RPN锚框生成器
 
 detector.diff_model.config = 'DG/Ours/drone/diffusion_detector_drone_ir_clear_day.py'  # 指定扩散教师的配置文件路径
 
-detector.diff_model.pretrained_model = 'work_dirs/DD_IR.pth'  # 指定扩散教师的权重路径
+detector.diff_model.pretrained_model = '/mnt/ssd/lql/Fitness-Generalization-Transferability/work_dirs/diffusion_detector_drone_ir_clear_day/best_coco_bbox_mAP_50_iter_5000.pth'  # 指定扩散教师的权重路径
 
 model = dict(  # 重建域泛化检测器包装器
     _delete_=True,  # 删除基础配置中原有模型定义

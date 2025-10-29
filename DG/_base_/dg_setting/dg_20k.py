@@ -10,7 +10,7 @@ default_hooks = dict(
     visualization=dict(
         type='DetVisualizationHook',
         draw=True,              # 训练阶段也画
-        interval=500,           # 每 500 iter 画一批（可按需要加大/减小）
+        interval=1000,           # 每 1000 iter 画一批（可按需要加大/减小）
         test_out_dir='drone_vis'  # 验证/测试结果统一落盘到这里
     ))
 
@@ -34,17 +34,17 @@ log_processor = dict(type='LogProcessor', window_size=50, by_epoch=False)
 log_level = 'INFO'
 load_from = None
 resume = False
-train_cfg = dict(type='IterBasedTrainLoop', max_iters=20000, val_interval=1000)
+train_cfg = dict(type='IterBasedTrainLoop', max_iters=5000, val_interval=1000) # max_iters=20000
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 param_scheduler = [
-    dict(type='LinearLR', start_factor=0.001, by_epoch=False, begin=0, end=500),
+    dict(type='LinearLR', start_factor=0.001, by_epoch=False, begin=0, end=125), # todo 500 warmup
     dict(
         type='MultiStepLR',
         begin=0,
-        end=20000,
+        end=5000,
         by_epoch=False,
-        milestones=[18000],#[3000, 4500], #18000
+        milestones=[4500],#[3000, 4500], #18000
         gamma=0.1)
 ]
 

@@ -117,7 +117,7 @@ labeled_dataset_rgb = dict(  # 定义仿真RGB带标注数据集
     data_root=data_root,  # 指定数据根目录
     metainfo=dict(classes=classes),  # 设置类别信息
     ann_file='sim_drone_ann/rgb/train.json',  # 指向仿真RGB训练标注
-    data_prefix=dict(img='sim_drone_rgb/Town01_Opt/carla_data/images_rgb/'),  # 指向RGB图像目录
+    data_prefix=dict(img='sim_drone_rgb/Town01_Opt/carla_data/'),  # 指向RGB图像目录
     filter_cfg=dict(filter_empty_gt=True),  # 过滤无标注图像
     pipeline=sup_pipeline_rgb)  # 采用RGB监督流水线
 labeled_dataset_ir = dict(  # 定义仿真IR带标注数据集
@@ -125,7 +125,7 @@ labeled_dataset_ir = dict(  # 定义仿真IR带标注数据集
     data_root=data_root,  # 指定数据根目录
     metainfo=dict(classes=classes),  # 设置类别信息
     ann_file='sim_drone_ann/ir/train.json',  # 指向仿真IR训练标注
-    data_prefix=dict(img='sim_drone_ir/Town01_Opt/carla_data/images_ir/'),  # 指向IR图像目录
+    data_prefix=dict(img='sim_drone_ir/Town01_Opt/carla_data/'),  # 指向IR图像目录
     filter_cfg=dict(filter_empty_gt=True),  # 过滤无标注图像
     pipeline=sup_pipeline_ir)  # 采用IR监督流水线
 labeled_dataset = dict(  # 组合仿真RGB与IR数据集

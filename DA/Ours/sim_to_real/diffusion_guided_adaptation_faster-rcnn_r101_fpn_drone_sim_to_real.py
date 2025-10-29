@@ -26,9 +26,8 @@ detector.detector.rpn_head.anchor_generator = dict(  # 调整RPN锚框生成器�
 )  # 锚框生成器配置结束
 
 # 扩散教师模型在红外数据上完成训练
-detector.diff_model.config = 'DG/Ours/drone/diffusion_detector_drone_ir_clear_day.py'  # 指定扩散教师配置路径
-
-detector.diff_model.pretrained_model = 'work_dirs/DD_IR.pth'  # 指定扩散教师权重路径
+detector.diff_model.config = 'DG/Ours/drone/diffusion_guided_generalization_faster-rcnn_r101_fpn_drone_ir.py'#'DG/Ours/drone/diffusion_detector_drone_ir_clear_day.py'  # 指定扩散教师配置路径
+detector.diff_model.pretrained_model = 'work_dirs/diffusion_guided_generalization_faster-rcnn_r101_fpn_drone_ir/best_teacher_coco_bbox_mAP_50_iter_5000.pth'  # 指定扩散教师权重路径
 
 model = dict(  # 重建域适应检测器包装器
     _delete_=True,  # 删除基础配置中的默认模型定义
@@ -44,4 +43,4 @@ model = dict(  # 重建域适应检测器包装器
     ),  # 训练配置结束
 )  # 模型定义结束
 
-auto_scale_lr = dict(enable=True, base_batch_size=8)  # 启用自动学习率缩放并设置基准批量大小
+auto_scale_lr = dict(enable=True, base_batch_size=16)  # 启用自动学习率缩放并设置基准批量大小
