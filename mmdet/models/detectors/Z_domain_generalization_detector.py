@@ -49,7 +49,10 @@ class DomainGeneralizationDetector(BaseDetector):
         self.train_cfg = train_cfg
             
         # cross model setting
-        self.cross_loss_weight = self.train_cfg.cross_loss_cfg.get('cross_loss_weight')
+        self.cross_loss_weight = self.train_cfg.cross_loss_cfg.get('cross_loss_weight')  # 读取交叉蒸馏初始权重
+        raw_schedule = self.train_cfg.cross_loss_cfg.get('schedule', [])  # 获取阶段性调度配置
+        self.cross_loss_schedule = sorted(raw_schedule, key=lambda item: item.get('start_iter', 0))  # 按起始迭代排序调度表
+        self.cross_schedule_stage = -1  # 记录当前处于的调度阶段索引
         # feature loss setting
         self.feature_loss_type = self.train_cfg.feature_loss_cfg.get(
             'feature_loss_type')
@@ -63,6 +66,21 @@ class DomainGeneralizationDetector(BaseDetector):
         
         self.burn_up_iters = self.train_cfg.get('burn_up_iters', 0)
         self.local_iter = 0
+
+    def _update_cross_schedule(self) -> None:
+        """动态调整交叉蒸馏权重以及底层扩散教师的启用状态。"""
+        if not self.cross_loss_schedule:  # 若未配置调度策略则直接返回
+            return  # 不执行任何更新
+        while (self.cross_schedule_stage + 1 < len(self.cross_loss_schedule)
+               and self.local_iter >= self.cross_loss_schedule[self.cross_schedule_stage + 1].get('start_iter', 0)):  # 检查是否需要推进阶段
+            self.cross_schedule_stage += 1  # 推进到下一个阶段
+            stage_cfg = self.cross_loss_schedule[self.cross_schedule_stage]  # 取出当前阶段配置
+            new_weight = stage_cfg.get('cross_loss_weight', None)  # 读取阶段交叉蒸馏权重
+            if new_weight is not None:  # 若显式提供权重
+                self.cross_loss_weight = new_weight  # 更新交叉蒸馏权重
+            target_teacher = stage_cfg.get('active_teacher', None)  # 读取期望启用的扩散教师名称
+            if target_teacher and hasattr(self.model, 'set_active_diff_detector'):  # 当提供教师名称且底层模型支持切换
+                self.model.set_active_diff_detector(target_teacher)  # 切换到底层指定教师
 
     @property
     def with_rpn(self):
@@ -84,7 +102,8 @@ class DomainGeneralizationDetector(BaseDetector):
         Returns:
             dict: A dictionary of loss components
         """
-        losses = dict()
+        self._update_cross_schedule()  # 在每次迭代前更新调度状态
+        losses = dict()  # 初始化损失容器
         if self.local_iter >= self.burn_up_iters:
             # losses.update(**self.model.student.loss(batch_inputs, batch_data_samples))
             losses.update(**self.loss_cross(batch_inputs, batch_data_samples))
