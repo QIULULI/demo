@@ -69,18 +69,18 @@ val_dataloader = dict(  # 定义验证数据加载器
         type=dataset_type,  # 使用 COCO 数据集格式
         data_root=data_root,  # 数据根目录
         metainfo=dict(classes=classes),  # 类别元信息
-        # ann_file='sim_drone_ann/rgb/val.json',  # 指向仿真验证标注文件
-        # data_prefix=dict(img=rgb_img_prefix),  # 图像目录前缀
-        ann_file='real_drone_ann/val_visible.json',  # 真实域测试标注文件
-        data_prefix=dict(img='real_drone_rgb/'),  # 真实域图像根目录
+        ann_file='sim_drone_ann/rgb/val.json',  # 指向仿真验证标注文件
+        data_prefix=dict(img=rgb_img_prefix),  # 图像目录前缀
+        # ann_file='real_drone_ann/val_visible.json',  # 真实域测试标注文件
+        # data_prefix=dict(img='real_drone_rgb/'),  # 真实域图像根目录
         test_mode=True,  # 启用测试模式以跳过数据增强
         filter_cfg=dict(filter_empty_gt=True),  # 过滤无标注图像
         pipeline=test_pipeline))  # 复用基础测试流水线
 test_dataloader = val_dataloader  # 将测试加载器与验证加载器保持一致
 val_evaluator = dict(  # 定义验证阶段评估器
     type='CocoMetric',  # 使用 COCO 指标
-    # ann_file=data_root + 'sim_drone_ann/rgb/val.json',  # 指向验证标注文件
-    ann_file=data_root + 'real_drone_ann/val_visible.json',  # 指向验证标注文件
+    ann_file=data_root + 'sim_drone_ann/rgb/val.json',  # 指向验证标注文件
+    # ann_file=data_root + 'real_drone_ann/val_visible.json',  # 指向验证标注文件
     metric='bbox',  # 计算边界框指标
     format_only=False)  # 直接输出评估结果
 test_evaluator = val_evaluator  # 复用验证评估器作为测试评估器
@@ -91,4 +91,5 @@ model = dict(  # 重写模型特定参数
         anchor_generator=dict(  # 修改锚框生成策略
             type='AnchorGenerator',  # 指定生成器类型
             scales=[2, 4, 8],  # 使用较小尺度捕捉小型无人机
-            ratios=[0.33, 0.5, 1.0, 2.0])))  # 扩展宽高比以覆盖细长目标 
+            ratios=[0.33, 0.5, 1.0, 2.0], # 扩展宽高比以覆盖细长目标
+            strides=[4, 8, 16, 32, 64]))) # 明确各层步长以匹配特征图
