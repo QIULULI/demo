@@ -6,7 +6,7 @@ classes = ('drone',)  # 仅包含无人机单一类别
 backend_args = None  # 图像加载默认使用mmcv后端
 
 ir_img_prefix = '/mnt/ssd/lql/Fitness-Generalization-Transferability/data/sim_drone_ir/Town01_Opt/carla_data'  # 红外图像前缀路径
-rgb_img_prefix = '/mnt/ssd/lql/Fitness-Generalization-Transferability/data/drone_rgb_clear_day'  # 可见光图像前缀路径
+rgb_img_prefix = '/mnt/ssd/lql/Fitness-Generalization-Transferability/data/sim_drone_rgb/Town01_Opt/carla_data'  # 可见光图像前缀路径
 
 ir_repeat = 1  # 红外数据重复次数，可通过修改该值控制采样比例
 rgb_repeat = 1  # 可见光数据重复次数，可通过修改该值控制采样比例
@@ -45,7 +45,7 @@ test_pipeline = [  # 定义验证/测试流水线
 
 train_dataset = dict(  # 构建训练数据集组合
     type='ConcatDataset',  # 使用串联数据集拼接两种模态
-    separate_eval=False,  # 训练阶段无需区分评估指标
+    #separate_eval=False,  # 训练阶段无需区分评估指标
     datasets=[  # 定义具体子数据集
         dict(  # 红外数据分支配置
             type='RepeatDataset',  # 通过重复实现采样比例控制
@@ -65,7 +65,7 @@ train_dataset = dict(  # 构建训练数据集组合
                 type=dataset_type,  # 指定数据集类型
                 data_root=data_root,  # 指定数据根目录
                 metainfo=dict(classes=classes),  # 写入类别信息
-                ann_file='drone_sim_coco/train.json',  # 可见光训练标注文件
+                ann_file='sim_drone_ann/rgb/train.json',  # 可见光训练标注文件
                 data_prefix=dict(img=rgb_img_prefix),  # 可见光图像前缀
                 filter_cfg=dict(filter_empty_gt=True),  # 过滤无目标图像
                 pipeline=train_pipeline))  # 引用统一流水线
