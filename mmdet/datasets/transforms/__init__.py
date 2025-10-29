@@ -25,6 +25,7 @@ from .transforms import (Albu, CachedMixUp, CachedMosaic, CopyPaste, CutOut,
 from .wrappers import MultiBranch, ProposalBroadcaster, RandomOrder
 from .albu_domain_adaption import AlbuDomainAdaption
 from .at_transforms import at_weak_augmentation, at_strong_augmentation
+from .set_sensor_tag import SetSensorTag  # 导入自定义传感器标记变换以便在配置中使用
 
 __all__ = [
     'PackDetInputs', 'ToTensor', 'ImageToTensor', 'Transpose',
@@ -44,5 +45,5 @@ __all__ = [
     'PackTrackInputs', 'PackReIDInputs', 'FixScaleResize',
     'ResizeShortestEdge', 'GTBoxSubOne_GLIP', 'RandomFlip_GLIP',
     'RandomSamplingNegPos', 'LoadTextAnnotations', 'AlbuDomainAdaption',
-    'at_strong_augmentation', 'at_weak_augmentation'
+    'at_strong_augmentation', 'at_weak_augmentation', 'SetSensorTag'  # 将自定义传感器标记变换导出供外部引用
 ]
