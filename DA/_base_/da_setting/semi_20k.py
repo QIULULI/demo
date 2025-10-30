@@ -46,7 +46,7 @@ resume = False
 # 如果burn_up_iters<max_iters, 则模型在指定iter进入半监督，源域和目标域一起进行训练，teacher模型进行EMA参数更新
 # 如果burn_up_iters>max_iters, 则模型只进行源域训练
 
-burn_up_iters = 12000 #12000
+burn_up_iters = 8000 #12000
 train_cfg = dict(type='IterBasedTrainLoop', max_iters=20000, val_interval=1000)
 val_cfg = dict(type='TeacherStudentValLoop')
 test_cfg = dict(type='TestLoop')

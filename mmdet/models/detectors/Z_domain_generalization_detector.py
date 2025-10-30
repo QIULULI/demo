@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
+import inspect  # 新增中文注释：引入inspect模块以便动态检查函数签名
 from typing import Dict, Tuple
 import torch
 from torch import Tensor
@@ -146,36 +147,31 @@ class DomainGeneralizationDetector(BaseDetector):
                 - masks (Tensor): Has a shape (num_instances, H, W).
         """
         result = None  # 新增中文注释：初始化预测结果变量
+        def _predict_with_signature(target_module):  # 新增中文注释：定义内部函数用于根据签名安全调用预测接口
+            predict_method = getattr(target_module, 'predict', None)  # 新增中文注释：尝试从目标模块上获取predict方法
+            if predict_method is None:  # 新增中文注释：若目标模块未实现predict方法
+                raise AttributeError(f'{target_module.__class__.__name__} does not implement predict method')  # 新增中文注释：抛出异常提示缺少预测接口
+            signature = inspect.signature(predict_method)  # 新增中文注释：使用inspect获取predict方法的参数签名
+            accepts_return_feature = 'return_feature' in signature.parameters  # 新增中文注释：判断签名中是否包含return_feature参数
+            if accepts_return_feature:  # 新增中文注释：若支持return_feature参数
+                return predict_method(batch_inputs, batch_data_samples, rescale=rescale, return_feature=return_feature)  # 新增中文注释：直接传入rescale和return_feature执行预测
+            prediction = predict_method(batch_inputs, batch_data_samples, rescale=rescale)  # 新增中文注释：当不支持return_feature时仅传入rescale执行预测
+            if return_feature:  # 新增中文注释：若调用者期望返回特征但模块不支持
+                return prediction, None  # 新增中文注释：补充None占位以满足接口约定
+            return prediction  # 新增中文注释：返回原始预测结果
+
         if self.with_student:  # 新增中文注释：判断当前模型是否包含学生模型分支
             predict_on = self.model.semi_test_cfg.get('predict_on', 'teacher')  # 新增中文注释：获取推理时应使用的模型分支
             if predict_on == 'teacher':  # 新增中文注释：若选择教师模型进行预测
-                result = self.model.teacher(  # 新增中文注释：调用教师模型并传递缩放及特征返回参数
-                    batch_inputs,  # 新增中文注释：教师模型的图像输入
-                    batch_data_samples,  # 新增中文注释：教师模型的样本数据输入
-                    mode='predict',  # 新增中文注释：指定教师模型处于预测模式
-                    rescale=rescale,  # 新增中文注释：传递是否还原缩放的标志
-                    return_feature=return_feature)  # 新增中文注释：传递是否返回特征的开关
+                result = _predict_with_signature(self.model.teacher)  # 新增中文注释：调用教师模型的安全预测包装函数
             elif predict_on == 'student':  # 新增中文注释：若选择学生模型进行预测
-                result = self.model.student(  # 新增中文注释：调用学生模型并传递相同参数
-                    batch_inputs,  # 新增中文注释：学生模型的图像输入
-                    batch_data_samples,  # 新增中文注释：学生模型的样本数据输入
-                    mode='predict',  # 新增中文注释：指定学生模型处于预测模式
-                    rescale=rescale,  # 新增中文注释：传递是否还原缩放的标志
-                    return_feature=return_feature)  # 新增中文注释：传递是否返回特征的开关
+                result = _predict_with_signature(self.model.student)  # 新增中文注释：调用学生模型的安全预测包装函数
             elif predict_on == 'diff_detector':  # 新增中文注释：若选择扩散检测器进行预测
-                result = self.model.diff_detector(  # 新增中文注释：调用扩散检测器并传递相同参数
-                    batch_inputs,  # 新增中文注释：扩散检测器的图像输入
-                    batch_data_samples,  # 新增中文注释：扩散检测器的样本数据输入
-                    mode='predict',  # 新增中文注释：指定扩散检测器处于预测模式
-                    rescale=rescale,  # 新增中文注释：传递是否还原缩放的标志
-                    return_feature=return_feature)  # 新增中文注释：传递是否返回特征的开关
+                result = _predict_with_signature(self.model.diff_detector)  # 新增中文注释：调用扩散检测器的安全预测包装函数
+            else:  # 新增中文注释：若配置中的predict_on值未被识别
+                raise ValueError(f'Unsupported predict_on value: {predict_on}')  # 新增中文注释：抛出异常提示非法配置
         else:  # 新增中文注释：若不存在师生结构则直接调用底层模型
-            result = self.model(  # 新增中文注释：调用基础模型并传递缩放与特征开关参数
-                batch_inputs,  # 新增中文注释：基础模型的图像输入
-                batch_data_samples,  # 新增中文注释：基础模型的样本数据输入
-                mode='predict',  # 新增中文注释：指定基础模型处于预测模式
-                rescale=rescale,  # 新增中文注释：传递是否还原缩放的标志
-                return_feature=return_feature)  # 新增中文注释：传递是否返回特征的开关
+            result = _predict_with_signature(self.model)  # 新增中文注释：调用基础模型的安全预测包装函数
 
         if return_feature and not isinstance(result, tuple):  # 新增中文注释：当需要特征且返回值非元组时进行兼容性处理
             result = (result, None)  # 新增中文注释：包装为包含预测结果及占位特征的元组

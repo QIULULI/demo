@@ -42,14 +42,14 @@ model = dict(  # 构建域泛化训练包装器
     detector=detector,  # 注入扩散师生检测器
     data_preprocessor=detector.data_preprocessor,  # 复用预处理器
     train_cfg=dict(  # 配置训练阶段策略
-        burn_up_iters=2000,  # 前2000迭代仅更新学生主干
+        burn_up_iters=5000,  # 前5000迭代仅更新学生主干
         cross_loss_cfg=dict(  # 交叉蒸馏配置
             enable_cross_loss=True,  # 启用交叉蒸馏
             cross_loss_weight=0.4,  # 默认交叉蒸馏权重
             schedule=[  # 阶段性调度表
                 dict(start_iter=0, active_teacher='rgb', cross_loss_weight=0.0),  # 初始阶段仅依赖红外教师
-                dict(start_iter=2000, active_teacher='ir', cross_loss_weight=0.4),  # 进入交叉阶段启用RGB教师
-                dict(start_iter=3500, active_teacher='rgb', cross_loss_weight=0.5),  # 后期回归红外教师并加大权重
+                dict(start_iter=8000, active_teacher='ir', cross_loss_weight=0.4),  # 进入交叉阶段启用RGB教师
+                dict(start_iter=14000, active_teacher='rgb', cross_loss_weight=0.5),  # 后期回归红外教师并加大权重
             ]),  # 调度表定义完毕
         feature_loss_cfg=dict(  # 特征蒸馏配置
             enable_feature_loss=True,  # 启用特征蒸馏
@@ -64,4 +64,4 @@ model = dict(  # 构建域泛化训练包装器
             loss_reg_kd=dict(type='L1Loss', loss_weight=1.0))  # 边框回归蒸馏损失
     ))  # 训练配置结束
 
-auto_scale_lr = dict(enable=True, base_batch_size=8)  # 启用自动学习率缩放
+auto_scale_lr = dict(enable=True, base_batch_size=16)  # 启用自动学习率缩放

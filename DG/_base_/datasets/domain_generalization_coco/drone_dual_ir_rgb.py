@@ -75,8 +75,8 @@ val_dataset = dict(  # 构建验证数据集
     type=dataset_type,  # 指定数据集类型
     data_root=data_root,  # 指定数据根目录
     metainfo=dict(classes=classes),  # 写入类别信息
-    ann_file='sim_drone_ann/ir/val.json',  # 验证标注文件路径
-    data_prefix=dict(img=ir_img_prefix),  # 默认使用红外模态进行评估
+    ann_file='sim_drone_ann/rgb/val.json',  # 验证标注文件路径
+    data_prefix=dict(img=rgb_img_prefix),  # 默认使用红外模态进行评估
     test_mode=True,  # 以测试模式加载
     filter_cfg=dict(filter_empty_gt=True),  # 过滤无目标图片
     pipeline=test_pipeline)  # 引用验证流水线
@@ -101,7 +101,7 @@ test_dataloader = val_dataloader  # 复用验证加载器作为测试加载器
 
 val_evaluator = dict(  # 构建验证评估器
     type='CocoMetric',  # 使用COCO指标
-    ann_file=data_root + 'sim_drone_ann/ir/val.json',  # 指定评估标注路径
+    ann_file=data_root + 'sim_drone_ann/rgb/val.json',  # 指定评估标注路径
     metric='bbox',  # 关注检测框指标
     format_only=False)  # 同时输出指标结果
 

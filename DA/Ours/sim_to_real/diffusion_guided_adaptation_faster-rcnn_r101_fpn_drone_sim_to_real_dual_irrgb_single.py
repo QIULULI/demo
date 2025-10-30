@@ -4,7 +4,7 @@
 _base_ = [  # 指定继承的基础配置列表
     '../../_base_/models/diffusion_guided_adaptation_faster_rcnn_r101_fpn.py',  # 继承扩散引导学生结构
     '../../_base_/da_setting/semi_20k.py',  # 继承半监督20k训练调度
-    '../../_base_/datasets/sim_to_real/semi_drone_ir_rgb_aug.py',  # 继承多模态仿真到真实的数据设置
+    '../../_base_/datasets/sim_to_real/semi_drone_rgb_aug.py',  # 继承多模态仿真到真实的数据设置
 ]  # 基础配置列表结束
 
 classes = ('drone',)  # 定义任务类别，仅包含无人机
@@ -33,16 +33,7 @@ detector.detector.rpn_head.anchor_generator = dict(  # 调整RPN锚框生成器�
 # 为保证训练正常启动，请先准备好DD_IR.pth与DD_RGB.pth或等效文件
 
 detector.diff_model = [  # 使用列表形式显式声明多名扩散教师
-    dict(  # 第一名教师：仿真IR扩散检测器
-        sensor='sim_ir',  # 指定服务的传感器标签
-        config='DG/Ours/drone/diffusion_detector_drone_ir_clear_day.py',  # 对应的配置文件路径
-        pretrained_model='work_dirs/diffusion_detector_drone_ir_clear_day/best_coco_bbox_mAP_50_iter_5000.pth',  # 训练完成的仿真IR扩散教师权重路径
-    ),  # 仿真IR教师配置结束
-    dict(  # 第二名教师：仿真RGB扩散检测器
-        sensor='sim_rgb',  # 指定服务的传感器标签
-        config='DG/Ours/drone/diffusion_detector_drone_rgb_sim.py',  # 对应的配置文件路径
-        pretrained_model='work_dirs/diffusion_detector_drone_rgb_sim/best_coco_bbox_mAP_50_iter_20000.pth',  # 训练完成的仿真RGB扩散教师权重路径
-    ),  # 仿真RGB教师配置结束
+    dict(sensor='sim_rgb', config='DG/Ours/drone/diffusion_detector_drone_dual_ir_rgb.py', pretrained_model='work_dirs/Dual_Diffusion_Teacher.pth'),  # 仿真RGB教师配置结束
 ]  # 扩散教师列表定义完成
 
 # 如果希望采用互学习后导出的单一双模态教师，请将上方列表替换为
