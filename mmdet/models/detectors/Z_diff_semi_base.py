@@ -417,6 +417,7 @@ class SemiBaseDiffDetector(BaseDetector):
             for local_idx, sample_idx in enumerate(sample_indices):  # 遍历组内样本
                 origin_sample = batch_data_samples[sample_idx]  # 获取原始数据样本
                 origin_sample.gt_instances = primary_results[local_idx].pred_instances  # 写入伪标签实例
+                sensor_tag_list[sample_idx] = sensor_tag  # 中文注释：记录当前样本的传感器标签供后续蒸馏使用
                 origin_sample.gt_instances.bboxes = bbox_project(  # 逆映射预测框到原图空间
                     origin_sample.gt_instances.bboxes,
                     torch.from_numpy(origin_sample.homography_matrix).inverse().to(
