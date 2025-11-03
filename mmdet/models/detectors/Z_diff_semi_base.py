@@ -343,13 +343,12 @@ class SemiBaseDiffDetector(BaseDetector):
                     data_samples.gt_instances.bboxes,
                     torch.from_numpy(data_samples.homography_matrix).inverse().to(
                         self.data_preprocessor.device), data_samples.ori_shape)
-            if isinstance(diff_feature, (list, tuple)):  # 若返回的是按样本排列的特征序列
+            if isinstance(diff_feature, (list, tuple)):  # 若返回的是按层排列的特征序列
                 primary_features = list(diff_feature)  # 转换为列表以便后续统一封装
             else:  # 若返回单一张量
                 primary_features = [diff_feature for _ in range(len(batch_data_samples))]  # 为每个样本复制一份引用
-            distill_feature = {  # 构造与多教师一致的返回结构
-                'primary': primary_features,  # 主教师特征列表
-                'peer': [dict() for _ in range(len(batch_data_samples))]  # 同伴特征占位，保持兼容
+            distill_feature = {  # 构造主教师输出结构
+                'main_teacher': primary_features  # 主教师特征列表
             }
             return batch_data_samples, batch_info, distill_feature  # 返回伪标签、批信息与特征
 
@@ -359,6 +358,7 @@ class SemiBaseDiffDetector(BaseDetector):
         sample_count = len(batch_data_samples)  # 记录样本数量，便于构造输出容器
         primary_feature_list: List[Any] = [None] * sample_count  # 为主教师特征预留位置
         peer_feature_list: List[Dict[str, Any]] = [dict() for _ in range(sample_count)]  # 初始化同伴特征字典列表
+        peer_prediction_list: List[Dict[str, Any]] = [dict() for _ in range(sample_count)]  # 初始化同伴预测字典列表
         sensor_to_indices: Dict[str, List[int]] = {}  # 构建传感器到样本索引的映射
         for idx, data_samples in enumerate(batch_data_samples):  # 遍历批次中的每个样本
             if not hasattr(data_samples, 'metainfo') or 'sensor' not in data_samples.metainfo:  # 若样本缺少传感器标签
@@ -386,14 +386,21 @@ class SemiBaseDiffDetector(BaseDetector):
                     continue  # 仅处理同伴教师
                 peer_inputs = batch_inputs[sample_indices]  # 使用相同图像张量作为输入
                 peer_samples = [copy.deepcopy(batch_data_samples[i]) for i in sample_indices]  # 复制样本以避免状态污染
-                _, peer_feature = peer_teacher.predict(  # 调用同伴教师获取特征
+                peer_results, peer_feature = peer_teacher.predict(  # 调用同伴教师获取预测与特征
                     peer_inputs, peer_samples, rescale=False, return_feature=True)
                 for local_idx, sample_idx in enumerate(sample_indices):  # 将同伴特征写入对应位置
                     peer_feature_list[sample_idx][peer_sensor] = peer_feature[local_idx]  # 按传感器标签归档特征
+                    peer_prediction_list[sample_idx][peer_sensor] = peer_results[local_idx].pred_instances  # 记录同伴教师预测实例
         distill_feature = {  # 汇总主教师与同伴教师特征
-            'primary': primary_feature_list,  # 主教师特征列表，顺序与批输入一致
-            'peer': peer_feature_list  # 同伴特征字典列表，每个元素对应一个样本
+            'main_teacher': primary_feature_list  # 主教师特征列表，顺序与批输入一致
         }
+        has_cross_feature = any(len(feature_map) > 0 for feature_map in peer_feature_list)  # 判断是否存在有效的同伴特征
+        if has_cross_feature:  # 当存在同伴特征时构造交叉教师信息
+            cross_teacher_payload: Dict[str, Any] = {'features': peer_feature_list}  # 写入同伴特征列表
+            has_cross_prediction = any(len(pred_map) > 0 for pred_map in peer_prediction_list)  # 判断是否存在同伴预测
+            if has_cross_prediction:  # 若存在同伴预测结果
+                cross_teacher_payload['predictions'] = peer_prediction_list  # 将同伴预测写入返回结构
+            distill_feature['cross_teacher'] = cross_teacher_payload  # 将交叉教师信息补充到整体返回字典
         return batch_data_samples, batch_info, distill_feature  # 返回伪标签、批信息与多教师特征
 
     def _parse_diff_feature(self, diff_feature: Any, batch_info: dict) -> dict:
@@ -401,18 +408,21 @@ class SemiBaseDiffDetector(BaseDetector):
         main_teacher_feature = diff_feature  # 中文注释：默认主教师特征直接等于原始特征
         cross_teacher_info = None  # 中文注释：初始化交叉教师信息为空
         if isinstance(diff_feature, dict):  # 中文注释：当特征以字典形式提供时按约定键解析
-            main_teacher_feature = diff_feature.get('main_teacher', diff_feature.get('teacher_feature'))  # 中文注释：优先读取主教师特征键
+            main_teacher_feature = diff_feature.get('main_teacher', diff_feature.get('teacher_feature', diff_feature))  # 中文注释：优先读取主教师特征键并在缺失时回退
             cross_teacher_info = diff_feature.get('cross_teacher')  # 中文注释：获取交叉教师相关信息块
         parsed_feature = {'main_teacher': main_teacher_feature}  # 中文注释：构建标准化返回字典并写入主教师特征
-        if cross_teacher_info is not None:  # 中文注释：若存在交叉教师信息则进一步整理
-            if isinstance(cross_teacher_info, dict):  # 中文注释：仅在结构为字典时尝试补充批次信息
-                cross_sensor = cross_teacher_info.get('sensor', 'cross_teacher')  # 中文注释：读取交叉教师的传感器标识若缺省则给默认值
-                cross_predictions = cross_teacher_info.get('predictions')  # 中文注释：获取交叉教师的预测结果用于下游组件
-                if cross_predictions is not None:  # 中文注释：当存在预测结果时写入批次信息供后续使用
-                    batch_info.setdefault('cross_teacher', {})  # 中文注释：确保批次信息中存在交叉教师条目
-                    batch_info['cross_teacher']['predictions'] = cross_predictions  # 中文注释：记录交叉教师的预测数据
-                    batch_info['cross_teacher']['sensor'] = cross_sensor  # 中文注释：补充交叉教师的传感器名称便于诊断
-            parsed_feature['cross_teacher'] = cross_teacher_info  # 中文注释：在标准化结果中保留完整的交叉教师信息
+        if isinstance(cross_teacher_info, dict):  # 中文注释：若交叉教师信息为字典则分发特定字段
+            cross_features = cross_teacher_info.get('features')  # 中文注释：读取交叉教师提供的特征集合
+            cross_predictions = cross_teacher_info.get('predictions')  # 中文注释：读取交叉教师给出的预测集合
+            if cross_features is not None:  # 中文注释：仅在存在交叉特征时才写入批次信息
+                batch_info.setdefault('cross_teacher', {})  # 中文注释：确保批次信息包含交叉教师分支
+                batch_info['cross_teacher']['features'] = cross_features  # 中文注释：记录交叉教师特征供后续损失使用
+            if cross_predictions is not None:  # 中文注释：仅在存在交叉预测时记录
+                batch_info.setdefault('cross_teacher', {})  # 中文注释：防止批次信息缺少交叉教师条目
+                batch_info['cross_teacher']['predictions'] = cross_predictions  # 中文注释：存储交叉教师的预测结果
+            parsed_feature['cross_teacher'] = cross_teacher_info  # 中文注释：在解析结果中保留交叉教师完整信息
+        elif cross_teacher_info is not None:  # 中文注释：若交叉教师信息存在但非字典则直接透传
+            parsed_feature['cross_teacher'] = cross_teacher_info  # 中文注释：保持原始结构避免信息丢失
         return parsed_feature  # 中文注释：返回解析后的特征字典
 
     def project_pseudo_instances(self, batch_pseudo_instances: SampleList,

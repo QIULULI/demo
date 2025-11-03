@@ -236,7 +236,7 @@ class DomainAdaptationDetector(BaseDetector):
         main_teacher_feature = diff_feature  # 中文注释：默认将传入特征视作主教师特征
         cross_teacher_info = None  # 中文注释：初始化交叉教师信息为None
         if isinstance(diff_feature, dict):  # 中文注释：当传入结构为字典时按约定键拆分主教师与交叉教师
-            main_teacher_feature = diff_feature.get('main_teacher')  # 中文注释：提取主教师的多尺度特征集合
+            main_teacher_feature = diff_feature.get('main_teacher', diff_feature.get('teacher_feature', diff_feature))  # 中文注释：优先读取主教师特征若缺失则回退
             cross_teacher_info = diff_feature.get('cross_teacher')  # 中文注释：提取交叉教师相关信息块
         losses = dict()  # 中文注释：初始化最终损失字典
         feature_loss = dict()  # 中文注释：准备记录特征蒸馏相关损失
@@ -251,22 +251,27 @@ class DomainAdaptationDetector(BaseDetector):
                 layer_loss = self.feature_loss(
                     student_feature, teacher_feature)  # 中文注释：计算学生特征与主教师特征的蒸馏损失
                 feature_loss['pkd_feature_loss'] = feature_loss['pkd_feature_loss'] + layer_loss / num_teacher_layers  # 中文注释：将损失按层数平均累积
-        if cross_teacher_info is not None and self.cross_feature_loss is not None:  # 中文注释：若交叉教师信息存在且开启权重则计算额外特征蒸馏
-            cross_features = None  # 中文注释：初始化交叉教师特征容器
-            if isinstance(cross_teacher_info, dict):  # 中文注释：交叉教师信息为字典时尝试读取标准键
-                cross_features = cross_teacher_info.get('features', cross_teacher_info.get('main_feature'))  # 中文注释：读取交叉教师提供的多尺度特征
-            elif isinstance(cross_teacher_info, (list, tuple)):  # 中文注释：若直接给出序列则直接使用
-                cross_features = cross_teacher_info  # 中文注释：直接记录交叉教师特征序列
-            if cross_features is not None:  # 中文注释：仅当获取到有效的交叉教师特征时计算蒸馏损失
-                cross_feature_list = cross_features if isinstance(cross_features, (list, tuple)) else [cross_features]  # 中文注释：确保交叉特征以列表形式处理
-                num_cross_layers = max(len(cross_feature_list), 1)  # 中文注释：记录交叉教师特征层数避免除零
-                cross_loss_value = 0  # 中文注释：初始化交叉特征损失累计值
-                for student_feature, cross_feature in zip(student_x, cross_feature_list):  # 中文注释：遍历学生与交叉教师对应层
-                    layer_loss = self.cross_feature_loss(
-                        student_feature, cross_feature)  # 中文注释：计算每层的交叉教师特征蒸馏损失
-                    cross_loss_value = cross_loss_value + layer_loss / num_cross_layers  # 中文注释：按层数平均累积交叉特征损失
-                feature_loss['pkd_cross_feature_loss'] = cross_loss_value  # 中文注释：将交叉教师特征蒸馏损失写入结果字典
-        if cross_teacher_info is not None:  # 中文注释：若存在交叉教师附加信息则进一步计算一致性损失
+        cross_features = None  # 中文注释：初始化交叉教师特征容器
+        cross_has_consistency = False  # 中文注释：标记交叉教师是否提供一致性信息
+        if isinstance(cross_teacher_info, dict):  # 中文注释：交叉教师信息为字典时解析标准字段
+            cross_features = cross_teacher_info.get('features', cross_teacher_info.get('main_feature'))  # 中文注释：读取交叉教师提供的特征集合并兼容旧键名
+            consistency_block = cross_teacher_info.get('consistency')  # 中文注释：获取可能存在的一致性信息字典
+            if consistency_block is not None:  # 中文注释：当一致性字段显式存在时视为具备信息
+                cross_has_consistency = True  # 中文注释：记录存在一致性数据
+            if cross_teacher_info.get('cls_consistency') is not None or cross_teacher_info.get('reg_consistency') is not None:  # 中文注释：检测顶层是否直接提供一致性项
+                cross_has_consistency = True  # 中文注释：若存在显式一致性项则同样标记可用
+        elif isinstance(cross_teacher_info, (list, tuple)):  # 中文注释：若交叉教师以序列形式直接提供特征
+            cross_features = cross_teacher_info  # 中文注释：直接使用该特征序列
+        if cross_features is not None and self.cross_feature_loss is not None:  # 中文注释：仅在具备特征且配置了权重时计算交叉蒸馏
+            cross_feature_list = cross_features if isinstance(cross_features, (list, tuple)) else [cross_features]  # 中文注释：确保交叉特征以列表形式处理
+            num_cross_layers = max(len(cross_feature_list), 1)  # 中文注释：记录交叉教师特征层数避免除零
+            cross_loss_value = 0  # 中文注释：初始化交叉特征损失累计值
+            for student_feature, cross_feature in zip(student_x, cross_feature_list):  # 中文注释：遍历学生与交叉教师对应层
+                layer_loss = self.cross_feature_loss(
+                    student_feature, cross_feature)  # 中文注释：计算每层的交叉教师特征蒸馏损失
+                cross_loss_value = cross_loss_value + layer_loss / num_cross_layers  # 中文注释：按层数平均累积交叉特征损失
+            feature_loss['pkd_cross_feature_loss'] = cross_loss_value  # 中文注释：将交叉教师特征蒸馏损失写入结果字典
+        if cross_teacher_info is not None and cross_has_consistency:  # 中文注释：仅在确实存在一致性信息时才计算相应损失
             feature_loss.update(self.loss_cross_feature(cross_teacher_info))  # 中文注释：调用辅助函数计算分类与回归一致性损失
         losses.update(feature_loss)  # 中文注释：将所有特征相关损失合并到最终输出
         return losses  # 中文注释：返回损失字典供训练流程使用
@@ -279,14 +284,14 @@ class DomainAdaptationDetector(BaseDetector):
         if self.cross_cls_loss_weight > 0:  # 中文注释：仅在分类一致性权重大于0时计算
             cls_value = cross_teacher_info.get('cls_consistency')  # 中文注释：优先读取顶层分类一致性数值
             if cls_value is None:  # 中文注释：若顶层缺失则尝试从嵌套结构读取
-                consistency_block = cross_teacher_info.get('consistency', {})  # 中文注释：获取可能的嵌套一致性字典
+                consistency_block = cross_teacher_info.get('consistency') or {}  # 中文注释：获取可能的嵌套一致性字典并在缺失时返回空字典
                 cls_value = consistency_block.get('cls')  # 中文注释：从嵌套字典读取分类一致性项
             if cls_value is not None:  # 中文注释：只有在成功取得数值时才写入损失
                 losses['cross_cls_consistency_loss'] = cls_value * self.cross_cls_loss_weight  # 中文注释：按配置权重缩放分类一致性损失
         if self.cross_reg_loss_weight > 0:  # 中文注释：仅在回归一致性权重大于0时计算
             reg_value = cross_teacher_info.get('reg_consistency')  # 中文注释：优先读取顶层回归一致性数值
             if reg_value is None:  # 中文注释：若未提供则尝试从嵌套结构读取
-                consistency_block = cross_teacher_info.get('consistency', {})  # 中文注释：获取可能的嵌套一致性字典
+                consistency_block = cross_teacher_info.get('consistency') or {}  # 中文注释：获取可能的嵌套一致性字典并在缺失时返回空字典
                 reg_value = consistency_block.get('reg')  # 中文注释：从嵌套字典读取回归一致性项
             if reg_value is not None:  # 中文注释：确保存在有效数值再写入结果
                 losses['cross_reg_consistency_loss'] = reg_value * self.cross_reg_loss_weight  # 中文注释：按权重缩放回归一致性损失
