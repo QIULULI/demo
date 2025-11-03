@@ -241,19 +241,56 @@ class DomainAdaptationDetector(BaseDetector):
         if isinstance(diff_feature, dict):  # 中文注释：当传入结构为字典时按约定键拆分主教师与交叉教师
             main_teacher_feature = diff_feature.get('main_teacher', diff_feature.get('teacher_feature', diff_feature))  # 中文注释：优先读取主教师特征若缺失则回退
             cross_teacher_info = diff_feature.get('cross_teacher')  # 中文注释：提取交叉教师相关信息块
+        def _aggregate_sample_level_features(sample_feature_list):  # 中文注释：内部工具函数将按样本排列的多尺度特征转换为尺度优先张量
+            if not isinstance(sample_feature_list, (list, tuple)) or not sample_feature_list:  # 中文注释：若输入不是序列或为空则直接返回None
+                return None  # 中文注释：无有效特征时返回None
+            level_count = 0  # 中文注释：初始化可用尺度数量统计
+            for sample_entry in sample_feature_list:  # 中文注释：遍历每个样本的特征条目
+                if isinstance(sample_entry, (list, tuple)):  # 中文注释：仅统计序列形式的样本特征
+                    level_count = max(level_count, len(sample_entry))  # 中文注释：更新最大尺度数量用于后续聚合
+            if level_count == 0:  # 中文注释：当所有样本均缺失尺度信息时
+                return None  # 中文注释：直接返回None表示无法聚合
+            aggregated_levels = []  # 中文注释：初始化尺度优先的输出列表
+            for level_idx in range(level_count):  # 中文注释：逐个尺度执行堆叠
+                level_candidates = []  # 中文注释：收集当前尺度的样本切片
+                for sample_entry in sample_feature_list:  # 中文注释：遍历每个样本
+                    candidate_tensor = None  # 中文注释：为当前样本的尺度特征初始化占位
+                    if isinstance(sample_entry, (list, tuple)) and len(sample_entry) > level_idx:  # 中文注释：当样本提供该尺度特征时取出
+                        candidate_tensor = sample_entry[level_idx]  # 中文注释：记录当前样本对应尺度的张量
+                    elif torch.is_tensor(sample_entry) and level_idx == 0:  # 中文注释：兼容直接返回单张量的情况并仅对首尺度有效
+                        candidate_tensor = sample_entry  # 中文注释：将张量直接视为尺度特征
+                    level_candidates.append(candidate_tensor)  # 中文注释：无论是否缺失都追加占位保持顺序
+                reference_tensor = next((item for item in level_candidates if torch.is_tensor(item)), None)  # 中文注释：寻找首个有效张量用于构造占位
+                if reference_tensor is None:  # 中文注释：若当前尺度所有样本均缺失则以None占位
+                    aggregated_levels.append(None)  # 中文注释：记录None保持尺度索引一致
+                    continue  # 中文注释：继续处理下一尺度
+                normalized_slices = []  # 中文注释：用于存放处理后的样本切片
+                for candidate_tensor in level_candidates:  # 中文注释：遍历当前尺度的全部样本切片
+                    if torch.is_tensor(candidate_tensor):  # 中文注释：若样本提供有效张量直接使用
+                        normalized_slices.append(candidate_tensor)  # 中文注释：记录原始张量
+                    else:  # 中文注释：当样本缺失该尺度时需要填充占位
+                        normalized_slices.append(torch.zeros_like(reference_tensor))  # 中文注释：使用零张量补齐以保持对齐
+                aggregated_levels.append(torch.stack(normalized_slices, dim=0))  # 中文注释：按batch维度堆叠得到尺度优先张量
+            has_valid_level = any(torch.is_tensor(level_tensor) for level_tensor in aggregated_levels if level_tensor is not None)  # 中文注释：检测是否存在有效尺度张量
+            return aggregated_levels if has_valid_level else None  # 中文注释：若存在有效张量则返回聚合结果否则返回None
+        if isinstance(main_teacher_feature, (list, tuple)) and main_teacher_feature and isinstance(main_teacher_feature[0], (list, tuple)):  # 中文注释：当主教师特征以样本列表形式提供时执行尺度聚合
+            main_teacher_feature = _aggregate_sample_level_features(main_teacher_feature)  # 中文注释：将样本级特征转换为尺度优先结构
+        elif torch.is_tensor(main_teacher_feature):  # 中文注释：当主教师仅返回单个张量时统一包装为列表
+            main_teacher_feature = [main_teacher_feature]  # 中文注释：保持与多尺度结构一致的接口
+        elif isinstance(main_teacher_feature, (list, tuple)) and main_teacher_feature and all(torch.is_tensor(item) for item in main_teacher_feature):  # 中文注释：当主教师已提供尺度优先张量列表时直接使用
+            main_teacher_feature = list(main_teacher_feature)  # 中文注释：显式转换为列表以便后续修改
+        else:  # 中文注释：其余情况视为缺失主教师特征
+            main_teacher_feature = None  # 中文注释：将无效结构置为None
         losses = dict()  # 中文注释：初始化最终损失字典
         feature_loss = dict()  # 中文注释：准备记录特征蒸馏相关损失
         feature_loss['pkd_feature_loss'] = 0  # 中文注释：初始化主教师特征蒸馏损失累积值
-        if main_teacher_feature is not None:  # 中文注释：仅在主教师特征有效时计算蒸馏损失
-            if isinstance(main_teacher_feature, (list, tuple)):  # 中文注释：当主教师特征为序列时直接使用
-                teacher_feature_list = main_teacher_feature  # 中文注释：记录主教师特征列表
-            else:  # 中文注释：若主教师特征非序列则包装成单元素列表保持统一
-                teacher_feature_list = [main_teacher_feature]  # 中文注释：构建仅含单层特征的列表
-            num_teacher_layers = max(len(teacher_feature_list), 1)  # 中文注释：计算主教师特征层数避免除零
-            for student_feature, teacher_feature in zip(student_x, teacher_feature_list):  # 中文注释：遍历对应层特征计算蒸馏损失
-                layer_loss = self.feature_loss(
-                    student_feature, teacher_feature)  # 中文注释：计算学生特征与主教师特征的蒸馏损失
-                feature_loss['pkd_feature_loss'] = feature_loss['pkd_feature_loss'] + layer_loss / num_teacher_layers  # 中文注释：将损失按层数平均累积
+        if isinstance(main_teacher_feature, (list, tuple)) and main_teacher_feature:  # 中文注释：仅在主教师提供有效尺度张量时计算蒸馏
+            valid_pairs = [(stu_feat, tea_feat) for stu_feat, tea_feat in zip(student_x, main_teacher_feature) if torch.is_tensor(tea_feat)]  # 中文注释：筛选出教师与学生都具备的尺度组合
+            if valid_pairs:  # 中文注释：存在至少一个有效尺度时执行蒸馏
+                normalization_factor = 1.0 / len(valid_pairs)  # 中文注释：计算均值系数避免层数不同造成权重偏移
+                for student_feature, teacher_feature in valid_pairs:  # 中文注释：遍历每个有效尺度对
+                    layer_loss = self.feature_loss(student_feature, teacher_feature)  # 中文注释：调用蒸馏损失函数评估该尺度差异
+                    feature_loss['pkd_feature_loss'] = feature_loss['pkd_feature_loss'] + layer_loss * normalization_factor  # 中文注释：按均值系数累计主教师蒸馏损失
         cross_features = None  # 中文注释：初始化交叉教师特征容器
         cross_has_consistency = False  # 中文注释：标记交叉教师是否提供一致性信息
         if isinstance(cross_teacher_info, dict):  # 中文注释：交叉教师信息为字典时解析标准字段
@@ -265,15 +302,51 @@ class DomainAdaptationDetector(BaseDetector):
                 cross_has_consistency = True  # 中文注释：若存在显式一致性项则同样标记可用
         elif isinstance(cross_teacher_info, (list, tuple)):  # 中文注释：若交叉教师以序列形式直接提供特征
             cross_features = cross_teacher_info  # 中文注释：直接使用该特征序列
-        if cross_features is not None and self.cross_feature_loss is not None:  # 中文注释：仅在具备特征且配置了权重时计算交叉蒸馏
-            cross_feature_list = cross_features if isinstance(cross_features, (list, tuple)) else [cross_features]  # 中文注释：确保交叉特征以列表形式处理
-            num_cross_layers = max(len(cross_feature_list), 1)  # 中文注释：记录交叉教师特征层数避免除零
-            cross_loss_value = 0  # 中文注释：初始化交叉特征损失累计值
-            for student_feature, cross_feature in zip(student_x, cross_feature_list):  # 中文注释：遍历学生与交叉教师对应层
-                layer_loss = self.cross_feature_loss(
-                    student_feature, cross_feature)  # 中文注释：计算每层的交叉教师特征蒸馏损失
-                cross_loss_value = cross_loss_value + layer_loss / num_cross_layers  # 中文注释：按层数平均累积交叉特征损失
-            feature_loss['pkd_cross_feature_loss'] = cross_loss_value  # 中文注释：将交叉教师特征蒸馏损失写入结果字典
+        aggregated_cross_features = None  # 中文注释：初始化聚合后的交叉教师特征容器
+        if isinstance(cross_features, (list, tuple)) and cross_features and isinstance(cross_features[0], dict):  # 中文注释：当交叉教师按样本提供并区分传感器时执行重组
+            sensor_feature_map = dict()  # 中文注释：创建传感器到样本特征的映射
+            for sample_entry in cross_features:  # 中文注释：遍历每个样本的交叉特征字典
+                for sensor_tag, sensor_feature in sample_entry.items():  # 中文注释：遍历该样本中的各个传感器特征
+                    sensor_feature_map.setdefault(sensor_tag, []).append(sensor_feature)  # 中文注释：将特征按传感器累积
+            aggregated_cross_features = dict()  # 中文注释：准备存放按传感器聚合后的尺度张量
+            for sensor_tag, sensor_sample_list in sensor_feature_map.items():  # 中文注释：遍历每个传感器及其对应的样本特征
+                aggregated_cross_features[sensor_tag] = _aggregate_sample_level_features(sensor_sample_list)  # 中文注释：对每个传感器执行尺度聚合
+            cross_features = aggregated_cross_features  # 中文注释：将交叉特征替换为聚合后的结构
+            if isinstance(cross_teacher_info, dict):  # 中文注释：在保持字典结构时同步更新原信息块
+                cross_teacher_info['features'] = aggregated_cross_features  # 中文注释：写回聚合结果供后续流程复用
+        elif isinstance(cross_features, (list, tuple)) and cross_features and isinstance(cross_features[0], (list, tuple)):  # 中文注释：当交叉特征为样本列表但未区分传感器时直接聚合
+            aggregated_cross_features = _aggregate_sample_level_features(cross_features)  # 中文注释：对整体样本列表执行尺度聚合
+            cross_features = aggregated_cross_features  # 中文注释：使用聚合后的列表进行后续蒸馏
+        elif isinstance(cross_features, (list, tuple)) and all(torch.is_tensor(item) for item in cross_features):  # 中文注释：当交叉特征已是尺度优先列表时保持不变
+            aggregated_cross_features = list(cross_features)  # 中文注释：显式转换为列表以便后续处理
+            cross_features = aggregated_cross_features  # 中文注释：保持变量一致
+        elif torch.is_tensor(cross_features):  # 中文注释：当交叉特征为单个张量时包装成列表
+            aggregated_cross_features = [cross_features]  # 中文注释：构造单尺度列表供蒸馏使用
+            cross_features = aggregated_cross_features  # 中文注释：更新交叉特征引用
+        if isinstance(cross_features, dict):  # 中文注释：若交叉特征以传感器字典形式存在则额外生成合并列表
+            sensor_level_values = [levels for levels in cross_features.values() if isinstance(levels, (list, tuple))]  # 中文注释：提取所有传感器的尺度列表
+            if sensor_level_values:  # 中文注释：当至少存在一个传感器提供有效尺度时
+                max_level_count = max(len(levels) for levels in sensor_level_values)  # 中文注释：计算最大尺度数量
+                aggregated_cross_features = []  # 中文注释：初始化跨传感器合并的尺度容器
+                for level_idx in range(max_level_count):  # 中文注释：逐尺度汇总所有传感器
+                    level_slices = []  # 中文注释：收集当前尺度下的传感器张量
+                    for levels in sensor_level_values:  # 中文注释：遍历各个传感器的尺度列表
+                        if level_idx < len(levels):  # 中文注释：仅在传感器提供该尺度时参与合并
+                            level_tensor = levels[level_idx]  # 中文注释：取出对应尺度张量
+                            if torch.is_tensor(level_tensor):  # 中文注释：仅保留有效张量
+                                level_slices.append(level_tensor)  # 中文注释：加入待拼接列表
+                    aggregated_cross_features.append(torch.cat(level_slices, dim=0) if level_slices else None)  # 中文注释：按批维合并所有传感器的该尺度特征
+        if aggregated_cross_features is None and isinstance(cross_features, (list, tuple)):  # 中文注释：若尚未构建跨传感器合并结果而交叉特征为列表
+            aggregated_cross_features = list(cross_features)  # 中文注释：直接复制列表作为聚合输出
+        if aggregated_cross_features is not None and self.cross_feature_loss is not None:  # 中文注释：具备交叉特征且配置了蒸馏权重时计算交叉蒸馏
+            valid_cross_pairs = [(stu_feat, cross_feat) for stu_feat, cross_feat in zip(student_x, aggregated_cross_features) if torch.is_tensor(cross_feat)]  # 中文注释：筛选存在有效交叉教师张量的尺度
+            if valid_cross_pairs:  # 中文注释：当存在有效尺度时执行交叉蒸馏
+                normalization_factor = 1.0 / len(valid_cross_pairs)  # 中文注释：计算均值系数保持损失规模稳定
+                cross_loss_value = 0  # 中文注释：初始化交叉蒸馏损失累计值
+                for student_feature, cross_feature in valid_cross_pairs:  # 中文注释：遍历每个有效尺度对
+                    layer_loss = self.cross_feature_loss(student_feature, cross_feature)  # 中文注释：计算该尺度的交叉蒸馏损失
+                    cross_loss_value = cross_loss_value + layer_loss * normalization_factor  # 中文注释：按均值系数累积交叉蒸馏损失
+                feature_loss['pkd_cross_feature_loss'] = cross_loss_value  # 中文注释：记录交叉教师特征蒸馏损失
         if cross_teacher_info is not None and cross_has_consistency:  # 中文注释：仅在确实存在一致性信息时才计算相应损失
             feature_loss.update(self.loss_cross_feature(cross_teacher_info))  # 中文注释：调用辅助函数计算分类与回归一致性损失
         if self.cross_consistency_debug_log:  # 中文注释：当启用调试日志时输出交叉一致性损失数值

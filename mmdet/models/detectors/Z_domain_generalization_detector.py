@@ -317,11 +317,28 @@ class DomainGeneralizationDetector(BaseDetector):
                 sample_features = [teacher_feature_payload[idx] for idx in indices]  # 中文注释：取出当前传感器的全部样本特征包
                 if not sample_features:  # 中文注释：若该传感器下无样本则跳过
                     continue  # 中文注释：继续处理其他传感器
-                level_count = len(sample_features[0])  # 中文注释：读取单个样本所含的尺度数量
+                level_count = max(len(sample_feature) if isinstance(sample_feature, (list, tuple)) else 0 for sample_feature in sample_features)  # 中文注释：统计样本内可用的最大尺度数量以兼容缺失情况
+                if level_count <= 0:  # 中文注释：当无法识别任何尺度时跳过当前传感器
+                    continue  # 中文注释：继续处理下一传感器
                 grouped_levels = []  # 中文注释：初始化当前传感器的尺度特征列表
                 for level_idx in range(level_count):  # 中文注释：遍历每一个尺度
-                    level_stack = torch.stack([sample_feature[level_idx] for sample_feature in sample_features], dim=0)  # 中文注释：在batch维度堆叠当前尺度的所有样本特征
-                    grouped_levels.append(level_stack)  # 中文注释：将堆叠结果加入传感器特征列表
+                    level_candidates = []  # 中文注释：为当前尺度收集所有样本的特征切片
+                    for sample_feature in sample_features:  # 中文注释：逐个样本提取当前尺度特征
+                        if isinstance(sample_feature, (list, tuple)) and len(sample_feature) > level_idx:  # 中文注释：当样本提供足够尺度时直接取值
+                            level_candidates.append(sample_feature[level_idx])  # 中文注释：记录当前样本的尺度特征
+                        else:  # 中文注释：若样本缺失该尺度则使用占位符稍后补齐
+                            level_candidates.append(None)  # 中文注释：以None占位保持索引稳定
+                    reference_tensor = next((candidate for candidate in level_candidates if torch.is_tensor(candidate)), None)  # 中文注释：寻找首个有效张量以确定占位形状
+                    if reference_tensor is None:  # 中文注释：若全部样本均缺失当前尺度则在输出中以None占位
+                        grouped_levels.append(None)  # 中文注释：保持尺度位置以防错位
+                        continue  # 中文注释：继续处理下一个尺度
+                    normalized_slices = []  # 中文注释：准备存放格式统一的样本切片
+                    for candidate in level_candidates:  # 中文注释：遍历原始候选列表
+                        if torch.is_tensor(candidate):  # 中文注释：若候选为有效张量直接使用
+                            normalized_slices.append(candidate)  # 中文注释：追加到规范化切片列表
+                        else:  # 中文注释：当候选缺失时以零张量占位保证维度一致
+                            normalized_slices.append(torch.zeros_like(reference_tensor))  # 中文注释：生成同形状零张量占位
+                    grouped_levels.append(torch.stack(normalized_slices, dim=0))  # 中文注释：将所有样本在batch维度堆叠得到当前尺度张量
                 grouped_features[sensor_tag] = grouped_levels  # 中文注释：登记当前传感器的多尺度特征
             return grouped_features  # 中文注释：返回按传感器切分的多尺度特征
         if torch.is_tensor(teacher_feature_payload):  # 中文注释：当教师特征为单一张量时直接按索引切片
@@ -356,11 +373,25 @@ class DomainGeneralizationDetector(BaseDetector):
                 for sample_idx in range(total_count):  # 中文注释：按照原批次顺序遍历样本
                     sensor_tag, local_idx = routing[sample_idx]  # 中文注释：查找当前样本所属传感器及其组内索引
                     current_sensor_features = grouped_features.get(sensor_tag)  # 中文注释：获取该传感器的特征集合
-                    if current_sensor_features is None:  # 中文注释：若缺少特征则跳过
+                    if current_sensor_features is None or level_idx >= len(current_sensor_features):  # 中文注释：若缺少当前尺度特征则占位
+                        level_slices.append(None)  # 中文注释：以None占位保持序列对齐
                         continue  # 中文注释：继续处理下一个样本
                     level_tensor = current_sensor_features[level_idx]  # 中文注释：提取当前尺度的特征张量
-                    level_slices.append(level_tensor[local_idx:local_idx + 1])  # 中文注释：截取与当前样本对应的切片并保留批维
-                merged_levels.append(torch.cat(level_slices, dim=0) if level_slices else None)  # 中文注释：将切片按原顺序拼接成完整批次
+                    if level_tensor is None:  # 中文注释：若该尺度为空则占位
+                        level_slices.append(None)  # 中文注释：以None保持索引稳定
+                    else:  # 中文注释：当尺度张量有效时切片
+                        level_slices.append(level_tensor[local_idx:local_idx + 1])  # 中文注释：截取与当前样本对应的切片并保留批维
+                reference_slice = next((slice_tensor for slice_tensor in level_slices if torch.is_tensor(slice_tensor)), None)  # 中文注释：寻找参考切片以便填充占位
+                if reference_slice is None:  # 中文注释：若所有切片均缺失则以None记录该尺度
+                    merged_levels.append(None)  # 中文注释：将当前尺度标记为空以便后续过滤
+                    continue  # 中文注释：进入下一尺度处理
+                normalized_slices = []  # 中文注释：用于存放填充后的切片列表
+                for slice_tensor in level_slices:  # 中文注释：遍历原始切片
+                    if torch.is_tensor(slice_tensor):  # 中文注释：若切片有效则直接使用
+                        normalized_slices.append(slice_tensor)  # 中文注释：保存原始切片
+                    else:  # 中文注释：当切片缺失时以零张量填充
+                        normalized_slices.append(torch.zeros_like(reference_slice))  # 中文注释：生成与参考切片形状一致的零张量填补
+                merged_levels.append(torch.cat(normalized_slices, dim=0))  # 中文注释：将规范化切片在批维拼接恢复原顺序
             return merged_levels  # 中文注释：返回合并后的多尺度特征列表
         if torch.is_tensor(reference_feature):  # 中文注释：当参考特征为单张量时直接按顺序拼接
             ordered_slices = []  # 中文注释：初始化顺序切片列表
