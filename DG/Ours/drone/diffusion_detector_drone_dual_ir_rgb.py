@@ -38,6 +38,11 @@ detector.diff_model = dict(  # 配置扩散教师信息
             pretrained_model='/mnt/ssd/lql/Fitness-Generalization-Transferability/work_dirs/diffusion_detector_drone_rgb_sim/best_coco_bbox_mAP_50_iter_20000.pth')  # 可见光教师权重
     ])  # 教师列表定义完毕
 
+detector.semi_test_cfg = dict(  # 重写半监督测试配置以便互学习后的学生承担推理职责
+    predict_on='student',  # 指定推理阶段使用学生分支输出预测结果
+    forward_on='student',  # 指定推理阶段的forward调用走学生分支以维持一致性
+    extract_feat_on='student')  # 指定特征抽取阶段调用学生分支以便后续蒸馏或可视化
+
 model = dict(  # 构建域泛化训练包装器
     _delete_=True,  # 删除基础模型定义
     type='DomainGeneralizationDetector',  # 指定顶层模型类型

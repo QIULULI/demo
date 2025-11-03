@@ -60,5 +60,8 @@ optim_wrapper = dict(
 
 launcher = 'none'
 auto_scale_lr = dict(enable=True, base_batch_size=16)
-custom_hooks = [dict(type='AdaptiveTeacherHook', burn_up_iters=burn_up_iters)]
+custom_hooks = [
+    dict(type='AdaptiveTeacherHook', burn_up_iters=burn_up_iters),  # 继续启用自适应教师钩子以保持EMA更新
+    dict(type='StudentToTeacherExportHook')  # 在训练结束时同步学生权重到教师以兼容旧版推理脚本
+]
 find_unused_parameters = True

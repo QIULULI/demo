@@ -67,5 +67,8 @@ optim_wrapper = dict(
 
 launcher = 'none'
 auto_scale_lr = dict(enable=True, base_batch_size=32)
-custom_hooks = [dict(type='AdaptiveTeacherHook', burn_up_iters=burn_up_iters, momentum=0.0004)]
+custom_hooks = [
+    dict(type='AdaptiveTeacherHook', burn_up_iters=burn_up_iters, momentum=0.0004),  # 维持域适配阶段的自适应教师动量更新策略
+    dict(type='StudentToTeacherExportHook')  # 新增权重导出钩子以在训练结束时将学生权重复制到教师分支
+]
 find_unused_parameters = True

@@ -31,6 +31,7 @@ detector.detector.rpn_head.anchor_generator = dict(  # 调整RPN锚框生成器�
 # 组建扩散教师字典，分别载入仿真IR与仿真RGB单模态教师权重
 # 若已训练完成双模态互学习教师，可将pretrained_model路径替换为Dual_Diffusion_Teacher权重
 # 为保证训练正常启动，请先准备好DD_IR.pth与DD_RGB.pth或等效文件
+# 若使用双教师联合权重，请确认其中包含互学习后更新过的学生分支参数，并在测试前保持predict_on指向student而非重新切回teacher
 
 detector.diff_model = dict(  # 使用字典形式同时声明教师池与主教师标识
     main_teacher='dual_real_rgb',  # 指定默认主教师为真实域双模态教师以便覆盖真实样本
