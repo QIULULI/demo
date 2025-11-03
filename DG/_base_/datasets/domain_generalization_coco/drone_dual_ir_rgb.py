@@ -1,4 +1,5 @@
 # 数据集基础配置文件：定义无人机IR/RGB双模态训练集与验证集
+from copy import deepcopy  # 引入deepcopy用于生成独立流水线副本
 dataset_type = 'CocoDataset'  # 指定数据集类型为COCO格式
 data_root = 'data/'  # 定义统一的数据根目录
 classes = ('drone',)  # 仅包含无人机单一类别
@@ -20,7 +21,7 @@ color_space_light = [  # 轻量级颜色增强空间定义
     [dict(type='Sharpness')],  # 锐度增强
 ]  # 结束颜色增强空间
 
-train_pipeline = [  # 定义训练阶段数据处理流水线
+train_pipeline_template = [  # 定义训练阶段通用数据处理模板流水线
     dict(type='LoadImageFromFile', backend_args=backend_args),  # 加载图像文件
     dict(type='LoadAnnotations', with_bbox=True),  # 加载带边界框标注
     dict(type='Resize', scale=(1600, 960), keep_ratio=True),  # 等比例缩放到统一分辨率
@@ -29,18 +30,29 @@ train_pipeline = [  # 定义训练阶段数据处理流水线
     dict(type='FilterAnnotations', min_gt_bbox_wh=(1e-2, 1e-2)),  # 过滤过小目标
     dict(type='RandomFlip', prob=0.5),  # 随机水平翻转
     dict(type='RandAugment', aug_space=color_space_light, aug_num=1),  # 轻量随机增强
-    dict(type='PackDetInputs',  # 打包检测模型输入
-         meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape',  # 保留关键元信息
-                    'scale_factor', 'flip', 'flip_direction',
-                    'homography_matrix')),  # 同时保留单应矩阵用于投影
-]  # 结束训练流水线定义
+]  # 结束训练通用流水线模板定义
+
+def build_train_pipeline(sensor_tag):  # 定义函数用于根据传感器标签生成完整训练流水线
+    pipeline = deepcopy(train_pipeline_template)  # 深拷贝模板确保不同模态互不影响
+    pipeline.append(dict(type='SetSensorTag', sensor=sensor_tag))  # 插入SetSensorTag以写入当前样本的传感器标记
+    pipeline.append(  # 在流水线末尾追加打包组件并扩展元信息字段
+        dict(type='PackDetInputs',  # 打包检测模型输入
+             meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape',  # 保留关键元信息
+                        'scale_factor', 'flip', 'flip_direction',  # 记录几何变换信息
+                        'homography_matrix', 'sensor'))  # 同时保留单应矩阵与传感器标签
+    )  # PackDetInputs配置结束
+    return pipeline  # 返回构建完成的流水线
+
+train_pipeline_ir = build_train_pipeline(sensor_tag='sim_ir')  # 构建红外训练流水线并写入仿真IR标签
+train_pipeline_rgb = build_train_pipeline(sensor_tag='sim_rgb')  # 构建可见光训练流水线并写入仿真RGB标签
 
 test_pipeline = [  # 定义验证/测试流水线
     dict(type='LoadImageFromFile', backend_args=backend_args),  # 加载图像
     dict(type='Resize', scale=(1600, 960), keep_ratio=True),  # 调整尺寸
     dict(type='LoadAnnotations', with_bbox=True),  # 加载标注便于评估
+    dict(type='SetSensorTag', sensor='sim_rgb'),  # 写入验证集默认仿真RGB传感器标签
     dict(type='PackDetInputs',  # 打包评估输入
-         meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape', 'scale_factor')),  # 保留必要元信息
+         meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape', 'scale_factor', 'sensor')),  # 保留必要元信息并包含传感器字段
 ]  # 结束验证流水线
 
 train_dataset = dict(  # 构建训练数据集组合
@@ -57,7 +69,7 @@ train_dataset = dict(  # 构建训练数据集组合
                 ann_file='sim_drone_ann/ir/train.json',  # 红外训练标注文件
                 data_prefix=dict(img=ir_img_prefix),  # 红外图像前缀
                 filter_cfg=dict(filter_empty_gt=True),  # 过滤无目标图像
-                pipeline=train_pipeline)),  # 引用统一流水线
+                pipeline=train_pipeline_ir)),  # 引用红外专属流水线
         dict(  # 可见光数据分支配置
             type='RepeatDataset',  # 使用重复机制
             times=rgb_repeat,  # 可见光重复次数
@@ -68,7 +80,7 @@ train_dataset = dict(  # 构建训练数据集组合
                 ann_file='sim_drone_ann/rgb/train.json',  # 可见光训练标注文件
                 data_prefix=dict(img=rgb_img_prefix),  # 可见光图像前缀
                 filter_cfg=dict(filter_empty_gt=True),  # 过滤无目标图像
-                pipeline=train_pipeline))  # 引用统一流水线
+                pipeline=train_pipeline_rgb))  # 引用可见光专属流水线
     ])  # 结束数据集列表定义
 
 val_dataset = dict(  # 构建验证数据集
