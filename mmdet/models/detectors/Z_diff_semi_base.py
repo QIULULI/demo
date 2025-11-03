@@ -390,6 +390,8 @@ class SemiBaseDiffDetector(BaseDetector):
         batch_info = {}  # 初始化批处理信息占位符
         sample_count = len(batch_data_samples)  # 记录样本数量，便于构造输出容器
         primary_feature_list: List[Any] = [None] * sample_count  # 为主教师特征预留位置
+        sensor_tag_list: List[Optional[str]] = [None] * sample_count  # 中文注释：初始化逐样本传感器标签列表
+        grouped_primary_features: Dict[str, Any] = dict()  # 中文注释：记录按传感器划分的主教师多尺度特征
         peer_feature_list: List[Dict[str, Any]] = [dict() for _ in range(sample_count)]  # 初始化同伴特征字典列表
         peer_prediction_list: List[Dict[str, Any]] = [dict() for _ in range(sample_count)]  # 初始化同伴预测字典列表
         device_for_stats = batch_inputs.device  # 中文注释：记录输入张量所在设备以保证统计量与主干数据保持一致
@@ -410,6 +412,8 @@ class SemiBaseDiffDetector(BaseDetector):
             group_samples_for_pred = [copy.deepcopy(batch_data_samples[i]) for i in sample_indices]  # 复制数据样本供教师推理使用
             primary_results, primary_feature = teacher_model.predict(  # 使用主教师进行预测并返回特征
                 group_inputs, group_samples_for_pred, rescale=False, return_feature=True)
+            normalized_group_feature, sample_level_features = self._normalize_group_feature_payload(primary_feature, len(sample_indices))  # 中文注释：统一当前传感器的教师特征结构并拆分逐样本特征
+            grouped_primary_features[sensor_tag] = normalized_group_feature  # 中文注释：登记当前传感器对应的多尺度特征
             for local_idx, sample_idx in enumerate(sample_indices):  # 遍历组内样本
                 origin_sample = batch_data_samples[sample_idx]  # 获取原始数据样本
                 origin_sample.gt_instances = primary_results[local_idx].pred_instances  # 写入伪标签实例
@@ -417,7 +421,8 @@ class SemiBaseDiffDetector(BaseDetector):
                     origin_sample.gt_instances.bboxes,
                     torch.from_numpy(origin_sample.homography_matrix).inverse().to(
                         self.data_preprocessor.device), origin_sample.ori_shape)
-                primary_feature_list[sample_idx] = primary_feature[local_idx]  # 记录主教师特征，按原批序填充
+                sensor_tag_list[sample_idx] = sensor_tag  # 中文注释：记录当前样本使用的传感器标签
+                primary_feature_list[sample_idx] = sample_level_features[local_idx]  # 中文注释：保存对应样本拆分后的主教师特征
             for peer_sensor, peer_teacher in self.diff_teacher_bank.items():  # 遍历其它教师以获取交叉特征
                 if peer_sensor == sensor_tag:  # 跳过主教师自身
                     continue  # 仅处理同伴教师
@@ -478,8 +483,12 @@ class SemiBaseDiffDetector(BaseDetector):
                     sample_cls_stats[sample_idx]['count'] += int(cls_losses.numel())  # 中文注释：更新当前样本的分类匹配数量
                     sample_reg_stats[sample_idx]['sum'] = sample_reg_stats[sample_idx]['sum'] + reg_losses.sum().to(device=device_for_stats, dtype=dtype_for_stats)  # 中文注释：将当前匹配的回归损失累加到对应样本的统计量
                     sample_reg_stats[sample_idx]['count'] += int(reg_losses.numel())  # 中文注释：更新当前样本的回归匹配数量
+        if any(tag is None for tag in sensor_tag_list):  # 中文注释：检测是否存在未被赋值的传感器标签
+            raise KeyError('存在缺失传感器标签的样本，无法完成多教师伪标签生成。')  # 中文注释：抛出明确错误提示
         distill_feature = {  # 汇总主教师与同伴教师特征
-            'main_teacher': primary_feature_list  # 主教师特征列表，顺序与批输入一致
+            'main_teacher': primary_feature_list,  # 主教师特征列表，顺序与批输入一致
+            'sensor_map': sensor_tag_list,  # 中文注释：记录逐样本的传感器来源便于后续蒸馏分组
+            'grouped_main_teacher': grouped_primary_features  # 中文注释：按传感器组织的主教师多尺度特征
         }
         has_cross_feature = any(len(feature_map) > 0 for feature_map in peer_feature_list)  # 判断是否存在有效的同伴特征
         has_cross_prediction = any(len(pred_map) > 0 for pred_map in peer_prediction_list)  # 中文注释：判断是否存在同伴教师的预测结果
@@ -516,10 +525,18 @@ class SemiBaseDiffDetector(BaseDetector):
         """中文注释：将扩散教师返回的特征结构统一整理便于后续蒸馏使用。"""
         main_teacher_feature = diff_feature  # 中文注释：默认主教师特征直接等于原始特征
         cross_teacher_info = None  # 中文注释：初始化交叉教师信息为空
+        sensor_map = None  # 中文注释：初始化传感器标签映射占位
+        grouped_main_teacher = None  # 中文注释：初始化按传感器划分的主教师特征结构
         if isinstance(diff_feature, dict):  # 中文注释：当特征以字典形式提供时按约定键解析
             main_teacher_feature = diff_feature.get('main_teacher', diff_feature.get('teacher_feature', diff_feature))  # 中文注释：优先读取主教师特征键并在缺失时回退
             cross_teacher_info = diff_feature.get('cross_teacher')  # 中文注释：获取交叉教师相关信息块
+            sensor_map = diff_feature.get('sensor_map')  # 中文注释：尝试读取逐样本传感器标签列表
+            grouped_main_teacher = diff_feature.get('grouped_main_teacher')  # 中文注释：尝试读取按传感器整理的主教师特征
         parsed_feature = {'main_teacher': main_teacher_feature}  # 中文注释：构建标准化返回字典并写入主教师特征
+        if sensor_map is not None:  # 中文注释：若提供逐样本传感器映射则保留
+            parsed_feature['sensor_map'] = sensor_map  # 中文注释：记录传感器标签列表
+        if grouped_main_teacher is not None:  # 中文注释：若存在按传感器分组的特征则附加
+            parsed_feature['grouped_main_teacher'] = grouped_main_teacher  # 中文注释：保存分组后的主教师特征结构
         if isinstance(cross_teacher_info, dict):  # 中文注释：若交叉教师信息为字典则分发特定字段
             cross_features = cross_teacher_info.get('features')  # 中文注释：读取交叉教师提供的特征集合
             cross_predictions = cross_teacher_info.get('predictions')  # 中文注释：读取交叉教师给出的预测集合
@@ -604,6 +621,33 @@ class SemiBaseDiffDetector(BaseDetector):
         elif self.semi_test_cfg.get('forward_on', 'teacher') == 'diff_detector':
             return self.diff_detector(batch_inputs, batch_data_samples, mode='tensor')
 
+    def _normalize_group_feature_payload(self, feature_payload: Any, group_size: int) -> Tuple[Any, List[Any]]:  # 中文注释：规范化教师特征结构以兼容不同调用场景
+        if feature_payload is None:  # 中文注释：当输入特征为空时直接返回占位结果
+            return None, [None] * group_size  # 中文注释：返回空特征以及长度匹配的None列表
+        if isinstance(feature_payload, (list, tuple)) and feature_payload:  # 中文注释：针对列表或元组结构分别展开处理
+            first_item = feature_payload[0]  # 中文注释：读取首个元素用于判断当前存储形式
+            if torch.is_tensor(first_item):  # 中文注释：若首元素为张量说明结构按尺度排列
+                level_tensors = [level_feat for level_feat in feature_payload]  # 中文注释：复制各尺度张量以保持与输入一致
+                per_sample_features: List[List[Tensor]] = []  # 中文注释：初始化逐样本特征列表
+                level_count = len(level_tensors)  # 中文注释：记录尺度数量用于遍历
+                for sample_idx in range(group_size):  # 中文注释：遍历组内每一个样本索引
+                    sample_levels = [level_feat[sample_idx] for level_feat in level_tensors]  # 中文注释：提取该样本在各尺度的切片
+                    per_sample_features.append(sample_levels)  # 中文注释：将切片加入逐样本列表
+                return level_tensors, per_sample_features  # 中文注释：返回按尺度排列的张量与逐样本特征
+            if isinstance(first_item, (list, tuple)) and first_item:  # 中文注释：若首元素也是序列说明特征已按样本拆分
+                per_sample_features = [list(sample_feat) for sample_feat in feature_payload]  # 中文注释：逐样本复制避免共享底层引用
+                level_count = len(first_item)  # 中文注释：获取每个样本包含的尺度数量
+                stacked_levels: List[Tensor] = []  # 中文注释：初始化按尺度堆叠的张量列表
+                for level_idx in range(level_count):  # 中文注释：遍历所有尺度索引
+                    level_stack = torch.stack([sample_feat[level_idx] for sample_feat in per_sample_features], dim=0)  # 中文注释：沿批次维度堆叠该尺度的所有样本
+                    stacked_levels.append(level_stack)  # 中文注释：保存堆叠后的张量便于后续前向
+                return stacked_levels, per_sample_features  # 中文注释：返回堆叠张量及逐样本列表
+        if torch.is_tensor(feature_payload):  # 中文注释：若输入直接为张量则视作单尺度特征
+            per_sample_features = [feature_payload[sample_idx:sample_idx + 1] for sample_idx in range(group_size)]  # 中文注释：逐样本切片保持张量结构
+            return [feature_payload], per_sample_features  # 中文注释：返回包装后的张量和逐样本特征
+        per_sample_features = [feature_payload for _ in range(group_size)]  # 中文注释：其他类型直接复制引用以补齐长度
+        return feature_payload, per_sample_features  # 中文注释：返回原始特征对象与逐样本列表
+
     def extract_feat(self, batch_inputs: Tensor) -> Tuple[Tensor]:
         """Extract features.
 
@@ -645,3 +689,4 @@ class SemiBaseDiffDetector(BaseDetector):
             unexpected_keys,
             error_msgs,
         )
+

@@ -1,7 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
 import inspect  # 新增中文注释：引入inspect模块以便动态检查函数签名
-from typing import Dict, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple  # 中文注释：引入类型注解工具以便描述复杂结构
 import torch
 from torch import Tensor
 
@@ -234,6 +234,75 @@ class DomainGeneralizationDetector(BaseDetector):
             sensor_to_indices.setdefault(sensor_tag, []).append(idx)  # 中文注释：将样本索引加入对应传感器的列表中
         return sensor_to_indices  # 中文注释：返回按照传感器聚合的索引映射
 
+    def _group_indices_by_sensor_tags(self, sensor_tags: Sequence[str]) -> Dict[str, List[int]]:  # 中文注释：依据传感器标签序列生成索引分组
+        sensor_to_indices: Dict[str, List[int]] = dict()  # 中文注释：初始化空字典存放传感器到索引的映射
+        for idx, sensor_tag in enumerate(sensor_tags):  # 中文注释：遍历每一个样本位置与对应的传感器标签
+            if sensor_tag is None:  # 中文注释：若传感器标签为空则直接报错提示数据异常
+                raise KeyError(f'Sensor tag is missing at batch index {idx}.')  # 中文注释：抛出键错误以便快速定位问题
+            sensor_to_indices.setdefault(sensor_tag, []).append(idx)  # 中文注释：将当前索引加入对应传感器的索引列表
+        return sensor_to_indices  # 中文注释：返回构建好的传感器索引映射
+
+    def _normalize_group_feature_payload(self, feature_payload: Any, group_size: int) -> Tuple[Any, List[Any]]:  # 中文注释：规范化教师特征结构并生成逐样本列表
+        if feature_payload is None:  # 中文注释：若输入特征为空直接返回空结果
+            return None, [None] * group_size  # 中文注释：返回空特征及填充的None列表保持长度一致
+        if isinstance(feature_payload, (list, tuple)) and feature_payload:  # 中文注释：当输入为非空列表或元组时进入详细判断
+            first_item = feature_payload[0]  # 中文注释：提取第一个元素用于判断当前组织形式
+            if torch.is_tensor(first_item):  # 中文注释：若首元素为张量说明结构按尺度存储
+                level_tensors = [level_feat for level_feat in feature_payload]  # 中文注释：逐层复制张量列表保持原有排列
+                per_sample_features: List[List[Tensor]] = []  # 中文注释：初始化逐样本特征容器
+                level_count = len(level_tensors)  # 中文注释：记录尺度数量便于后续遍历
+                for sample_idx in range(group_size):  # 中文注释：遍历组内每个样本索引
+                    sample_levels = [level_feat[sample_idx] for level_feat in level_tensors]  # 中文注释：抽取当前样本在各尺度的特征切片
+                    per_sample_features.append(sample_levels)  # 中文注释：将切片结果追加到逐样本列表
+                return level_tensors, per_sample_features  # 中文注释：返回规范化后的多尺度张量与逐样本特征
+            if isinstance(first_item, (list, tuple)) and first_item:  # 中文注释：若首元素本身为列表或元组说明特征已按样本展开
+                per_sample_features = [list(sample_feat) for sample_feat in feature_payload]  # 中文注释：逐样本复制以避免共享引用
+                level_count = len(first_item)  # 中文注释：读取单个样本包含的尺度数量
+                stacked_levels: List[Tensor] = []  # 中文注释：初始化按尺度堆叠的特征列表
+                for level_idx in range(level_count):  # 中文注释：遍历每一个尺度索引
+                    level_stack = torch.stack([sample_feat[level_idx] for sample_feat in per_sample_features], dim=0)  # 中文注释：沿批维堆叠同尺度的所有样本特征
+                    stacked_levels.append(level_stack)  # 中文注释：将堆叠后的张量保存以供后续前向使用
+                return stacked_levels, per_sample_features  # 中文注释：返回多尺度堆叠张量与逐样本特征
+        if torch.is_tensor(feature_payload):  # 中文注释：若输入直接为张量则视作单尺度特征
+            per_sample_features = [feature_payload[sample_idx:sample_idx + 1] for sample_idx in range(group_size)]  # 中文注释：逐样本切片生成单尺度特征
+            return [feature_payload], per_sample_features  # 中文注释：将张量包装成列表并返回逐样本特征
+        per_sample_features = [feature_payload for _ in range(group_size)]  # 中文注释：对于其他类型直接复制引用以保持长度
+        return feature_payload, per_sample_features  # 中文注释：返回原始特征对象与逐样本列表
+
+    def _distribute_group_roi_outputs(self, group_outputs: Dict[str, Tensor],
+                                      storage: List[Dict[str, Tensor]],
+                                      sample_indices: List[int],
+                                      roi_counts: List[int]) -> Dict[str, Tensor]:
+        distribution_cache: Dict[str, Tensor] = dict()  # 中文注释：初始化缓存用于记录空张量模板
+        for key, value in group_outputs.items():  # 中文注释：遍历教师前向结果中的每个键值对
+            if value is None:  # 中文注释：若值为空则跳过该键
+                continue  # 中文注释：继续处理下一个输出项
+            distribution_cache.setdefault(key, value.new_empty((0,) + value.shape[1:]))  # 中文注释：为当前键构建零长度模板以备样本无ROI时使用
+            start = 0  # 中文注释：初始化切片起始位置
+            for local_idx, (sample_idx, roi_num) in enumerate(zip(sample_indices, roi_counts)):  # 中文注释：遍历组内样本及其对应的ROI数量
+                if roi_num == 0:  # 中文注释：当某个样本没有ROI时直接填充零长度张量
+                    storage[sample_idx][key] = distribution_cache[key]  # 中文注释：写入预构建的空张量保持结构一致
+                    continue  # 中文注释：跳过切片操作处理下一个样本
+                end = start + roi_num  # 中文注释：计算当前样本对应的结束位置
+                storage[sample_idx][key] = value[start:end]  # 中文注释：将对应片段赋值给该样本位置
+                start = end  # 中文注释：更新起始位置准备处理下一段
+        return distribution_cache  # 中文注释：返回键到空模板张量的映射供外部补全缺失键
+
+    def _finalize_grouped_outputs(self, aggregated: Dict[str, List[Tensor]],
+                                  fallback_cache: Dict[str, Tensor]) -> Dict[str, Tensor]:  # 中文注释：将逐样本存储的张量按批次顺序拼接
+        finalized: Dict[str, Tensor] = dict()  # 中文注释：初始化最终输出字典
+        for key, sample_tensors in aggregated.items():  # 中文注释：遍历每一个输出键
+            tensors_in_order: List[Tensor] = []  # 中文注释：按批次顺序收集张量片段
+            for tensor in sample_tensors:  # 中文注释：遍历该键对应的逐样本张量
+                if tensor is None:  # 中文注释：若当前样本未写入结果则补齐零长度模板
+                    tensor = fallback_cache.get(key)  # 中文注释：读取预先缓存的空张量
+                if tensor is None:  # 中文注释：若仍未获取到有效张量则跳过该样本
+                    continue  # 中文注释：避免将None加入拼接序列导致错误
+                tensors_in_order.append(tensor)  # 中文注释：将张量加入拼接列表
+            if tensors_in_order:  # 中文注释：当存在可拼接的张量时执行拼接
+                finalized[key] = torch.cat(tensors_in_order, dim=0)  # 中文注释：沿ROI维拼接形成批次输出
+        return finalized  # 中文注释：返回已拼接好的输出字典
+
     def _slice_teacher_features_by_sensor(self, teacher_feature_payload, sensor_to_indices: Dict[str, list]):  # 中文注释：根据传感器索引切分教师特征
         grouped_features = dict()  # 中文注释：初始化以传感器为键的特征字典
         if teacher_feature_payload is None:  # 中文注释：若教师特征为空则直接返回空字典
@@ -351,9 +420,22 @@ class DomainGeneralizationDetector(BaseDetector):
         pseudo_data_samples, batch_info, diff_feature = self.model.get_pseudo_instances_diff(batch_inputs, batch_data_samples)  # 中文注释：调用多教师接口生成伪标签并返回教师特征
         parsed_diff_feature = self.model._parse_diff_feature(diff_feature, batch_info)  # 中文注释：解析教师输出以获得标准化的特征结构
         batch_data_samples = pseudo_data_samples  # 中文注释：使用带伪标签的样本列表继续后续训练流程
-        sensor_to_indices = self._group_indices_by_sensor(batch_data_samples)  # 中文注释：根据传感器信息划分批次索引
+        parsed_sensor_tags: Optional[List[str]] = parsed_diff_feature.get('sensor_map') if isinstance(parsed_diff_feature, dict) else None  # 中文注释：尝试从教师返回中读取逐样本传感器标签
+        if parsed_sensor_tags is not None:  # 中文注释：若教师显式返回传感器标签映射
+            sensor_to_indices = self._group_indices_by_sensor_tags(parsed_sensor_tags)  # 中文注释：直接根据映射构建索引分组
+            sensor_tags_per_sample = parsed_sensor_tags  # 中文注释：保存逐样本传感器标签供后续使用
+        else:  # 中文注释：若教师未返回传感器标签则退回到样本元信息
+            sensor_to_indices = self._group_indices_by_sensor(batch_data_samples)  # 中文注释：根据传感器信息划分批次索引
+            sensor_tags_per_sample = [sample.metainfo['sensor'] for sample in batch_data_samples]  # 中文注释：从样本元信息中提取逐样本传感器标签
         grouped_samples = {sensor_tag: [batch_data_samples[idx] for idx in indices] for sensor_tag, indices in sensor_to_indices.items()}  # 中文注释：按照传感器重组样本列表用于局部蒸馏
-        grouped_teacher_features = self._slice_teacher_features_by_sensor(parsed_diff_feature.get('main_teacher'), sensor_to_indices)  # 中文注释：提取并切分主教师特征
+        grouped_teacher_features = dict()  # 中文注释：初始化教师特征分组字典
+        raw_grouped_feature = parsed_diff_feature.get('grouped_main_teacher') if isinstance(parsed_diff_feature, dict) else None  # 中文注释：尝试直接获取按传感器划分的特征
+        if isinstance(raw_grouped_feature, dict) and raw_grouped_feature:  # 中文注释：若教师已提供按传感器整理的特征
+            for sensor_tag, indices in sensor_to_indices.items():  # 中文注释：遍历所需的传感器键
+                if sensor_tag in raw_grouped_feature:  # 中文注释：仅当教师提供对应特征时才复制
+                    grouped_teacher_features[sensor_tag] = raw_grouped_feature[sensor_tag]  # 中文注释：写入当前传感器的多尺度特征
+        if not grouped_teacher_features:  # 中文注释：若教师未直接提供分组特征则退回切片逻辑
+            grouped_teacher_features = self._slice_teacher_features_by_sensor(parsed_diff_feature.get('main_teacher'), sensor_to_indices)  # 中文注释：提取并切分主教师特征
         student_x = self.model.student.extract_feat(batch_inputs)  # 中文注释：前向学生模型获取自身特征表示
         diff_x = self._merge_grouped_features(grouped_teacher_features, sensor_to_indices, len(batch_data_samples))  # 中文注释：将教师特征按照原批次顺序重新拼接
         losses = dict()  # 中文注释：初始化损失累加字典
@@ -416,7 +498,7 @@ class DomainGeneralizationDetector(BaseDetector):
         # Apply cross-kd in ROI head
         if isinstance(diff_x, (list, tuple)) and diff_x and all(item is not None for item in diff_x):  # 中文注释：确保全部尺度具备教师特征后再执行ROI蒸馏
             roi_losses_kd = self.roi_head_loss_with_kd(
-                student_x, diff_x, rpn_results_list, batch_data_samples)  # 中文注释：基于教师特征计算ROI知识蒸馏损失
+                student_x, grouped_teacher_features, rpn_results_list, batch_data_samples, sensor_tags_per_sample)  # 中文注释：基于分组教师特征与逐样本传感器标签计算ROI知识蒸馏损失
             losses.update(roi_losses_kd)  # 中文注释：累加ROI蒸馏损失
         ##############################################################################################################
 
@@ -424,10 +506,11 @@ class DomainGeneralizationDetector(BaseDetector):
 
     def roi_head_loss_with_kd(self,
                             student_x: Tuple[Tensor],
-                            diff_x: Tuple[Tensor],
+                            grouped_diff_x: Dict[str, Any],
                             rpn_results_list,
-                            batch_data_samples):
-        assert len(rpn_results_list) == len(batch_data_samples)
+                            batch_data_samples,
+                            sensor_tags: List[str]):  # 中文注释：基于传感器分组信息计算ROI级别的知识蒸馏损失
+        assert len(rpn_results_list) == len(batch_data_samples)  # 中文注释：确保RPN输出与样本数量一致
         outputs = unpack_gt_instances(batch_data_samples)
         batch_gt_instances, batch_gt_instances_ignore, _ = outputs
         roi_head = self.model.student.roi_head
@@ -454,61 +537,126 @@ class DomainGeneralizationDetector(BaseDetector):
         # bbox head loss
         if roi_head.with_bbox:
             bbox_results = self.bbox_loss_with_kd(
-                student_x, diff_x, sampling_results)
+                student_x, grouped_diff_x, sampling_results, sensor_tags)
             losses.update(bbox_results['loss_bbox_kd'])
 
         return losses
 
-    def bbox_loss_with_kd(self, student_x, diff_x, sampling_results):
-        rois = bbox2roi([res.priors for res in sampling_results])
-
-        student_head, diff_head = self.model.student.roi_head, self.model.diff_detector.roi_head
-        stu_bbox_results = student_head._bbox_forward(student_x, rois)
-        diff_bbox_results = diff_head._bbox_forward(diff_x, rois)
-        reused_bbox_results = diff_head._bbox_forward(student_x, rois)
-
-        losses_kd = dict()
-        # classification KD
-        reused_cls_scores = reused_bbox_results['cls_score']
-        diff_cls_scores = diff_bbox_results['cls_score']
-        avg_factor = sum([res.avg_factor for res in sampling_results])
-        loss_cls_kd = self.loss_cls_kd(
+    def bbox_loss_with_kd(self, student_x, grouped_diff_x, sampling_results, sensor_tags):  # 中文注释：按传感器划分执行ROI知识蒸馏前向与损失计算
+        if len(sensor_tags) != len(sampling_results):  # 中文注释：确保传感器标签数量与采样结果数量一致
+            raise ValueError('传感器标签数量与采样结果数量不一致，无法执行知识蒸馏。')  # 中文注释：抛出错误提示以便排查
+        rois = bbox2roi([res.priors for res in sampling_results])  # 中文注释：基于全部样本的提议框拼接成批次ROI
+        student_head = self.model.student.roi_head  # 中文注释：获取学生模型的ROI头以执行前向
+        reference_diff_head = self.model.diff_detector.roi_head  # 中文注释：获取主扩散教师的ROI头用于读取结构信息
+        stu_bbox_results = student_head._bbox_forward(student_x, rois)  # 中文注释：使用学生特征计算ROI头输出
+        sensor_to_indices = self._group_indices_by_sensor_tags(sensor_tags)  # 中文注释：根据传感器标签将样本索引划分分组
+        teacher_storage: List[Dict[str, Tensor]] = [dict() for _ in sampling_results]  # 中文注释：初始化教师前向结果的逐样本存储
+        reused_storage: List[Dict[str, Tensor]] = [dict() for _ in sampling_results]  # 中文注释：初始化教师头复用学生特征的存储
+        teacher_fallback_cache: Dict[str, Tensor] = dict()  # 中文注释：缓存教师输出各键的零长度模板以便补齐
+        reused_fallback_cache: Dict[str, Tensor] = dict()  # 中文注释：缓存复用输出各键的零长度模板
+        for sensor_tag, indices in sensor_to_indices.items():  # 中文注释：遍历每个传感器分组
+            if not indices:  # 中文注释：若当前传感器下无样本则跳过
+                continue  # 中文注释：继续处理下一个传感器
+            if sensor_tag not in self.model.diff_teacher_bank:  # 中文注释：确保存在对应的扩散教师
+                raise KeyError(f'未找到传感器"{sensor_tag}"对应的扩散教师，无法执行ROI蒸馏。')  # 中文注释：抛出详细错误提示
+            group_feature_payload = grouped_diff_x.get(sensor_tag) if isinstance(grouped_diff_x, dict) else None  # 中文注释：读取当前传感器的教师特征
+            if group_feature_payload is None:  # 中文注释：若缺少对应特征则无法继续
+                raise KeyError(f'传感器"{sensor_tag}"缺少主教师特征，无法执行ROI蒸馏。')  # 中文注释：抛出错误提示
+            normalized_group_feature, _ = self._normalize_group_feature_payload(group_feature_payload, len(indices))  # 中文注释：统一当前传感器特征结构
+            if normalized_group_feature is None:  # 中文注释：若规范化结果为空则跳过后续计算
+                continue  # 中文注释：继续处理其他传感器
+            if isinstance(normalized_group_feature, (list, tuple)):  # 中文注释：若特征以序列形式提供
+                teacher_features_ready = [feat for feat in normalized_group_feature]  # 中文注释：复制多尺度张量列表
+            elif torch.is_tensor(normalized_group_feature):  # 中文注释：若规范化结果为单张量则包装成列表
+                teacher_features_ready = [normalized_group_feature]  # 中文注释：构造单尺度张量列表
+            else:  # 中文注释：遇到无法识别的结构时直接报错
+                raise TypeError(f'不支持的教师特征类型：{type(normalized_group_feature)}')  # 中文注释：提醒开发者检查特征格式
+            teacher_features_ready = [feat for feat in teacher_features_ready]  # 中文注释：复制列表以避免共享引用
+            teacher_features_ready = tuple(teacher_features_ready)  # 中文注释：转换为元组以适配ROI头前向接口
+            feature_device = student_x[0].device if isinstance(student_x, (list, tuple)) else student_x.device  # 中文注释：获取学生特征所在的设备
+            index_tensor = torch.tensor(indices, device=feature_device, dtype=torch.long)  # 中文注释：将样本索引转换成张量以便切片
+            student_group_features = [level_feat.index_select(0, index_tensor) for level_feat in student_x]  # 中文注释：提取当前传感器对应的学生特征
+            sampling_subset = [sampling_results[idx] for idx in indices]  # 中文注释：收集当前传感器的采样结果
+            sensor_rois = bbox2roi([res.priors for res in sampling_subset])  # 中文注释：基于子集采样结果生成局部ROI
+            roi_counts = [res.priors.shape[0] for res in sampling_subset]  # 中文注释：统计每个样本的ROI数量用于结果拆分
+            teacher_model = self.model.diff_teacher_bank[sensor_tag]  # 中文注释：获取当前传感器的教师模型
+            teacher_roi_head = teacher_model.roi_head  # 中文注释：读取教师ROI头执行前向
+            teacher_forward = teacher_roi_head._bbox_forward(teacher_features_ready, sensor_rois)  # 中文注释：使用教师特征计算ROI输出
+            reused_forward = teacher_roi_head._bbox_forward(student_group_features, sensor_rois)  # 中文注释：使用教师头对学生特征前向
+            teacher_cache_update = self._distribute_group_roi_outputs(teacher_forward, teacher_storage, indices, roi_counts)  # 中文注释：将教师输出拆分回逐样本存储
+            reused_cache_update = self._distribute_group_roi_outputs(reused_forward, reused_storage, indices, roi_counts)  # 中文注释：将复用输出拆分回逐样本存储
+            for key, value in teacher_cache_update.items():  # 中文注释：更新教师空模板缓存
+                teacher_fallback_cache.setdefault(key, value)  # 中文注释：仅在未存在同名模板时写入
+            for key, value in reused_cache_update.items():  # 中文注释：更新复用输出空模板缓存
+                reused_fallback_cache.setdefault(key, value)  # 中文注释：仅在未存在同名模板时写入
+        sample_count = len(sampling_results)  # 中文注释：记录样本数量用于构建拼接列表
+        teacher_keys = set(teacher_fallback_cache.keys())  # 中文注释：初始化教师输出键集合
+        reused_keys = set(reused_fallback_cache.keys())  # 中文注释：初始化复用输出键集合
+        for sample_outputs in teacher_storage:  # 中文注释：遍历逐样本教师输出
+            teacher_keys.update(sample_outputs.keys())  # 中文注释：补充键集合
+        for sample_outputs in reused_storage:  # 中文注释：遍历逐样本复用输出
+            reused_keys.update(sample_outputs.keys())  # 中文注释：补充键集合
+        aggregated_teacher: Dict[str, List[Tensor]] = {key: [None] * sample_count for key in teacher_keys}  # 中文注释：创建教师输出的逐样本列表结构
+        aggregated_reused: Dict[str, List[Tensor]] = {key: [None] * sample_count for key in reused_keys}  # 中文注释：创建复用输出的逐样本列表结构
+        for sample_idx, sample_outputs in enumerate(teacher_storage):  # 中文注释：遍历教师逐样本输出
+            for key, value in sample_outputs.items():  # 中文注释：遍历当前样本的所有输出项
+                aggregated_teacher[key][sample_idx] = value  # 中文注释：将张量放回对应位置
+        for sample_idx, sample_outputs in enumerate(reused_storage):  # 中文注释：遍历复用逐样本输出
+            for key, value in sample_outputs.items():  # 中文注释：遍历当前样本的所有输出项
+                aggregated_reused[key][sample_idx] = value  # 中文注释：将张量放回对应位置
+        for key in teacher_keys:  # 中文注释：为缺少模板的教师键补齐空张量
+            if key not in teacher_fallback_cache:  # 中文注释：当缓存中不存在该键时
+                for sample_outputs in teacher_storage:  # 中文注释：遍历样本寻找可用张量
+                    if key in sample_outputs:  # 中文注释：找到首个包含该键的样本
+                        template_tensor = sample_outputs[key]  # 中文注释：获取对应张量
+                        teacher_fallback_cache[key] = template_tensor.new_empty((0,) + template_tensor.shape[1:])  # 中文注释：基于该张量创建零长度模板
+                        break  # 中文注释：完成模板创建后跳出循环
+        for key in reused_keys:  # 中文注释：为缺少模板的复用键补齐空张量
+            if key not in reused_fallback_cache:  # 中文注释：当缓存中不存在该键时
+                for sample_outputs in reused_storage:  # 中文注释：遍历样本寻找可用张量
+                    if key in sample_outputs:  # 中文注释：找到首个包含该键的样本
+                        template_tensor = sample_outputs[key]  # 中文注释：获取对应张量
+                        reused_fallback_cache[key] = template_tensor.new_empty((0,) + template_tensor.shape[1:])  # 中文注释：创建零长度模板
+                        break  # 中文注释：模板创建完成后跳出循环
+        diff_bbox_results = self._finalize_grouped_outputs(aggregated_teacher, teacher_fallback_cache)  # 中文注释：按批次顺序拼接教师输出
+        reused_bbox_results = self._finalize_grouped_outputs(aggregated_reused, reused_fallback_cache)  # 中文注释：按批次顺序拼接复用输出
+        if 'cls_score' not in reused_bbox_results or 'cls_score' not in diff_bbox_results:  # 中文注释：确保分类输出存在
+            raise KeyError('教师或复用分支缺少cls_score，无法计算分类蒸馏损失。')  # 中文注释：抛出错误提示
+        if 'bbox_pred' not in reused_bbox_results or 'bbox_pred' not in diff_bbox_results:  # 中文注释：确保回归输出存在
+            raise KeyError('教师或复用分支缺少bbox_pred，无法计算回归蒸馏损失。')  # 中文注释：抛出错误提示
+        losses_kd = dict()  # 中文注释：初始化蒸馏损失容器
+        reused_cls_scores = reused_bbox_results['cls_score']  # 中文注释：提取复用分支的分类预测
+        diff_cls_scores = diff_bbox_results['cls_score']  # 中文注释：提取教师分支的分类预测
+        avg_factor = sum([res.avg_factor for res in sampling_results])  # 中文注释：汇总正负样本权重用于归一化
+        loss_cls_kd = self.loss_cls_kd(  # 中文注释：计算分类蒸馏损失
             reused_cls_scores,
             diff_cls_scores,
             avg_factor=avg_factor)
-        losses_kd['loss_cls_kd'] = loss_cls_kd
-        # l1 loss
-        assert student_head.bbox_head.reg_class_agnostic \
-            == diff_head.bbox_head.reg_class_agnostic
-        num_classes = student_head.bbox_head.num_classes
-        reused_bbox_preds = reused_bbox_results['bbox_pred']
-        diff_bbox_preds = diff_bbox_results['bbox_pred']
-        diff_cls_scores = diff_cls_scores.softmax(dim=1)[:, :num_classes]
-        reg_weights, reg_distill_idx = diff_cls_scores.max(dim=1)
-        if not student_head.bbox_head.reg_class_agnostic:
-            reg_distill_idx = reg_distill_idx[:, None, None].repeat(1, 1, 4)
-            reused_bbox_preds = reused_bbox_preds.reshape(-1, num_classes, 4)
-            reused_bbox_preds = reused_bbox_preds.gather(
-                dim=1, index=reg_distill_idx)
-            reused_bbox_preds = reused_bbox_preds.squeeze(1)
-            diff_bbox_preds = diff_bbox_preds.reshape(-1, num_classes, 4)
-            diff_bbox_preds = diff_bbox_preds.gather(
-                dim=1, index=reg_distill_idx)
-            diff_bbox_preds = diff_bbox_preds.squeeze(1)
-
-        loss_reg_kd = self.loss_reg_kd(
+        losses_kd['loss_cls_kd'] = loss_cls_kd  # 中文注释：记录分类蒸馏损失
+        assert student_head.bbox_head.reg_class_agnostic == reference_diff_head.bbox_head.reg_class_agnostic  # 中文注释：验证学生与教师在回归模式上保持一致
+        num_classes = student_head.bbox_head.num_classes  # 中文注释：读取类别数量用于回归通道选择
+        reused_bbox_preds = reused_bbox_results['bbox_pred']  # 中文注释：提取复用分支的回归预测
+        diff_bbox_preds = diff_bbox_results['bbox_pred']  # 中文注释：提取教师分支的回归预测
+        diff_prob = diff_cls_scores.softmax(dim=1)[:, :num_classes]  # 中文注释：对教师分类结果做Softmax并截取目标类别范围
+        reg_weights, reg_distill_idx = diff_prob.max(dim=1)  # 中文注释：获取最大概率及其对应类别索引用于加权回归
+        if not student_head.bbox_head.reg_class_agnostic:  # 中文注释：当回归分支按类别划分时需根据最优类别挑选通道
+            reg_distill_idx = reg_distill_idx[:, None, None].repeat(1, 1, 4)  # 中文注释：扩展索引形状匹配回归张量
+            reused_bbox_preds = reused_bbox_preds.reshape(-1, num_classes, 4)  # 中文注释：将复用回归结果重塑为类别维度
+            reused_bbox_preds = reused_bbox_preds.gather(dim=1, index=reg_distill_idx).squeeze(1)  # 中文注释：按照选定类别抽取对应回归预测
+            diff_bbox_preds = diff_bbox_preds.reshape(-1, num_classes, 4)  # 中文注释：重塑教师回归结果
+            diff_bbox_preds = diff_bbox_preds.gather(dim=1, index=reg_distill_idx).squeeze(1)  # 中文注释：抽取教师在目标类别下的回归预测
+        loss_reg_kd = self.loss_reg_kd(  # 中文注释：计算回归蒸馏损失
             reused_bbox_preds,
             diff_bbox_preds,
             weight=reg_weights[:, None],
             avg_factor=reg_weights.sum() * 4)
-        losses_kd['loss_reg_kd'] = loss_reg_kd
-
-        bbox_results = dict()
-        for key, value in stu_bbox_results.items():
-            bbox_results['stu_' + key] = value
-        for key, value in diff_bbox_results.items():
-            bbox_results['diff_' + key] = value
-        for key, value in reused_bbox_results.items():
-            bbox_results['reused_' + key] = value
-        bbox_results['loss_bbox_kd'] = losses_kd
-        return bbox_results
+        losses_kd['loss_reg_kd'] = loss_reg_kd  # 中文注释：记录回归蒸馏损失
+        bbox_results = dict()  # 中文注释：初始化返回字典
+        for key, value in stu_bbox_results.items():  # 中文注释：遍历学生分支输出
+            bbox_results['stu_' + key] = value  # 中文注释：为学生输出添加前缀后存储
+        for key, value in diff_bbox_results.items():  # 中文注释：遍历教师分支拼接结果
+            bbox_results['diff_' + key] = value  # 中文注释：为教师输出添加前缀后存储
+        for key, value in reused_bbox_results.items():  # 中文注释：遍历复用分支拼接结果
+            bbox_results['reused_' + key] = value  # 中文注释：为复用输出添加前缀后存储
+        bbox_results['loss_bbox_kd'] = losses_kd  # 中文注释：写入蒸馏损失项
+        return bbox_results  # 中文注释：返回包含三分支输出与蒸馏损失的字典
