@@ -417,7 +417,20 @@ class SemiBaseDiffDetector(BaseDetector):
                     origin_sample.gt_instances.bboxes,
                     torch.from_numpy(origin_sample.homography_matrix).inverse().to(
                         self.data_preprocessor.device), origin_sample.ori_shape)
-                primary_feature_list[sample_idx] = primary_feature[local_idx]  # 记录主教师特征，按原批序填充
+                if isinstance(primary_feature, (list, tuple)) and primary_feature and all(torch.is_tensor(level_feat) for level_feat in primary_feature):  # 中文注释：当主教师以多尺度张量列表返回时按样本提取每个尺度
+                    primary_feature_list[sample_idx] = [level_feat[local_idx] for level_feat in primary_feature]  # 中文注释：逐尺度切片并构成当前样本的特征列表
+                elif torch.is_tensor(primary_feature):  # 中文注释：当主教师特征为单个张量时直接按样本索引切片
+                    primary_feature_list[sample_idx] = [primary_feature[local_idx]]  # 中文注释：将单尺度特征包装成列表保持后续接口一致
+                elif isinstance(primary_feature, (list, tuple)) and primary_feature:  # 中文注释：当主教师返回的结构为样本列表等其他序列时兜底处理
+                    extracted_entry = primary_feature[local_idx]  # 中文注释：提取当前样本对应的条目
+                    if isinstance(extracted_entry, (list, tuple)):  # 中文注释：若条目本身为多尺度序列则直接转为列表
+                        primary_feature_list[sample_idx] = list(extracted_entry)  # 中文注释：保持原有尺度排列
+                    elif torch.is_tensor(extracted_entry):  # 中文注释：若条目为张量则统一包装成列表
+                        primary_feature_list[sample_idx] = [extracted_entry]  # 中文注释：确保后续处理始终基于列表结构
+                    else:  # 中文注释：对于无法识别的类型直接存储原始对象以便后续兼容逻辑处理
+                        primary_feature_list[sample_idx] = extracted_entry  # 中文注释：保留原始数据避免信息丢失
+                else:  # 中文注释：当主教师特征结构异常时直接透传以防止流程中断
+                    primary_feature_list[sample_idx] = primary_feature  # 中文注释：在未知结构下保留原引用供后续判断
             for peer_sensor, peer_teacher in self.diff_teacher_bank.items():  # 遍历其它教师以获取交叉特征
                 if peer_sensor == sensor_tag:  # 跳过主教师自身
                     continue  # 仅处理同伴教师
@@ -426,7 +439,20 @@ class SemiBaseDiffDetector(BaseDetector):
                 peer_results, peer_feature = peer_teacher.predict(  # 调用同伴教师获取预测与特征
                     peer_inputs, peer_samples, rescale=False, return_feature=True)
                 for local_idx, sample_idx in enumerate(sample_indices):  # 将同伴特征写入对应位置
-                    peer_feature_list[sample_idx][peer_sensor] = peer_feature[local_idx]  # 按传感器标签归档特征
+                    if isinstance(peer_feature, (list, tuple)) and peer_feature and all(torch.is_tensor(level_feat) for level_feat in peer_feature):  # 中文注释：当同伴教师返回多尺度列表时逐尺度提取
+                        peer_feature_list[sample_idx][peer_sensor] = [level_feat[local_idx] for level_feat in peer_feature]  # 中文注释：将当前样本的所有尺度特征整理成列表
+                    elif torch.is_tensor(peer_feature):  # 中文注释：当同伴教师返回单张量时按样本切片
+                        peer_feature_list[sample_idx][peer_sensor] = [peer_feature[local_idx]]  # 中文注释：统一包装成列表保持接口一致
+                    elif isinstance(peer_feature, (list, tuple)) and peer_feature:  # 中文注释：当同伴教师输出其他序列结构时执行兼容处理
+                        extracted_peer = peer_feature[local_idx]  # 中文注释：取出当前样本对应的条目
+                        if isinstance(extracted_peer, (list, tuple)):  # 中文注释：若条目自身为多尺度序列则转为列表
+                            peer_feature_list[sample_idx][peer_sensor] = list(extracted_peer)  # 中文注释：保留原始尺度顺序
+                        elif torch.is_tensor(extracted_peer):  # 中文注释：若条目为张量则包装成列表
+                            peer_feature_list[sample_idx][peer_sensor] = [extracted_peer]  # 中文注释：确保后续处理一致
+                        else:  # 中文注释：在遇到未知类型时直接存储原始对象
+                            peer_feature_list[sample_idx][peer_sensor] = extracted_peer  # 中文注释：保留原始结构供后续逻辑自行判断
+                    else:  # 中文注释：在缺失或结构异常时直接记录原始返回值
+                        peer_feature_list[sample_idx][peer_sensor] = peer_feature  # 中文注释：透传异常结构防止信息损失
                     peer_prediction_list[sample_idx][peer_sensor] = peer_results[local_idx].pred_instances  # 记录同伴教师预测实例
                     primary_instances = primary_results[local_idx].pred_instances  # 中文注释：读取当前样本主教师的预测实例用于匹配
                     peer_instances = peer_results[local_idx].pred_instances  # 中文注释：读取当前样本同伴教师的预测实例
