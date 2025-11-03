@@ -28,10 +28,12 @@ detector.diff_model = dict(  # 配置扩散教师信息
     teachers=[  # 列出全部扩散教师
         dict(  # 红外教师配置
             name='ir',  # 教师名称
+            sensor='ir',  # 指定与数据集标注一致的传感器标签
             config='DG/Ours/drone/diffusion_detector_drone_ir_clear_day.py',  # 教师配置路径
             pretrained_model='/mnt/ssd/lql/Fitness-Generalization-Transferability/work_dirs/diffusion_detector_drone_ir_clear_day/best_coco_bbox_mAP_50_iter_5000.pth'),  # 红外教师权重
         dict(  # 可见光教师配置
             name='rgb',  # 教师名称
+            sensor='rgb',  # 指定与数据集标注一致的传感器标签
             config='DG/Ours/drone/diffusion_detector_drone_rgb_sim.py',  # 教师配置路径
             pretrained_model='/mnt/ssd/lql/Fitness-Generalization-Transferability/work_dirs/diffusion_detector_drone_rgb_sim/best_coco_bbox_mAP_50_iter_20000.pth')  # 可见光教师权重
     ])  # 教师列表定义完毕
