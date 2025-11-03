@@ -9,6 +9,7 @@ from mmdet.models.utils import (rename_loss_dict,
 from mmdet.registry import MODELS
 from mmdet.structures import SampleList
 from mmdet.utils import ConfigType, OptConfigType, OptMultiConfig
+from mmengine.logging import MMLogger  # 中文注释：引入日志记录器以便在调试阶段输出一致性损失信息
 from .base import BaseDetector
 from ..losses import KDLoss
 
@@ -70,6 +71,8 @@ class DomainAdaptationDetector(BaseDetector):
             'cls_weight', 0.0)  # 中文注释：获取交叉教师分类一致性损失的权重默认关闭
         self.cross_reg_loss_weight = self.cross_consistency_cfg.get(
             'reg_weight', 0.0)  # 中文注释：获取交叉教师回归一致性损失的权重默认关闭
+        self.cross_consistency_debug_log = self.cross_consistency_cfg.get(
+            'debug_log', False)  # 中文注释：读取是否启用交叉一致性损失的调试日志输出开关
         self.burn_up_iters = self.train_cfg.detector_cfg.get('burn_up_iters', 0)
         self.local_iter = 0
 
@@ -273,6 +276,13 @@ class DomainAdaptationDetector(BaseDetector):
             feature_loss['pkd_cross_feature_loss'] = cross_loss_value  # 中文注释：将交叉教师特征蒸馏损失写入结果字典
         if cross_teacher_info is not None and cross_has_consistency:  # 中文注释：仅在确实存在一致性信息时才计算相应损失
             feature_loss.update(self.loss_cross_feature(cross_teacher_info))  # 中文注释：调用辅助函数计算分类与回归一致性损失
+        if self.cross_consistency_debug_log:  # 中文注释：当启用调试日志时输出交叉一致性损失数值
+            logger = MMLogger.get_current_instance()  # 中文注释：获取当前训练过程绑定的日志记录器实例
+            if logger is not None:  # 中文注释：仅在日志记录器存在时才尝试写入信息
+                if 'cross_cls_consistency_loss' in feature_loss:  # 中文注释：检查分类一致性损失是否已计算
+                    logger.info(f"cross_cls_consistency_loss={feature_loss['cross_cls_consistency_loss'].item():.6f}")  # 中文注释：记录分类一致性损失的标量数值便于观测
+                if 'cross_reg_consistency_loss' in feature_loss:  # 中文注释：检查回归一致性损失是否已计算
+                    logger.info(f"cross_reg_consistency_loss={feature_loss['cross_reg_consistency_loss'].item():.6f}")  # 中文注释：记录回归一致性损失的标量数值便于观测
         losses.update(feature_loss)  # 中文注释：将所有特征相关损失合并到最终输出
         return losses  # 中文注释：返回损失字典供训练流程使用
 

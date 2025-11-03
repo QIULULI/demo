@@ -2,14 +2,14 @@
 import copy
 from typing import Dict
 from typing import Any, List, Optional, Union, Tuple
-import torch
-import torch.nn as nn
-from torch import Tensor
+import torch  # 中文注释：导入PyTorch基础库用于张量运算
+import torch.nn as nn  # 中文注释：导入神经网络模块以便构建模型与操作层
+from torch import Tensor  # 中文注释：从PyTorch中显式导入Tensor类型便于类型标注
 
 from mmdet.models.utils import (filter_gt_instances, rename_loss_dict, reweight_loss_dict)
 from mmdet.registry import MODELS
 from mmdet.structures import SampleList
-from mmdet.structures.bbox import bbox_project
+from mmdet.structures.bbox import bbox_project, bbox_overlaps  # 中文注释：导入边界框投影与IoU计算函数用于伪标签与匹配
 from mmdet.utils import ConfigType, OptConfigType, OptMultiConfig
 from .base import BaseDetector
 
@@ -99,7 +99,12 @@ class SemiBaseDiffDetector(BaseDetector):
             self.active_diff_key = 'student'  # 标记学生为当前主教师
         self.diff_teacher_bank = self.diff_detectors  # 确保教师资源库最终指向完整教师字典
 
-        self.semi_train_cfg = semi_train_cfg
+        self.semi_train_cfg = semi_train_cfg  # 中文注释：记录半监督训练阶段的配置字典以便各类损失读取参数
+        cross_cfg_candidate = self._fetch_config_value(self.semi_train_cfg, 'cross_consistency_cfg', {}) if self.semi_train_cfg is not None else {}  # 中文注释：尝试从训练配置中抽取交叉一致性相关的子配置
+        self.cross_consistency_cfg = cross_cfg_candidate if cross_cfg_candidate is not None else {}  # 中文注释：若未设置则回退为空字典确保后续访问安全
+        self.cross_consistency_iou_thr = float(self.cross_consistency_cfg.get('iou_thr', 0.5))  # 中文注释：读取用于匹配候选框的IoU阈值默认0.5
+        self.cross_consistency_min_conf = float(self.cross_consistency_cfg.get('min_conf', 0.0))  # 中文注释：读取主教师候选框的最小置信度筛选阈值默认0
+        self.cross_consistency_max_pairs = self.cross_consistency_cfg.get('max_pairs', None)  # 中文注释：读取每幅图像允许用于一致性计算的最大匹配对数量
         self.semi_test_cfg = semi_test_cfg
         if self.semi_train_cfg.get('freeze_teacher', True) is True:
             self.freeze(self.teacher)
@@ -180,6 +185,13 @@ class SemiBaseDiffDetector(BaseDetector):
                 'aliases': alias_candidates  # 记录全部可匹配的别名集合
             }
         return normalized_configs  # 返回标准化后的配置字典
+
+    @staticmethod
+    def _binary_kl_div(p: Tensor, q: Tensor, eps: float = 1e-6) -> Tensor:
+        """中文注释：计算二元概率分布之间的KL散度以衡量分类一致性。"""
+        p = p.clamp(min=eps, max=1 - eps)  # 中文注释：限制主教师概率范围避免对数计算发生数值溢出
+        q = q.clamp(min=eps, max=1 - eps)  # 中文注释：限制同伴教师概率范围保持运算稳定
+        return p * torch.log(p / q) + (1 - p) * torch.log((1 - p) / (1 - q))  # 中文注释：按照KL散度定义累加正类与负类的贡献
 
     def cuda(self, device: Optional[str] = None) -> nn.Module:  # 重载cuda方法，确保所有扩散教师迁移到指定设备
         """Since teacher is registered as a plain object, it is necessary to
@@ -380,6 +392,10 @@ class SemiBaseDiffDetector(BaseDetector):
         primary_feature_list: List[Any] = [None] * sample_count  # 为主教师特征预留位置
         peer_feature_list: List[Dict[str, Any]] = [dict() for _ in range(sample_count)]  # 初始化同伴特征字典列表
         peer_prediction_list: List[Dict[str, Any]] = [dict() for _ in range(sample_count)]  # 初始化同伴预测字典列表
+        device_for_stats = batch_inputs.device  # 中文注释：记录输入张量所在设备以保证统计量与主干数据保持一致
+        dtype_for_stats = batch_inputs.dtype  # 中文注释：记录输入张量的数据类型以便创建数值统计张量
+        sample_cls_stats = [{'sum': torch.zeros((), device=device_for_stats, dtype=dtype_for_stats), 'count': 0} for _ in range(sample_count)]  # 中文注释：为每个样本初始化分类一致性累加器与计数器
+        sample_reg_stats = [{'sum': torch.zeros((), device=device_for_stats, dtype=dtype_for_stats), 'count': 0} for _ in range(sample_count)]  # 中文注释：为每个样本初始化回归一致性累加器与计数器
         sensor_to_indices: Dict[str, List[int]] = {}  # 构建传感器到样本索引的映射
         for idx, data_samples in enumerate(batch_data_samples):  # 遍历批次中的每个样本
             if not hasattr(data_samples, 'metainfo') or 'sensor' not in data_samples.metainfo:  # 若样本缺少传感器标签
@@ -412,16 +428,88 @@ class SemiBaseDiffDetector(BaseDetector):
                 for local_idx, sample_idx in enumerate(sample_indices):  # 将同伴特征写入对应位置
                     peer_feature_list[sample_idx][peer_sensor] = peer_feature[local_idx]  # 按传感器标签归档特征
                     peer_prediction_list[sample_idx][peer_sensor] = peer_results[local_idx].pred_instances  # 记录同伴教师预测实例
+                    primary_instances = primary_results[local_idx].pred_instances  # 中文注释：读取当前样本主教师的预测实例用于匹配
+                    peer_instances = peer_results[local_idx].pred_instances  # 中文注释：读取当前样本同伴教师的预测实例
+                    main_bboxes = getattr(primary_instances, 'bboxes', None)  # 中文注释：获取主教师预测框张量
+                    peer_bboxes = getattr(peer_instances, 'bboxes', None)  # 中文注释：获取同伴教师预测框张量
+                    if main_bboxes is None or peer_bboxes is None or main_bboxes.numel() == 0 or peer_bboxes.numel() == 0:  # 中文注释：若任一教师缺少有效候选框则跳过一致性计算
+                        continue  # 中文注释：跳过当前样本的交叉一致性评估
+                    peer_bboxes = peer_bboxes.to(device=main_bboxes.device, dtype=main_bboxes.dtype)  # 中文注释：将同伴教师预测框转换到与主教师一致的设备与数据类型
+                    main_scores = getattr(primary_instances, 'scores', None)  # 中文注释：读取主教师的分类置信度
+                    peer_scores = getattr(peer_instances, 'scores', None)  # 中文注释：读取同伴教师的分类置信度
+                    if main_scores is None:  # 中文注释：当主教师未提供置信度时使用单位张量代替
+                        main_scores = torch.ones(main_bboxes.shape[0], device=main_bboxes.device, dtype=main_bboxes.dtype)  # 中文注释：构造全为1的置信度以保持流程连续
+                    else:
+                        main_scores = main_scores.to(device=main_bboxes.device, dtype=main_bboxes.dtype)  # 中文注释：确保主教师置信度与边界框处于相同设备与精度
+                    if peer_scores is None:  # 中文注释：当同伴教师未提供置信度时使用单位张量代替
+                        peer_scores = torch.ones(peer_bboxes.shape[0], device=main_bboxes.device, dtype=main_bboxes.dtype)  # 中文注释：构造全为1的置信度避免出现空值
+                    else:
+                        peer_scores = peer_scores.to(device=main_bboxes.device, dtype=main_bboxes.dtype)  # 中文注释：确保同伴教师置信度张量与主教师匹配
+                    selection_mask = torch.ones(main_bboxes.shape[0], dtype=torch.bool, device=main_bboxes.device)  # 中文注释：初始化主教师候选框选择掩码
+                    if self.cross_consistency_min_conf > 0:  # 中文注释：若配置了最小置信度则依据该阈值筛选候选框
+                        selection_mask = selection_mask & (main_scores >= self.cross_consistency_min_conf)  # 中文注释：仅保留置信度满足要求的主教师候选框
+                    selected_indices = torch.nonzero(selection_mask, as_tuple=False).squeeze(1)  # 中文注释：提取满足筛选条件的候选框索引
+                    if selected_indices.numel() == 0:  # 中文注释：若没有候选框通过筛选则无法计算一致性
+                        continue  # 中文注释：跳过当前样本的交叉一致性评估
+                    if isinstance(self.cross_consistency_max_pairs, (int, float)) and self.cross_consistency_max_pairs > 0 and selected_indices.numel() > int(self.cross_consistency_max_pairs):  # 中文注释：当设置了匹配对上限且候选过多时执行裁剪
+                        max_pair_limit = int(self.cross_consistency_max_pairs)  # 中文注释：将配置的匹配数量转换为整数以便索引操作
+                        selected_scores = main_scores[selected_indices]  # 中文注释：收集候选框对应的置信度用于排序
+                        _, topk_indices = torch.topk(selected_scores, k=max_pair_limit, largest=True)  # 中文注释：选择置信度最高的若干候选框以控制匹配数量
+                        selected_indices = selected_indices[topk_indices]  # 中文注释：根据排序结果截取最终参与匹配的索引
+                    overlaps = bbox_overlaps(main_bboxes[selected_indices], peer_bboxes)  # 中文注释：计算主教师候选框与同伴教师候选框之间的IoU矩阵
+                    if overlaps.numel() == 0:  # 中文注释：若IoU矩阵为空说明无法建立匹配关系
+                        continue  # 中文注释：跳过当前样本的交叉一致性评估
+                    max_iou, matched_peer_indices = overlaps.max(dim=1)  # 中文注释：为每个主教师候选框选取IoU最高的同伴候选框
+                    if self.cross_consistency_iou_thr > 0:  # 中文注释：当设定了IoU阈值时依据该阈值过滤弱匹配
+                        valid_mask = max_iou >= self.cross_consistency_iou_thr  # 中文注释：仅保留满足IoU门槛的匹配结果
+                    else:
+                        valid_mask = torch.ones_like(max_iou, dtype=torch.bool)  # 中文注释：未设置阈值时默认全部匹配有效
+                    if valid_mask.sum() == 0:  # 中文注释：若没有匹配通过阈值则无法继续计算
+                        continue  # 中文注释：跳过当前样本的交叉一致性评估
+                    matched_main_indices = selected_indices[valid_mask]  # 中文注释：提取有效匹配对应的主教师候选框索引
+                    matched_peer_indices = matched_peer_indices[valid_mask]  # 中文注释：提取有效匹配对应的同伴教师候选框索引
+                    matched_main_scores = main_scores[matched_main_indices]  # 中文注释：获取参与一致性计算的主教师置信度
+                    matched_peer_scores = peer_scores[matched_peer_indices]  # 中文注释：获取对应的同伴教师置信度
+                    cls_losses = self._binary_kl_div(matched_main_scores, matched_peer_scores)  # 中文注释：计算主教师与同伴教师在匹配候选上的分类KL散度
+                    matched_main_boxes = main_bboxes[matched_main_indices]  # 中文注释：收集主教师匹配候选框的坐标
+                    matched_peer_boxes = peer_bboxes[matched_peer_indices]  # 中文注释：收集同伴教师匹配候选框的坐标
+                    reg_losses = torch.abs(matched_main_boxes - matched_peer_boxes).mean(dim=1)  # 中文注释：对匹配候选框的坐标差异计算L1损失
+                    sample_cls_stats[sample_idx]['sum'] = sample_cls_stats[sample_idx]['sum'] + cls_losses.sum().to(device=device_for_stats, dtype=dtype_for_stats)  # 中文注释：将当前匹配的分类损失累加到对应样本的统计量
+                    sample_cls_stats[sample_idx]['count'] += int(cls_losses.numel())  # 中文注释：更新当前样本的分类匹配数量
+                    sample_reg_stats[sample_idx]['sum'] = sample_reg_stats[sample_idx]['sum'] + reg_losses.sum().to(device=device_for_stats, dtype=dtype_for_stats)  # 中文注释：将当前匹配的回归损失累加到对应样本的统计量
+                    sample_reg_stats[sample_idx]['count'] += int(reg_losses.numel())  # 中文注释：更新当前样本的回归匹配数量
         distill_feature = {  # 汇总主教师与同伴教师特征
             'main_teacher': primary_feature_list  # 主教师特征列表，顺序与批输入一致
         }
         has_cross_feature = any(len(feature_map) > 0 for feature_map in peer_feature_list)  # 判断是否存在有效的同伴特征
-        if has_cross_feature:  # 当存在同伴特征时构造交叉教师信息
-            cross_teacher_payload: Dict[str, Any] = {'features': peer_feature_list}  # 写入同伴特征列表
-            has_cross_prediction = any(len(pred_map) > 0 for pred_map in peer_prediction_list)  # 判断是否存在同伴预测
-            if has_cross_prediction:  # 若存在同伴预测结果
-                cross_teacher_payload['predictions'] = peer_prediction_list  # 将同伴预测写入返回结构
-            distill_feature['cross_teacher'] = cross_teacher_payload  # 将交叉教师信息补充到整体返回字典
+        has_cross_prediction = any(len(pred_map) > 0 for pred_map in peer_prediction_list)  # 中文注释：判断是否存在同伴教师的预测结果
+        cls_per_sample: List[Optional[Tensor]] = []  # 中文注释：初始化分类一致性逐样本统计列表
+        reg_per_sample: List[Optional[Tensor]] = []  # 中文注释：初始化回归一致性逐样本统计列表
+        for cls_stats, reg_stats in zip(sample_cls_stats, sample_reg_stats):  # 中文注释：遍历每个样本的分类与回归统计量
+            if cls_stats['count'] > 0:  # 中文注释：当分类匹配数量大于零时计算平均KL散度
+                cls_per_sample.append(cls_stats['sum'] / cls_stats['count'])  # 中文注释：记录该样本的平均分类一致性值
+            else:
+                cls_per_sample.append(None)  # 中文注释：当无匹配对时以None占位便于后续判断
+            if reg_stats['count'] > 0:  # 中文注释：当回归匹配数量大于零时计算平均L1损失
+                reg_per_sample.append(reg_stats['sum'] / reg_stats['count'])  # 中文注释：记录该样本的平均回归一致性值
+            else:
+                reg_per_sample.append(None)  # 中文注释：无匹配对时占位以避免误用
+        valid_cls_values = [value for value in cls_per_sample if value is not None]  # 中文注释：筛选出真实存在的分类一致性结果
+        valid_reg_values = [value for value in reg_per_sample if value is not None]  # 中文注释：筛选出真实存在的回归一致性结果
+        has_cls_metric = len(valid_cls_values) > 0  # 中文注释：判断是否存在可用的分类一致性度量
+        has_reg_metric = len(valid_reg_values) > 0  # 中文注释：判断是否存在可用的回归一致性度量
+        zero_scalar = torch.zeros((), device=device_for_stats, dtype=dtype_for_stats)  # 中文注释：预先构造零标量便于在缺失时回退
+        cls_consistency_value = torch.stack(valid_cls_values).mean() if has_cls_metric else zero_scalar  # 中文注释：汇总所有样本的分类一致性并在缺失时返回零
+        reg_consistency_value = torch.stack(valid_reg_values).mean() if has_reg_metric else zero_scalar.clone()  # 中文注释：汇总所有样本的回归一致性并在缺失时返回零并拷贝一份零标量避免共享引用
+        if has_cross_feature or has_cross_prediction or has_cls_metric or has_reg_metric:  # 中文注释：当至少存在一种交叉信息或一致性指标时构造返回包
+            cross_teacher_payload: Dict[str, Any] = {}  # 中文注释：初始化交叉教师返回字典
+            if has_cross_feature:  # 中文注释：存在同伴特征时写入列表
+                cross_teacher_payload['features'] = peer_feature_list  # 中文注释：记录每个样本对应的同伴教师特征
+            if has_cross_prediction:  # 中文注释：存在同伴预测时一并写入
+                cross_teacher_payload['predictions'] = peer_prediction_list  # 中文注释：记录同伴教师输出的预测实例
+            cross_teacher_payload['cls_consistency'] = cls_consistency_value  # 中文注释：写入跨教师分类一致性的平均结果
+            cross_teacher_payload['reg_consistency'] = reg_consistency_value  # 中文注释：写入跨教师回归一致性的平均结果
+            distill_feature['cross_teacher'] = cross_teacher_payload  # 中文注释：将交叉教师信息补充到整体返回字典
         return batch_data_samples, batch_info, distill_feature  # 返回伪标签、批信息与多教师特征
 
     def _parse_diff_feature(self, diff_feature: Any, batch_info: dict) -> dict:
