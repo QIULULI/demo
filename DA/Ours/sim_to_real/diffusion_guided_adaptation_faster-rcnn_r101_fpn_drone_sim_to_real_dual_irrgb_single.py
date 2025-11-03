@@ -4,7 +4,7 @@
 _base_ = [  # 指定继承的基础配置列表
     '../../_base_/models/diffusion_guided_adaptation_faster_rcnn_r101_fpn.py',  # 继承扩散引导学生结构
     '../../_base_/da_setting/semi_20k.py',  # 继承半监督20k训练调度
-    '../../_base_/datasets/sim_to_real/semi_drone_rgb_aug.py',  # 继承多模态仿真到真实的数据设置
+    '../../_base_/datasets/sim_to_real/semi_drone_ir_rgb_aug.py',  # 继承包含SetSensorTag写入传感器元信息的RGB+IR数据配置
 ]  # 基础配置列表结束
 
 classes = ('drone',)  # 定义任务类别，仅包含无人机
@@ -32,9 +32,29 @@ detector.detector.rpn_head.anchor_generator = dict(  # 调整RPN锚框生成器�
 # 若已训练完成双模态互学习教师，可将pretrained_model路径替换为Dual_Diffusion_Teacher权重
 # 为保证训练正常启动，请先准备好DD_IR.pth与DD_RGB.pth或等效文件
 
-detector.diff_model = [  # 使用列表形式显式声明多名扩散教师
-    dict(sensor='sim_rgb', config='DG/Ours/drone/diffusion_detector_drone_dual_ir_rgb.py', pretrained_model='work_dirs/Dual_Diffusion_Teacher.pth'),  # 仿真RGB教师配置结束
-]  # 扩散教师列表定义完成
+detector.diff_model = dict(  # 使用字典形式同时声明教师池与主教师标识
+    main_teacher='dual_real_rgb',  # 指定默认主教师为真实域双模态教师以便覆盖真实样本
+    teachers=[  # 构建扩散教师列表确保每个传感器均有对应权重
+        dict(  # 第一名教师：仿真IR扩散检测器
+            name='sim_ir',  # 唯一名称用于从教师池中检索模型
+            sensor='sim_ir',  # 指定服务的传感器标签对应仿真IR样本
+            config='DG/Ours/drone/diffusion_detector_drone_ir_clear_day.py',  # 指向仿真IR教师的模型配置文件
+            pretrained_model='work_dirs/diffusion_detector_drone_ir_clear_day/best_coco_bbox_mAP_50_iter_5000.pth',  # 明确仿真IR教师的检查点路径方便权重加载
+        ),  # 仿真IR教师配置结束
+        dict(  # 第二名教师：仿真RGB扩散检测器
+            name='sim_rgb',  # 唯一名称用于仿真RGB教师
+            sensor='sim_rgb',  # 指定服务的传感器标签对应仿真RGB样本
+            config='DG/Ours/drone/diffusion_detector_drone_rgb_sim.py',  # 指向仿真RGB教师的模型配置文件
+            pretrained_model='work_dirs/diffusion_detector_drone_rgb_sim/best_coco_bbox_mAP_50_iter_20000.pth',  # 明确仿真RGB教师的检查点路径确保加载成功
+        ),  # 仿真RGB教师配置结束
+        dict(  # 第三名教师：真实域双模态扩散检测器
+            name='dual_real_rgb',  # 唯一名称用于真实域双模态教师
+            sensor='real_rgb',  # 指定服务的传感器标签对应真实RGB样本
+            config='DG/Ours/drone/diffusion_detector_drone_dual_ir_rgb.py',  # 指向双模态教师的模型配置文件以提供互补信息
+            pretrained_model='work_dirs/Dual_Diffusion_Teacher.pth',  # 明确双模态教师的检查点路径便于权重准备与加载
+        ),  # 真实域双模态教师配置结束
+    ],  # 扩散教师列表定义完成
+)  # 扩散教师字典配置完成
 
 # 如果希望采用互学习后导出的单一双模态教师，请将上方列表替换为
 # dict(sensor='sim_rgb', config='DG/Ours/drone/diffusion_detector_drone_dual_ir_rgb.py', pretrained_model='work_dirs/Dual_Diffusion_Teacher.pth')
