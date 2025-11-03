@@ -50,50 +50,54 @@ class SemiBaseDiffDetector(BaseDetector):
         super().__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
 
-        self.student = MODELS.build(detector.deepcopy())  # 构建学生模型副本
-        self.teacher = MODELS.build(detector.deepcopy())  # 构建教师模型副本
-        self.diff_detector = None  # 初始化当前启用的扩散教师指针
-        self.diff_detectors = dict()  # 构建一个字典用于缓存所有扩散教师
+        self.student = MODELS.build(detector.deepcopy())  # 构建学生模型副本用于梯度更新
+        self.teacher = MODELS.build(detector.deepcopy())  # 构建教师模型副本用于生成伪标签
+        self.diff_detector = None  # 初始化扩散教师占位符
+        self.diff_detectors = dict()  # 创建扩散教师存储字典
+        self.diff_teacher_bank = self.diff_detectors  # 将教师资源库引用到同一字典以便统一维护
         self.active_diff_key = None  # 记录当前激活的扩散教师标识
-        teacher_pool = None  # 初始化教师配置池占位
-        if isinstance(diff_model, dict):  # 当diff_model为常规字典或ConfigDict时提取多教师配置
-            teacher_pool = diff_model.get('teachers', None)  # 读取teachers列表
-        if teacher_pool:  # 若提供多教师配置列表
-            for teacher_cfg in teacher_pool:  # 遍历每个教师配置条目
-                teacher_name = teacher_cfg.get('name')  # 读取教师名称（区分IR/RGB）
-                if not teacher_name:  # 若缺失名称则跳过以避免键冲突
-                    continue  # 直接跳过当前教师
-                teacher_config_path = teacher_cfg.get('config', '')  # 读取教师对应的配置文件路径
-                built_teacher = None  # 初始化教师模型占位
-                if teacher_config_path:  # 若提供独立配置文件
-                    teacher_config = Config.fromfile(teacher_config_path)  # 通过配置文件构建Config对象
-                    built_teacher = MODELS.build(teacher_config['model'])  # 根据配置构建教师模型
-                else:  # 若未提供配置则退回当前检测器结构
-                    built_teacher = MODELS.build(detector.deepcopy())  # 直接拷贝主检测器结构
-                pretrained_path = teacher_cfg.get('pretrained_model') or teacher_cfg.get('checkpoint')  # 读取权重路径
-                if pretrained_path:  # 若提供预训练权重
-                    load_checkpoint(built_teacher, pretrained_path, map_location='cpu', strict=True)  # 加载对应权重
-                built_teacher.cuda()  # 将教师模型放置到GPU上
-                self.freeze(built_teacher)  # 冻结教师模型参数
-                self.diff_detectors[teacher_name] = built_teacher  # 将教师模型缓存到字典中
-            if self.diff_detectors:  # 若成功构建至少一个教师
-                self.active_diff_key = diff_model.get('main_teacher') if isinstance(diff_model, dict) else None  # 读取首选教师标识
-                if not self.active_diff_key or self.active_diff_key not in self.diff_detectors:  # 若未指定或名称非法
-                    self.active_diff_key = next(iter(self.diff_detectors.keys()))  # 回退到字典第一个教师
-                self.diff_detector = self.diff_detectors[self.active_diff_key]  # 设置当前激活教师
-        if self.diff_detector is None and getattr(diff_model, 'config', None):  # 若尚未成功加载教师且存在旧式配置
-            teacher_config = Config.fromfile(diff_model.config)  # 解析旧式单教师配置
-            self.diff_detector = MODELS.build(teacher_config['model'])  # 构建扩散教师模型
-            if diff_model.pretrained_model:  # 若提供对应权重
-                load_checkpoint(self.diff_detector, diff_model.pretrained_model, map_location='cpu', strict=True)  # 加载权重
-                self.diff_detector.cuda()  # 将教师迁移到GPU
-                self.freeze(self.diff_detector)  # 冻结教师参数
-            self.diff_detectors['default'] = self.diff_detector  # 将单教师也放入缓存字典
-            self.active_diff_key = 'default'  # 记录当前教师标识
-        if self.diff_detector is None:  # 若仍未找到有效教师
+        normalized_teachers = self._normalize_diff_teacher_configs(diff_model)  # 调用解析函数获取标准化教师配置
+        main_teacher_hint = self._fetch_config_value(diff_model, 'main_teacher') if diff_model is not None else None  # 读取主教师提示
+        for teacher_key, teacher_meta in normalized_teachers.items():  # 遍历标准化后的教师配置字典
+            teacher_model_cfg = None  # 初始化教师模型结构占位符
+            teacher_config_path = teacher_meta.get('config')  # 获取教师独立配置文件路径
+            raw_config_entry = teacher_meta.get('raw')  # 保留原始配置对象便于回退
+            if teacher_config_path:  # 若提供独立配置文件
+                teacher_config_obj = Config.fromfile(teacher_config_path)  # 载入配置文件生成Config对象
+                teacher_model_cfg = teacher_config_obj['model']  # 提取模型结构配置
+            elif isinstance(raw_config_entry, dict) and 'model' in raw_config_entry:  # 若原始配置直接给出模型字段
+                teacher_model_cfg = raw_config_entry['model']  # 直接使用内嵌模型配置
+            else:  # 当未提供专用配置时回退到学生检测器结构
+                teacher_model_cfg = detector.deepcopy()  # 复制学生模型配置以保持一致结构
+            teacher_instance = MODELS.build(copy.deepcopy(teacher_model_cfg))  # 根据模型配置构建扩散教师实例
+            pretrained_path = teacher_meta.get('pretrained_model')  # 读取预训练权重路径
+            if pretrained_path:  # 若存在对应权重
+                load_checkpoint(teacher_instance, pretrained_path, map_location='cpu', strict=True)  # 加载预训练权重确保参数一致
+            teacher_instance.cuda()  # 将教师模型迁移至GPU以加速推理
+            self.freeze(teacher_instance)  # 冻结教师模型参数避免训练阶段被更新
+            self.diff_detectors[teacher_key] = teacher_instance  # 将实例化教师写入字典并以标识符索引
+            alias_set = teacher_meta.get('aliases', set())  # 取出可选别名集合用于主教师匹配
+            if self.active_diff_key is None and main_teacher_hint is not None and (main_teacher_hint == teacher_key or main_teacher_hint in alias_set):  # 若尚未确定主教师且提示匹配当前教师
+                self.active_diff_key = teacher_key  # 将当前教师设为主教师
+        if self.diff_detectors:  # 若成功加载至少一名扩散教师
+            if self.active_diff_key is None:  # 若尚未确定主教师
+                self.active_diff_key = next(iter(self.diff_detectors.keys()))  # 默认选择字典中的第一名教师
+            self.diff_detector = self.diff_detectors[self.active_diff_key]  # 将当前激活教师指向主教师实例
+        elif diff_model is not None and self._fetch_config_value(diff_model, 'config') is not None:  # 若未能解析教师但存在旧式配置字段
+            teacher_config = Config.fromfile(self._fetch_config_value(diff_model, 'config'))  # 载入旧式配置文件
+            self.diff_detector = MODELS.build(teacher_config['model'])  # 构建单一扩散教师实例
+            pretrained_path = self._fetch_config_value(diff_model, 'pretrained_model') or self._fetch_config_value(diff_model, 'pretrained')  # 获取旧式权重字段
+            if pretrained_path:  # 若存在旧式权重
+                load_checkpoint(self.diff_detector, pretrained_path, map_location='cpu', strict=True)  # 加载旧式教师权重
+            self.diff_detector.cuda()  # 将旧式教师迁移至GPU
+            self.freeze(self.diff_detector)  # 冻结旧式教师参数
+            self.diff_detectors['default'] = self.diff_detector  # 将旧式教师登记到字典中
+            self.active_diff_key = 'default'  # 记录当前主教师标识
+        else:  # 当未提供任何有效教师配置时
             self.diff_detector = self.student  # 使用学生模型作为退路教师
-            self.diff_detectors['student'] = self.student  # 将学生注册进教师字典
-            self.active_diff_key = 'student'  # 记录当前教师标识
+            self.diff_detectors['student'] = self.student  # 将学生登记到扩散教师字典
+            self.active_diff_key = 'student'  # 标记学生为当前主教师
+        self.diff_teacher_bank = self.diff_detectors  # 确保教师资源库最终指向完整教师字典
 
         self.semi_train_cfg = semi_train_cfg
         self.semi_test_cfg = semi_test_cfg
@@ -147,16 +151,33 @@ class SemiBaseDiffDetector(BaseDetector):
                 for nested_cfg in current_cfg:  # 遍历内部元素
                     parsing_queue.append((nested_cfg, fallback_sensor))  # 保留备用传感器标签递归处理
                 continue  # 跳过后续步骤，等待下次循环
+            if not isinstance(current_cfg, dict) and not self._is_single_diff_config(current_cfg):  # 若当前元素既非字典也不含关键字段
+                continue  # 直接跳过无效条目以避免误解析
             sensor_key = self._fetch_config_value(current_cfg, 'sensor', fallback_sensor)  # 优先从配置中读取传感器标签
             if sensor_key is None:  # 若仍未获得标签
-                sensor_key = 'default'  # 使用default作为占位标签，兼容旧逻辑
+                sensor_key = self._fetch_config_value(current_cfg, 'name', fallback_sensor)  # 回退使用名称字段作为标识
+            if sensor_key is None:  # 若依旧无法确定标识
+                sensor_key = 'default'  # 使用default作为占位标签兼容旧逻辑
             config_path = self._fetch_config_value(current_cfg, 'config')  # 提取配置文件路径
             pretrained_path = self._fetch_config_value(current_cfg, 'pretrained_model')  # 提取预训练权重路径
             if pretrained_path is None:  # 若未使用新字段名
                 pretrained_path = self._fetch_config_value(current_cfg, 'pretrained')  # 兼容旧字段名称
+            if pretrained_path is None:  # 若仍未找到预训练字段
+                pretrained_path = self._fetch_config_value(current_cfg, 'checkpoint')  # 兼容checkpoint字段
+            alias_candidates = {sensor_key}  # 初始化别名集合并包含主键
+            alias_sensor = self._fetch_config_value(current_cfg, 'sensor')  # 再次读取传感器字段便于补充别名
+            if alias_sensor is not None:  # 若存在传感器字段
+                alias_candidates.add(alias_sensor)  # 将传感器字段加入别名集合
+            alias_name = self._fetch_config_value(current_cfg, 'name')  # 读取名称字段
+            if alias_name is not None:  # 若存在名称字段
+                alias_candidates.add(alias_name)  # 将名称字段加入别名集合
+            if fallback_sensor is not None:  # 若存在备用标签
+                alias_candidates.add(fallback_sensor)  # 将备用标签加入别名集合
             normalized_configs[sensor_key] = {  # 汇总解析结果
                 'config': config_path,  # 存储配置文件路径
-                'pretrained_model': pretrained_path  # 存储预训练权重路径
+                'pretrained_model': pretrained_path,  # 存储预训练权重路径
+                'raw': current_cfg,  # 保留原始配置项便于后续构建
+                'aliases': alias_candidates  # 记录全部可匹配的别名集合
             }
         return normalized_configs  # 返回标准化后的配置字典
 
@@ -332,7 +353,7 @@ class SemiBaseDiffDetector(BaseDetector):
             self, batch_inputs: Tensor, batch_data_samples: SampleList
     ) -> Tuple[SampleList, Optional[dict]]:
         """Get pseudo instances from teacher model."""
-        if not self.diff_teacher_bank:  # 若未启用多教师，直接沿用默认diff_detector逻辑
+        if not self.diff_teacher_bank or len(self.diff_teacher_bank) <= 1:  # 若未启用多教师或仅存在单一教师则沿用默认逻辑
             self.diff_detector.eval()  # 将默认教师设置为评估模式
             results_list, diff_feature = self.diff_detector.predict(  # 使用默认教师生成伪标签与特征
                 batch_inputs, batch_data_samples, rescale=False, return_feature=True)  # 传入批量数据并要求返回特征
