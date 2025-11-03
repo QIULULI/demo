@@ -24,16 +24,16 @@ detector.detector.rpn_head.anchor_generator = dict(  # 调整RPN锚框以适应�
     strides=[4, 8, 16, 32, 64])  # 对齐FPN步长
 
 detector.diff_model = dict(  # 配置扩散教师信息
-    main_teacher='rgb',  # 指定主教师为红外分支
+    main_teacher='sim_rgb',  # 指定主教师为仿真RGB分支
     teachers=[  # 列出全部扩散教师
         dict(  # 红外教师配置
             name='ir',  # 教师名称
-            sensor='ir',  # 指定与数据集标注一致的传感器标签
+            sensor='sim_ir',  # 指定与数据集标注一致的传感器标签
             config='DG/Ours/drone/diffusion_detector_drone_ir_clear_day.py',  # 教师配置路径
             pretrained_model='/mnt/ssd/lql/Fitness-Generalization-Transferability/work_dirs/diffusion_detector_drone_ir_clear_day/best_coco_bbox_mAP_50_iter_5000.pth'),  # 红外教师权重
         dict(  # 可见光教师配置
             name='rgb',  # 教师名称
-            sensor='rgb',  # 指定与数据集标注一致的传感器标签
+            sensor='sim_rgb',  # 指定与数据集标注一致的传感器标签
             config='DG/Ours/drone/diffusion_detector_drone_rgb_sim.py',  # 教师配置路径
             pretrained_model='/mnt/ssd/lql/Fitness-Generalization-Transferability/work_dirs/diffusion_detector_drone_rgb_sim/best_coco_bbox_mAP_50_iter_20000.pth')  # 可见光教师权重
     ])  # 教师列表定义完毕
@@ -49,9 +49,9 @@ model = dict(  # 构建域泛化训练包装器
             enable_cross_loss=True,  # 启用交叉蒸馏
             cross_loss_weight=0.4,  # 默认交叉蒸馏权重
             schedule=[  # 阶段性调度表
-                dict(start_iter=0, active_teacher='rgb', cross_loss_weight=0.0),  # 初始阶段仅依赖红外教师
-                dict(start_iter=8000, active_teacher='ir', cross_loss_weight=0.4),  # 进入交叉阶段启用RGB教师
-                dict(start_iter=14000, active_teacher='rgb', cross_loss_weight=0.5),  # 后期回归红外教师并加大权重
+                dict(start_iter=0, active_teacher='sim_rgb', cross_loss_weight=0.0),  # 初始阶段仅依赖仿真RGB教师
+                dict(start_iter=8000, active_teacher='sim_ir', cross_loss_weight=0.4),  # 进入交叉阶段启用仿真IR教师
+                dict(start_iter=14000, active_teacher='sim_rgb', cross_loss_weight=0.5),  # 后期回归仿真RGB教师并加大权重
             ]),  # 调度表定义完毕
         feature_loss_cfg=dict(  # 特征蒸馏配置
             enable_feature_loss=True,  # 启用特征蒸馏
