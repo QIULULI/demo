@@ -8,6 +8,7 @@ backend_args = None  # 图像加载默认使用mmcv后端
 
 ir_img_prefix = '/mnt/ssd/lql/Fitness-Generalization-Transferability/data/sim_drone_ir/Town01_Opt/carla_data'  # 红外图像前缀路径
 rgb_img_prefix = '/mnt/ssd/lql/Fitness-Generalization-Transferability/data/sim_drone_rgb/Town01_Opt/carla_data'  # 可见光图像前缀路径
+real_rgb_img_prefix = 'data/real_drone_rgb/val'  # 可见光图像前缀路径
 
 ir_repeat = 1  # 红外数据重复次数，可通过修改该值控制采样比例
 rgb_repeat = 1  # 可见光数据重复次数，可通过修改该值控制采样比例
@@ -87,8 +88,8 @@ val_dataset = dict(  # 构建验证数据集
     type=dataset_type,  # 指定数据集类型
     data_root=data_root,  # 指定数据根目录
     metainfo=dict(classes=classes),  # 写入类别信息
-    ann_file='sim_drone_ann/rgb/val.json',  # 验证标注文件路径
-    data_prefix=dict(img=rgb_img_prefix),  # 默认使用红外模态进行评估
+    ann_file='real_drone_ann/val_visible.json',  # 验证标注文件路径
+    data_prefix=dict(img='real_drone_rgb/'),  # 默认使用真实可见光模态进行评估
     test_mode=True,  # 以测试模式加载
     filter_cfg=dict(filter_empty_gt=True),  # 过滤无目标图片
     pipeline=test_pipeline)  # 引用验证流水线
@@ -113,7 +114,7 @@ test_dataloader = val_dataloader  # 复用验证加载器作为测试加载器
 
 val_evaluator = dict(  # 构建验证评估器
     type='CocoMetric',  # 使用COCO指标
-    ann_file=data_root + 'sim_drone_ann/rgb/val.json',  # 指定评估标注路径
+    ann_file=data_root + 'real_drone_ann/val_visible.json',  # 指定评估标注路径
     metric='bbox',  # 关注检测框指标
     format_only=False)  # 同时输出指标结果
 
