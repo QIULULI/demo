@@ -61,10 +61,23 @@ model = dict(  # 构建域泛化训练包装器
         cross_loss_cfg=dict(  # 交叉蒸馏配置
             enable_cross_loss=True,  # 启用交叉蒸馏
             cross_loss_weight=0.4,  # 默认交叉蒸馏权重
+            trainable_teacher_loss_weight=1.0,  # 为可训练教师损失设置基础权重便于全局引用
             schedule=[  # 阶段性调度表
-                dict(start_iter=0, active_teacher='sim_rgb', cross_loss_weight=0.0),  # 初始阶段仅依赖仿真RGB教师
-                dict(start_iter=8000, active_teacher='sim_ir', cross_loss_weight=0.4),  # 进入交叉阶段启用仿真IR教师
-                dict(start_iter=14000, active_teacher='sim_rgb', cross_loss_weight=0.5),  # 后期回归仿真RGB教师并加大权重
+                dict(  # 阶段一配置
+                    start_iter=0,  # 迭代0开始进入阶段一
+                    active_teacher='sim_rgb',  # 阶段一使用仿真RGB教师
+                    cross_loss_weight=0.0,  # 阶段一关闭交叉蒸馏避免扰动初始学生
+                    trainable_teacher_loss_weight=0.0),  # 阶段一禁用可训练教师损失避免无梯度阶段浪费计算
+                dict(  # 阶段二配置
+                    start_iter=8000,  # 迭代8000开始进入阶段二
+                    active_teacher='sim_ir',  # 阶段二切换仿真IR教师以提供跨模态信息
+                    cross_loss_weight=0.4,  # 阶段二恢复交叉蒸馏权重以进行互学习
+                    trainable_teacher_loss_weight=0.8),  # 阶段二为可训练教师分支提供较高损失权重促进收敛
+                dict(  # 阶段三配置
+                    start_iter=14000,  # 迭代14000开始进入阶段三
+                    active_teacher='sim_rgb',  # 阶段三回归仿真RGB教师巩固性能
+                    cross_loss_weight=0.5,  # 阶段三进一步提升交叉蒸馏强度
+                    trainable_teacher_loss_weight=1.0),  # 阶段三将可训练教师损失权重恢复至基准实现充分训练
             ]),  # 调度表定义完毕
         feature_loss_cfg=dict(  # 特征蒸馏配置
             enable_feature_loss=True,  # 启用特征蒸馏
