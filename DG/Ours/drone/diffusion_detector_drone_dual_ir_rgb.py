@@ -35,7 +35,15 @@ detector.diff_model = dict(  # 配置扩散教师信息
             name='rgb',  # 教师名称
             sensor='sim_rgb',  # 指定与数据集标注一致的传感器标签
             config='DG/Ours/drone/diffusion_detector_drone_rgb_sim.py',  # 教师配置路径
-            pretrained_model='/mnt/ssd/lql/Fitness-Generalization-Transferability/work_dirs/diffusion_detector_drone_rgb_sim/best_coco_bbox_mAP_50_iter_20000.pth')  # 可见光教师权重
+            pretrained_model='/mnt/ssd/lql/Fitness-Generalization-Transferability/work_dirs/diffusion_detector_drone_rgb_sim/best_coco_bbox_mAP_50_iter_20000.pth'),  # 可见光教师权重
+        dict(  # 新增真实RGB教师配置
+            name='real_rgb_teacher',  # 中文注释：为可训练教师命名以便后续引用
+            sensor='real_rgb',  # 中文注释：指定真实RGB模态的传感器标签以匹配数据元信息
+            config='DG/Ours/drone/diffusion_detector_drone_rgb_sim.py',  # 中文注释：复用仿真RGB结构作为初始架构
+            pretrained_model='/mnt/ssd/lql/Fitness-Generalization-Transferability/work_dirs/diffusion_detector_drone_rgb_sim/best_coco_bbox_mAP_50_iter_20000.pth',  # 中文注释：加载已收敛的基础权重作为初始化
+            trainable=True,  # 中文注释：显式标记该教师需参与训练以便后续逻辑开启梯度
+            requires_training=True  # 中文注释：再次强调该分支应被调度器视为待优化对象
+            )  # 中文注释：可训练教师配置结束
     ])  # 教师列表定义完毕
 
 detector.semi_test_cfg = dict(  # 重写半监督测试配置以便互学习后的学生承担推理职责
