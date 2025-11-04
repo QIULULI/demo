@@ -50,8 +50,25 @@ class DomainGeneralizationDetector(BaseDetector):
         self.train_cfg = train_cfg
             
         # cross model setting
-        self.cross_loss_weight = self.train_cfg.cross_loss_cfg.get('cross_loss_weight')  # 读取交叉蒸馏初始权重
-        raw_schedule = self.train_cfg.cross_loss_cfg.get('schedule', [])  # 获取阶段性调度配置
+        self.cross_loss_cfg = self.train_cfg.cross_loss_cfg  # 中文注释：缓存交叉蒸馏配置以便复用子项
+        self.cross_loss_weight = self.cross_loss_cfg.get('cross_loss_weight')  # 中文注释：读取交叉蒸馏初始权重
+        self.cross_feature_loss_weight = self.cross_loss_cfg.get('cross_feature_loss_weight', 0.0)  # 中文注释：读取交叉教师特征蒸馏权重默认0
+        if self.cross_feature_loss_weight <= 0:  # 中文注释：当交叉特征蒸馏权重未显式配置时尝试兼容旧配置
+            legacy_cross_weight = self.train_cfg.feature_loss_cfg.get('cross_feature_loss_weight', 0.0)  # 中文注释：读取旧版配置中的交叉特征蒸馏权重
+            if legacy_cross_weight > 0:  # 中文注释：当旧配置存在有效权重时沿用该值
+                self.cross_feature_loss_weight = legacy_cross_weight  # 中文注释：覆盖默认值确保向后兼容
+        self.cross_roi_kd_weight = self.cross_loss_cfg.get('cross_roi_kd_weight', 0.0)  # 中文注释：读取交叉ROI蒸馏额外权重默认0
+        self.cross_cls_loss_weight = self.cross_loss_cfg.get('cls_consistency_weight', 0.0)  # 中文注释：读取交叉分类一致性权重默认0
+        if self.cross_cls_loss_weight <= 0:  # 中文注释：当未设置交叉分类一致性权重时尝试读取旧版配置
+            legacy_cls_weight = (self.train_cfg.feature_loss_cfg.get('cross_consistency_cfg', {}) or {}).get('cls_weight', 0.0)  # 中文注释：从旧配置的子字典中获取分类权重
+            if legacy_cls_weight > 0:  # 中文注释：存在有效旧权重时启用
+                self.cross_cls_loss_weight = legacy_cls_weight  # 中文注释：使用旧权重保持行为一致
+        self.cross_reg_loss_weight = self.cross_loss_cfg.get('reg_consistency_weight', 0.0)  # 中文注释：读取交叉回归一致性权重默认0
+        if self.cross_reg_loss_weight <= 0:  # 中文注释：当未设置交叉回归一致性权重时尝试读取旧版配置
+            legacy_reg_weight = (self.train_cfg.feature_loss_cfg.get('cross_consistency_cfg', {}) or {}).get('reg_weight', 0.0)  # 中文注释：从旧配置的子字典中获取回归权重
+            if legacy_reg_weight > 0:  # 中文注释：存在有效旧权重时沿用
+                self.cross_reg_loss_weight = legacy_reg_weight  # 中文注释：覆盖默认值保证向后兼容
+        raw_schedule = self.cross_loss_cfg.get('schedule', [])  # 中文注释：获取阶段性调度配置
         self.cross_loss_schedule = sorted(raw_schedule, key=lambda item: item.get('start_iter', 0))  # 按起始迭代排序调度表
         self.cross_schedule_stage = -1  # 记录当前处于的调度阶段索引
         # feature loss setting
@@ -61,6 +78,10 @@ class DomainGeneralizationDetector(BaseDetector):
             'feature_loss_weight')
         self.feature_loss = KDLoss(
             loss_weight=self.feature_loss_weight, loss_type=self.feature_loss_type)
+        self.cross_feature_loss = None  # 中文注释：初始化交叉教师特征蒸馏损失为None避免未配置时误用
+        if self.cross_feature_loss_weight > 0:  # 中文注释：仅当交叉特征蒸馏权重大于0时构建损失实例
+            self.cross_feature_loss = KDLoss(  # 中文注释：基于配置的损失类型与权重创建知识蒸馏损失
+                loss_weight=self.cross_feature_loss_weight, loss_type=self.feature_loss_type)  # 中文注释：沿用主特征蒸馏的损失类型确保一致
 
         self.loss_cls_kd = MODELS.build(self.train_cfg.kd_cfg['loss_cls_kd'])
         self.loss_reg_kd = MODELS.build(self.train_cfg.kd_cfg['loss_reg_kd'])
@@ -269,6 +290,130 @@ class DomainGeneralizationDetector(BaseDetector):
         per_sample_features = [feature_payload for _ in range(group_size)]  # 中文注释：对于其他类型直接复制引用以保持长度
         return feature_payload, per_sample_features  # 中文注释：返回原始特征对象与逐样本列表
 
+    def _aggregate_sample_level_features(self, sample_feature_list: Sequence[Any]) -> Optional[List[Tensor]]:  # 中文注释：将逐样本特征重排为按尺度组织的批量张量
+        if not isinstance(sample_feature_list, (list, tuple)) or not sample_feature_list:  # 中文注释：当输入不是序列或为空时无需处理
+            return None  # 中文注释：直接返回None表示缺少有效特征
+        level_count = 0  # 中文注释：初始化统计最大尺度数量的变量
+        for sample_entry in sample_feature_list:  # 中文注释：遍历每个样本以确定潜在的尺度数量
+            if isinstance(sample_entry, (list, tuple)) and sample_entry:  # 中文注释：当样本提供多尺度列表时参与统计
+                level_count = max(level_count, len(sample_entry))  # 中文注释：更新最大尺度数量
+            elif torch.is_tensor(sample_entry):  # 中文注释：当样本仅提供单个张量时至少存在一个尺度
+                level_count = max(level_count, 1)  # 中文注释：记录单尺度情况
+        if level_count == 0:  # 中文注释：若所有样本均未提供有效张量
+            return None  # 中文注释：无法构建尺度聚合时返回None
+        aggregated_levels: List[Optional[Tensor]] = []  # 中文注释：初始化按尺度存放批量张量的列表
+        for level_idx in range(level_count):  # 中文注释：逐尺度构建批量张量
+            reference_tensor: Optional[Tensor] = None  # 中文注释：记录当前尺度的参考张量以便填充缺失项
+            ordered_candidates: List[Optional[Tensor]] = []  # 中文注释：按样本顺序收集候选张量
+            for sample_entry in sample_feature_list:  # 中文注释：遍历每个样本提取当前尺度
+                candidate_tensor = None  # 中文注释：初始化候选张量占位
+                if isinstance(sample_entry, (list, tuple)) and len(sample_entry) > level_idx:  # 中文注释：当样本具有足够尺度时读取对应项
+                    candidate_value = sample_entry[level_idx]  # 中文注释：获取当前尺度的对象
+                    if torch.is_tensor(candidate_value):  # 中文注释：仅处理真实张量
+                        candidate_tensor = candidate_value  # 中文注释：记录可用张量
+                elif torch.is_tensor(sample_entry) and level_idx == 0:  # 中文注释：当样本为单张量且仅能贡献第一个尺度
+                    candidate_tensor = sample_entry  # 中文注释：直接使用该张量
+                if reference_tensor is None and candidate_tensor is not None:  # 中文注释：若尚未确定参考张量则记录首个有效张量
+                    reference_tensor = candidate_tensor  # 中文注释：用于后续填充缺失样本
+                ordered_candidates.append(candidate_tensor)  # 中文注释：保持样本顺序存放候选结果
+            if reference_tensor is None:  # 中文注释：若当前尺度不存在任何有效张量
+                aggregated_levels.append(None)  # 中文注释：以None占位保持索引一致
+                continue  # 中文注释：继续处理下一个尺度
+            normalized_slices: List[Tensor] = []  # 中文注释：存放填充后的样本张量
+            for candidate_tensor in ordered_candidates:  # 中文注释：遍历每个样本的候选
+                if candidate_tensor is None:  # 中文注释：当该样本缺失当前尺度时
+                    normalized_slices.append(torch.zeros_like(reference_tensor))  # 中文注释：填充同形状零张量保持尺寸一致
+                else:  # 中文注释：当样本提供该尺度时直接使用其原始张量
+                    normalized_slices.append(candidate_tensor)  # 中文注释：保留原始张量
+            aggregated_levels.append(torch.stack(normalized_slices, dim=0))  # 中文注释：将所有样本在该尺度的张量按batch维堆叠
+        has_valid_level = any(torch.is_tensor(level_tensor) for level_tensor in aggregated_levels if level_tensor is not None)  # 中文注释：检查是否存在有效的尺度张量
+        return aggregated_levels if has_valid_level else None  # 中文注释：若存在有效张量则返回聚合结果否则返回None
+
+    def _average_cross_peer_feature_map(self, peer_feature_map: Any) -> Optional[List[Tensor]]:  # 中文注释：对同一样本内来自多教师的特征求平均
+        if not isinstance(peer_feature_map, dict) or not peer_feature_map:  # 中文注释：当结构不是字典或为空时无法求平均
+            return None  # 中文注释：直接返回None表示缺失有效同伴特征
+        level_count = 0  # 中文注释：初始化最大尺度数量统计
+        for feature_entry in peer_feature_map.values():  # 中文注释：遍历每个同伴教师提供的特征
+            if isinstance(feature_entry, (list, tuple)) and feature_entry:  # 中文注释：当特征为多尺度列表时参与统计
+                level_count = max(level_count, len(feature_entry))  # 中文注释：更新尺度数量
+            elif torch.is_tensor(feature_entry):  # 中文注释：当特征为单张量时至少提供一个尺度
+                level_count = max(level_count, 1)  # 中文注释：记录单尺度情况
+        if level_count == 0:  # 中文注释：若所有同伴均未提供可用张量
+            return None  # 中文注释：返回None表示无法构建平均特征
+        averaged_levels: List[Optional[Tensor]] = []  # 中文注释：初始化按尺度存放平均结果的列表
+        for level_idx in range(level_count):  # 中文注释：逐尺度聚合同伴教师特征
+            candidates: List[Tensor] = []  # 中文注释：记录当前尺度的有效张量集合
+            for feature_entry in peer_feature_map.values():  # 中文注释：遍历每个教师的特征条目
+                candidate_tensor = None  # 中文注释：初始化候选张量占位
+                if isinstance(feature_entry, (list, tuple)) and len(feature_entry) > level_idx:  # 中文注释：当教师提供足够尺度时提取对应张量
+                    tensor_value = feature_entry[level_idx]  # 中文注释：读取当前尺度的张量
+                    if torch.is_tensor(tensor_value):  # 中文注释：仅处理张量类型
+                        candidate_tensor = tensor_value  # 中文注释：记录有效张量
+                elif torch.is_tensor(feature_entry) and level_idx == 0:  # 中文注释：当教师仅提供单尺度张量时
+                    candidate_tensor = feature_entry  # 中文注释：默认该张量对应首个尺度
+                if candidate_tensor is not None:  # 中文注释：若找到有效张量则加入集合
+                    candidates.append(candidate_tensor)  # 中文注释：累计同尺度的所有教师张量
+            if candidates:  # 中文注释：当至少一个教师提供当前尺度时
+                stacked = torch.stack(candidates, dim=0)  # 中文注释：沿新增维度堆叠全部候选张量
+                averaged_levels.append(stacked.mean(dim=0))  # 中文注释：对堆叠结果取平均得到统一的交叉特征
+            else:  # 中文注释：当所有教师都缺失该尺度时仅以None占位
+                averaged_levels.append(None)  # 中文注释：若所有教师缺失该尺度则以None占位
+        has_valid = any(level is not None for level in averaged_levels)  # 中文注释：检查是否存在有效的平均结果
+        return averaged_levels if has_valid else None  # 中文注释：仅在存在有效尺度时返回平均后的特征列表
+
+    def _prepare_cross_teacher_features(self, cross_teacher_info: Any, sensor_to_indices: Dict[str, List[int]], batch_size: int) -> Tuple[Optional[List[Tensor]], Dict[str, Any]]:  # 中文注释：解析交叉教师信息并返回聚合特征及按传感器划分的结构
+        cross_payload = None  # 中文注释：初始化交叉教师原始特征容器
+        if isinstance(cross_teacher_info, dict):  # 中文注释：当交叉教师信息为字典时按约定键读取特征
+            cross_payload = cross_teacher_info.get('features', cross_teacher_info.get('main_feature'))  # 中文注释：优先从features或main_feature键中取值
+        else:  # 中文注释：当交叉教师信息非字典时直接将其视作原始特征
+            cross_payload = cross_teacher_info  # 中文注释：非字典结构直接视作特征载体
+        per_sample_features: List[Any] = [None] * batch_size  # 中文注释：预先分配逐样本特征列表保持与批量索引一致
+        if isinstance(cross_payload, (list, tuple)) and len(cross_payload) == batch_size:  # 中文注释：当提供逐样本列表时逐个解析
+            for sample_idx, entry in enumerate(cross_payload):  # 中文注释：遍历每个样本的交叉特征条目
+                if isinstance(entry, dict):  # 中文注释：条目为同伴教师字典时需要求平均
+                    per_sample_features[sample_idx] = self._average_cross_peer_feature_map(entry)  # 中文注释：对同伴特征求平均生成统一表示
+                elif isinstance(entry, (list, tuple)):  # 中文注释：当条目直接为多尺度列表时保留原样
+                    per_sample_features[sample_idx] = [tensor for tensor in entry]  # 中文注释：复制列表避免共享引用
+                elif torch.is_tensor(entry):  # 中文注释：当条目是单个张量时包装成单尺度列表
+                    per_sample_features[sample_idx] = [entry]  # 中文注释：确保后续处理统一
+                else:  # 中文注释：当条目结构未知或为空时直接置为None
+                    per_sample_features[sample_idx] = None  # 中文注释：未知结构时以None占位
+        elif isinstance(cross_payload, (list, tuple)) and cross_payload and all(torch.is_tensor(item) for item in cross_payload):  # 中文注释：当交叉特征以尺度优先列表形式提供
+            sample_limit = min(batch_size, cross_payload[0].shape[0])  # 中文注释：确定可切片的样本数量以防越界
+            per_sample_features = [[level_feat[sample_idx] for level_feat in cross_payload] for sample_idx in range(sample_limit)]  # 中文注释：沿批维切片构造逐样本尺度列表
+            if len(per_sample_features) < batch_size:  # 中文注释：若教师批量小于学生批量
+                per_sample_features.extend([None] * (batch_size - len(per_sample_features)))  # 中文注释：使用None填充缺失样本避免索引错误
+        elif torch.is_tensor(cross_payload):  # 中文注释：当交叉教师仅返回单个批量张量
+            sample_limit = min(batch_size, cross_payload.shape[0])  # 中文注释：确定可用的样本数量
+            per_sample_features = [[cross_payload[sample_idx]] for sample_idx in range(sample_limit)]  # 中文注释：逐样本切片并包装成列表
+            if len(per_sample_features) < batch_size:  # 中文注释：若批量不足则补齐剩余位置
+                per_sample_features.extend([None] * (batch_size - len(per_sample_features)))  # 中文注释：填充None保持长度一致
+        aggregated_levels = self._aggregate_sample_level_features(per_sample_features)  # 中文注释：将逐样本特征聚合为尺度优先结构
+        grouped_cross_features = dict()  # 中文注释：初始化按传感器划分的交叉特征字典
+        if aggregated_levels is not None and sensor_to_indices:  # 中文注释：存在有效聚合结果且给定传感器索引时才执行切分
+            grouped_cross_features = self._slice_teacher_features_by_sensor(aggregated_levels, sensor_to_indices)  # 中文注释：按照传感器索引切分交叉特征
+        return aggregated_levels, grouped_cross_features  # 中文注释：返回尺度优先张量列表与按传感器整理的特征
+
+    def loss_cross_consistency(self, cross_teacher_info: Any) -> dict:  # 中文注释：根据交叉教师提供的一致性指标计算损失
+        losses = dict()  # 中文注释：初始化损失字典
+        if not isinstance(cross_teacher_info, dict):  # 中文注释：当交叉教师信息非字典时认为没有可用的一致性指标
+            return losses  # 中文注释：直接返回空字典保持兼容
+        if self.cross_cls_loss_weight > 0:  # 中文注释：仅在分类一致性权重大于0时才计算该项
+            cls_value = cross_teacher_info.get('cls_consistency')  # 中文注释：优先读取顶层的分类一致性标量
+            if cls_value is None:  # 中文注释：若顶层缺失则尝试从嵌套字典中获取
+                consistency_block = cross_teacher_info.get('consistency') or {}  # 中文注释：读取可能的consistency子字典
+                cls_value = consistency_block.get('cls')  # 中文注释：从子字典中提取分类一致性数值
+            if cls_value is not None:  # 中文注释：成功取得数值后才写入损失
+                losses['cross_cls_consistency_loss'] = cls_value * self.cross_cls_loss_weight  # 中文注释：按配置权重缩放分类一致性损失
+        if self.cross_reg_loss_weight > 0:  # 中文注释：仅在回归一致性权重大于0时计算该项
+            reg_value = cross_teacher_info.get('reg_consistency')  # 中文注释：优先读取顶层的回归一致性标量
+            if reg_value is None:  # 中文注释：若顶层缺失则尝试从嵌套结构读取
+                consistency_block = cross_teacher_info.get('consistency') or {}  # 中文注释：读取可能存在的consistency子字典
+                reg_value = consistency_block.get('reg')  # 中文注释：从子字典中提取回归一致性数值
+            if reg_value is not None:  # 中文注释：成功取得数值后才写入损失
+                losses['cross_reg_consistency_loss'] = reg_value * self.cross_reg_loss_weight  # 中文注释：按权重缩放回归一致性损失
+        return losses  # 中文注释：返回交叉教师一致性损失字典
+
     def _distribute_group_roi_outputs(self, group_outputs: Dict[str, Tensor],
                                       storage: List[Dict[str, Tensor]],
                                       sample_indices: List[int],
@@ -469,6 +614,12 @@ class DomainGeneralizationDetector(BaseDetector):
             grouped_teacher_features = self._slice_teacher_features_by_sensor(parsed_diff_feature.get('main_teacher'), sensor_to_indices)  # 中文注释：提取并切分主教师特征
         student_x = self.model.student.extract_feat(batch_inputs)  # 中文注释：前向学生模型获取自身特征表示
         diff_x = self._merge_grouped_features(grouped_teacher_features, sensor_to_indices, len(batch_data_samples))  # 中文注释：将教师特征按照原批次顺序重新拼接
+        cross_teacher_info = parsed_diff_feature.get('cross_teacher') if isinstance(parsed_diff_feature, dict) else None  # 中文注释：提取交叉教师信息块供后续蒸馏使用
+        if cross_teacher_info is not None:  # 中文注释：仅在交叉教师信息存在时解析其特征
+            cross_x, grouped_cross_features = self._prepare_cross_teacher_features(cross_teacher_info, sensor_to_indices, len(batch_data_samples))  # 中文注释：对交叉教师特征进行聚合并按传感器划分
+        else:  # 中文注释：当未启用交叉教师时提供空的特征占位符
+            cross_x, grouped_cross_features = None, dict()  # 中文注释：缺少交叉教师时使用占位结果保持接口一致
+        cross_consistency_losses = self.loss_cross_consistency(cross_teacher_info)  # 中文注释：计算交叉教师提供的一致性损失项
         losses = dict()  # 中文注释：初始化损失累加字典
 
         # cross model loss
@@ -489,7 +640,19 @@ class DomainGeneralizationDetector(BaseDetector):
                     layer_loss = self.feature_loss(  # 中文注释：调用蒸馏损失函数
                         student_feature, diff_feature)  # 中文注释：传入学生与教师的对应特征
                     feature_loss['pkd_feature_loss'] += layer_loss/valid_count  # 中文注释：将各尺度损失按数量求平均后累加
+        if self.cross_feature_loss is not None and isinstance(cross_x, (list, tuple)) and cross_x:  # 中文注释：仅在配置交叉特征蒸馏且存在聚合特征时计算额外损失
+            cross_pairs = [(stu_feat, cross_feat) for stu_feat, cross_feat in zip(student_x, cross_x) if torch.is_tensor(cross_feat)]  # 中文注释：筛选学生与交叉教师同时存在的尺度对
+            if cross_pairs:  # 中文注释：存在有效尺度对时执行交叉蒸馏
+                normalizer = 1.0 / len(cross_pairs)  # 中文注释：计算均值系数以平衡不同尺度数量
+                cross_loss_total = None  # 中文注释：初始化交叉特征蒸馏损失累加器
+                for student_feature, cross_feature in cross_pairs:  # 中文注释：遍历每个有效尺度对
+                    layer_loss = self.cross_feature_loss(student_feature, cross_feature)  # 中文注释：调用交叉教师特征蒸馏损失函数
+                    scaled_layer_loss = layer_loss * normalizer  # 中文注释：按照均值系数缩放单尺度损失
+                    cross_loss_total = scaled_layer_loss if cross_loss_total is None else cross_loss_total + scaled_layer_loss  # 中文注释：累积各尺度的蒸馏损失
+                feature_loss['loss_cross_feature'] = cross_loss_total  # 中文注释：记录交叉教师特征蒸馏损失项
         losses.update(feature_loss)  # 中文注释：将特征蒸馏损失写入总损失
+        if cross_consistency_losses:  # 中文注释：若交叉教师提供了一致性指标则合并相应损失
+            losses.update(cross_consistency_losses)  # 中文注释：将一致性损失累加进总体损失字典
         ##############################################################################################################
 
         # student training
@@ -531,6 +694,11 @@ class DomainGeneralizationDetector(BaseDetector):
             roi_losses_kd = self.roi_head_loss_with_kd(
                 student_x, grouped_teacher_features, rpn_results_list, batch_data_samples, sensor_tags_per_sample)  # 中文注释：基于分组教师特征与逐样本传感器标签计算ROI知识蒸馏损失
             losses.update(roi_losses_kd)  # 中文注释：累加ROI蒸馏损失
+        if self.cross_roi_kd_weight > 0 and isinstance(grouped_cross_features, dict) and grouped_cross_features:  # 中文注释：当配置交叉ROI蒸馏且存在交叉特征时执行额外蒸馏
+            cross_roi_losses = self.roi_head_loss_with_kd(  # 中文注释：复用ROI蒸馏流程评估交叉教师特征
+                student_x, grouped_cross_features, rpn_results_list, batch_data_samples, sensor_tags_per_sample)  # 中文注释：使用交叉教师特征替代主教师执行ROI蒸馏
+            scaled_cross_roi_losses = {f'cross_{key}': value * self.cross_roi_kd_weight for key, value in cross_roi_losses.items()}  # 中文注释：为交叉ROI损失添加前缀并按配置权重缩放
+            losses.update(scaled_cross_roi_losses)  # 中文注释：将交叉ROI蒸馏损失并入总损失
         ##############################################################################################################
 
         return losses

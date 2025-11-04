@@ -146,13 +146,14 @@ For ***Diffusion Guided Adaptation Detector***  and  *Note* : you should check a
 sh ./tools/dist_train.sh DA/Ours/city_to_foggy/diffuison_guided_adaptation_faster-rcnn_r101_fpn_city_to_foggy.py  2
 ```
 
-### 特征蒸馏配置说明
+### 特征蒸馏与交叉一致性配置说明
 
-- `feature_loss_cfg.cross_feature_loss_weight`：交叉教师特征蒸馏的权重，默认值为 `0.0`，保持旧版配置不变时该项自动跳过，仅在需要对交叉教师特征做额外约束时开启。
-- `feature_loss_cfg.cross_consistency_cfg.cls_weight`：交叉教师分类一致性损失权重，默认值为 `0.0`，用于控制交叉教师分类对齐信号的强弱。
-- `feature_loss_cfg.cross_consistency_cfg.reg_weight`：交叉教师回归一致性损失权重，默认值为 `0.0`，用于控制交叉教师回归对齐信号的强弱。
+- `cross_loss_cfg.cross_feature_loss_weight`：交叉教师特征蒸馏的系数，默认值为 `0.0`。当值大于零时训练日志会新增 `loss_cross_feature`，用于衡量学生与交叉教师在各 FPN 层级上的 MSE/KL 误差。
+- `cross_loss_cfg.cross_roi_kd_weight`：交叉教师 ROI 蒸馏的系数，默认值为 `0.0`。打开后会额外输出 `cross_loss_cls_kd` / `cross_loss_reg_kd`，与主教师蒸馏一同对齐 ROI 头的分类与回归分支。
+- `cross_loss_cfg.cls_consistency_weight`：交叉教师分类一致性权重，默认值为 `0.0`。设置后训练日志会出现 `cross_cls_consistency_loss`，可按需调节交叉教师分类信号的重要性。
+- `cross_loss_cfg.reg_consistency_weight`：交叉教师回归一致性权重，默认值为 `0.0`。设置后训练日志会出现 `cross_reg_consistency_loss`，用于约束不同教师在框回归上的一致性。
 
-以上新增字段全部默认关闭，可逐项调节并互相独立；当启用交叉教师时，其预测结果会带有 `sensor` 识别字段写入 `batch_info.cross_teacher`，方便后续诊断与扩展。
+若老版本配置仍在 `feature_loss_cfg` 中声明 `cross_feature_loss_weight` 或 `cross_consistency_cfg`，当前实现会自动复用这些旧字段以保证向后兼容。所有分支默认关闭，按需将对应权重调整为正值即可启用；当启用交叉教师时，其预测结果会带有 `sensor` 识别字段写入 `batch_info.cross_teacher`，便于后续诊断与扩展。
 
 ### 🧭 Drone diffusion-guided pipeline checkpoints
 
