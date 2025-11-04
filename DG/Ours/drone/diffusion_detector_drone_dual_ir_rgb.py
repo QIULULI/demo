@@ -38,7 +38,7 @@ detector.diff_model = dict(  # 配置扩散教师信息
             pretrained_model='/mnt/ssd/lql/Fitness-Generalization-Transferability/work_dirs/diffusion_detector_drone_rgb_sim/best_coco_bbox_mAP_50_iter_20000.pth'),  # 可见光教师权重
         dict(  # 新增真实RGB教师配置
             name='real_rgb_teacher',  # 中文注释：为可训练教师命名以便后续引用
-            sensor='real_rgb',  # 中文注释：指定真实RGB模态的传感器标签以匹配数据元信息
+            sensor='dual_rgb',  # 中文注释：将可训练教师的传感器标签改为双RGB以匹配新增数据流水线
             config='DG/Ours/drone/diffusion_detector_drone_rgb_sim.py',  # 中文注释：复用仿真RGB结构作为初始架构
             pretrained_model='/mnt/ssd/lql/Fitness-Generalization-Transferability/work_dirs/diffusion_detector_drone_rgb_sim/best_coco_bbox_mAP_50_iter_20000.pth',  # 中文注释：加载已收敛的基础权重作为初始化
             trainable=True,  # 中文注释：显式标记该教师需参与训练以便后续逻辑开启梯度
@@ -66,9 +66,21 @@ model = dict(  # 构建域泛化训练包装器
             reg_consistency_weight=0.1,  # 中文注释：设置边框回归一致性正则权重以稳定定位
             cross_roi_kd_weight=0.2,  # 中文注释：设置交叉ROI级蒸馏的额外权重兼容需要该项的训练逻辑
             schedule=[  # 阶段性调度表
-                dict(start_iter=0, active_teacher='sim_rgb', cross_loss_weight=0.0),  # 初始阶段仅依赖仿真RGB教师
-                dict(start_iter=8000, active_teacher='sim_ir', cross_loss_weight=0.4),  # 进入交叉阶段启用仿真IR教师
-                dict(start_iter=14000, active_teacher='sim_rgb', cross_loss_weight=0.5),  # 后期回归仿真RGB教师并加大权重
+                dict(  # 阶段一配置
+                    start_iter=0,  # 迭代0开始进入阶段一
+                    active_teacher='sim_rgb',  # 阶段一使用仿真RGB教师
+                    cross_loss_weight=0.0,  # 阶段一关闭交叉蒸馏避免扰动初始学生
+                    trainable_teacher_loss_weight=0.0),  # 阶段一禁用可训练教师损失避免无梯度阶段浪费计算
+                dict(  # 阶段二配置
+                    start_iter=8000,  # 迭代8000开始进入阶段二
+                    active_teacher='sim_ir',  # 阶段二切换仿真IR教师以提供跨模态信息
+                    cross_loss_weight=0.4,  # 阶段二恢复交叉蒸馏权重以进行互学习
+                    trainable_teacher_loss_weight=0.8),  # 阶段二为可训练教师分支提供较高损失权重促进收敛
+                dict(  # 阶段三配置
+                    start_iter=14000,  # 迭代14000开始进入阶段三
+                    active_teacher='sim_rgb',  # 阶段三回归仿真RGB教师巩固性能
+                    cross_loss_weight=0.5,  # 阶段三进一步提升交叉蒸馏强度
+                    trainable_teacher_loss_weight=1.0),  # 阶段三将可训练教师损失权重恢复至基准实现充分训练
             ]),  # 调度表定义完毕
         feature_loss_cfg=dict(  # 特征蒸馏配置
             enable_feature_loss=True,  # 启用特征蒸馏

@@ -54,6 +54,7 @@ class DomainGeneralizationDetector(BaseDetector):
         # cross model setting
         self.cross_loss_cfg = self.train_cfg.cross_loss_cfg  # 中文注释：缓存交叉蒸馏配置以便复用子项
         self.cross_loss_weight = self.cross_loss_cfg.get('cross_loss_weight')  # 中文注释：读取交叉蒸馏初始权重
+        self.trainable_teacher_loss_weight = self.cross_loss_cfg.get('trainable_teacher_loss_weight', 0.0)  # 中文注释：读取可训练教师损失权重并提供默认值保证向后兼容
         self.cross_feature_loss_weight = self.cross_loss_cfg.get('cross_feature_loss_weight', 0.0)  # 中文注释：读取交叉教师特征蒸馏权重默认0
         if self.cross_feature_loss_weight <= 0:  # 中文注释：当交叉特征蒸馏权重未显式配置时尝试兼容旧配置
             legacy_cross_weight = self.train_cfg.feature_loss_cfg.get('cross_feature_loss_weight', 0.0)  # 中文注释：读取旧版配置中的交叉特征蒸馏权重
