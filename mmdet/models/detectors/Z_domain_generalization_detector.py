@@ -3,6 +3,8 @@ import copy
 import inspect  # 新增中文注释：引入inspect模块以便动态检查函数签名
 from typing import Any, Dict, List, Optional, Sequence, Tuple  # 中文注释：引入类型注解工具以便描述复杂结构
 import torch
+import torch.nn as nn  # 中文注释：用于类型注解和潜在模块构建操作
+import torch.nn.functional as F  # 中文注释：引入函数式API以便计算特征间的均方误差等损失
 from torch import Tensor
 
 from mmdet.models.utils import (rename_loss_dict,
@@ -51,6 +53,7 @@ class DomainGeneralizationDetector(BaseDetector):
             
         # cross model setting
         self.cross_loss_weight = self.train_cfg.cross_loss_cfg.get('cross_loss_weight')  # 读取交叉蒸馏初始权重
+        self.trainable_teacher_loss_weight = self.train_cfg.cross_loss_cfg.get('trainable_teacher_loss_weight', 1.0)  # 中文注释：读取可训练教师监督的损失权重默认值
         raw_schedule = self.train_cfg.cross_loss_cfg.get('schedule', [])  # 获取阶段性调度配置
         self.cross_loss_schedule = sorted(raw_schedule, key=lambda item: item.get('start_iter', 0))  # 按起始迭代排序调度表
         self.cross_schedule_stage = -1  # 记录当前处于的调度阶段索引
@@ -82,6 +85,9 @@ class DomainGeneralizationDetector(BaseDetector):
             target_teacher = stage_cfg.get('active_teacher', None)  # 读取期望启用的扩散教师名称
             if target_teacher and hasattr(self.model, 'set_active_diff_detector'):  # 当提供教师名称且底层模型支持切换
                 self.model.set_active_diff_detector(target_teacher)  # 切换到底层指定教师
+            dynamic_teacher_weight = stage_cfg.get('trainable_teacher_loss_weight', None)  # 中文注释：读取阶段性可训练教师损失权重
+            if dynamic_teacher_weight is not None:  # 中文注释：若调度表指定了新权重则更新
+                self.trainable_teacher_loss_weight = dynamic_teacher_weight  # 中文注释：同步可训练教师损失权重以配合阶段调度
 
     @property
     def with_rpn(self):
@@ -468,6 +474,7 @@ class DomainGeneralizationDetector(BaseDetector):
         if not grouped_teacher_features:  # 中文注释：若教师未直接提供分组特征则退回切片逻辑
             grouped_teacher_features = self._slice_teacher_features_by_sensor(parsed_diff_feature.get('main_teacher'), sensor_to_indices)  # 中文注释：提取并切分主教师特征
         student_x = self.model.student.extract_feat(batch_inputs)  # 中文注释：前向学生模型获取自身特征表示
+        student_feature_levels = list(student_x) if isinstance(student_x, (list, tuple)) else [student_x]  # 中文注释：将学生特征统一整理成列表以便逐尺度处理
         diff_x = self._merge_grouped_features(grouped_teacher_features, sensor_to_indices, len(batch_data_samples))  # 中文注释：将教师特征按照原批次顺序重新拼接
         losses = dict()  # 中文注释：初始化损失累加字典
 
@@ -482,7 +489,7 @@ class DomainGeneralizationDetector(BaseDetector):
         feature_loss = dict()
         feature_loss['pkd_feature_loss'] = 0
         if isinstance(diff_x, (list, tuple)) and diff_x:  # 中文注释：仅在教师特征有效时计算特征蒸馏
-            valid_pairs = [(stu_feat, tea_feat) for stu_feat, tea_feat in zip(student_x, diff_x) if tea_feat is not None]  # 中文注释：过滤掉缺失教师特征的尺度对
+            valid_pairs = [(stu_feat, tea_feat) for stu_feat, tea_feat in zip(student_feature_levels, diff_x) if tea_feat is not None]  # 中文注释：过滤掉缺失教师特征的尺度对
             valid_count = len(valid_pairs)  # 中文注释：统计可参与蒸馏的尺度数量
             if valid_count > 0:  # 中文注释：仅当存在有效尺度时才执行蒸馏
                 for student_feature, diff_feature in valid_pairs:  # 中文注释：逐个尺度计算特征损失
@@ -490,6 +497,63 @@ class DomainGeneralizationDetector(BaseDetector):
                         student_feature, diff_feature)  # 中文注释：传入学生与教师的对应特征
                     feature_loss['pkd_feature_loss'] += layer_loss/valid_count  # 中文注释：将各尺度损失按数量求平均后累加
         losses.update(feature_loss)  # 中文注释：将特征蒸馏损失写入总损失
+        ##############################################################################################################
+
+        # trainable teacher alignment loss
+        ##############################################################################################################
+        trainable_teacher_losses = dict()  # 中文注释：初始化可训练教师损失字典
+        trainable_payload = parsed_diff_feature.get('trainable_teachers') if isinstance(parsed_diff_feature, dict) else None  # 中文注释：获取可训练教师的前向输出包
+        trainable_keys = getattr(self.model, 'trainable_diff_teacher_keys', [])  # 中文注释：读取底层模型登记的可训练教师列表
+        if trainable_keys and isinstance(trainable_payload, dict) and student_feature_levels:  # 中文注释：仅当存在可训练教师与有效特征时才计算对齐损失
+            reference_tensor = student_feature_levels[0]  # 中文注释：选取首个学生特征作为创建标量的参考张量
+            mse_accumulator = reference_tensor.new_zeros(())  # 中文注释：创建标量用于累积均方误差
+            pair_counter = 0  # 中文注释：记录参与损失计算的样本尺度对数量
+            for sensor_key in trainable_keys:  # 中文注释：遍历全部可训练教师
+                sample_indices = sensor_to_indices.get(sensor_key, [])  # 中文注释：获取当前教师对应的样本索引列表
+                if not sample_indices:  # 中文注释：若该教师本批次无样本则跳过
+                    continue  # 中文注释：继续处理下一个教师
+                teacher_entry = trainable_payload.get(sensor_key, {})  # 中文注释：提取教师输出条目
+                sample_feature_list = None  # 中文注释：初始化逐样本特征列表
+                if isinstance(teacher_entry, dict):  # 中文注释：当输出为字典时读取features字段
+                    raw_features = teacher_entry.get('features')  # 中文注释：获取逐样本特征列表
+                    if isinstance(raw_features, list) and raw_features:  # 中文注释：确认特征列表有效
+                        sample_feature_list = raw_features  # 中文注释：使用教师提供的逐样本特征
+                elif isinstance(teacher_entry, list):  # 中文注释：当条目直接是列表时视为逐样本特征
+                    sample_feature_list = teacher_entry  # 中文注释：直接使用列表作为特征集合
+                if sample_feature_list is None and sensor_key in grouped_teacher_features:  # 中文注释：若缺失逐样本特征则退回按传感器聚合的结构
+                    grouped_feature = grouped_teacher_features[sensor_key]  # 中文注释：获取聚合特征
+                    if isinstance(grouped_feature, (list, tuple)) and grouped_feature:  # 中文注释：仅在结构有效时继续处理
+                        reconstructed_samples: List[List[Tensor]] = []  # 中文注释：初始化重建的逐样本特征容器
+                        for local_idx in range(len(sample_indices)):  # 中文注释：遍历当前教师负责的样本数量
+                            per_sample_levels: List[Tensor] = []  # 中文注释：初始化当前样本的多尺度特征列表
+                            for level_feat in grouped_feature:  # 中文注释：遍历各尺度特征张量
+                                if torch.is_tensor(level_feat):  # 中文注释：仅处理张量类型的尺度特征
+                                    per_sample_levels.append(level_feat[local_idx])  # 中文注释：提取当前样本在该尺度的特征
+                            if per_sample_levels:  # 中文注释：仅在成功提取时加入结果
+                                reconstructed_samples.append(per_sample_levels)  # 中文注释：记录当前样本的多尺度特征
+                        if reconstructed_samples:  # 中文注释：若成功重建则使用该列表
+                            sample_feature_list = reconstructed_samples  # 中文注释：将重建结果作为逐样本特征
+                if not sample_feature_list:  # 中文注释：若仍无法获得特征则跳过
+                    continue  # 中文注释：继续处理下一位教师
+                for local_offset, global_idx in enumerate(sample_indices):  # 中文注释：遍历该教师负责的每个样本
+                    if local_offset >= len(sample_feature_list):  # 中文注释：防止索引越界
+                        continue  # 中文注释：跳过不存在的条目
+                    teacher_levels = sample_feature_list[local_offset]  # 中文注释：取得当前样本的多尺度特征列表
+                    if not isinstance(teacher_levels, (list, tuple)):  # 中文注释：若结构异常则跳过
+                        continue  # 中文注释：继续下一个样本
+                    for level_idx, teacher_feature in enumerate(teacher_levels):  # 中文注释：遍历每个尺度的教师特征
+                        if level_idx >= len(student_feature_levels):  # 中文注释：当学生特征尺度不足时终止当前样本的遍历
+                            break  # 中文注释：防止访问越界
+                        if not torch.is_tensor(teacher_feature):  # 中文注释：若当前尺度不是张量则跳过
+                            continue  # 中文注释：跳过该尺度
+                        student_slice = student_feature_levels[level_idx][global_idx:global_idx + 1]  # 中文注释：提取学生对应尺度的单样本特征
+                        aligned_teacher_feature = teacher_feature.to(device=student_slice.device, dtype=student_slice.dtype)  # 中文注释：将教师特征转换到学生特征相同的设备与精度
+                        mse_accumulator = mse_accumulator + F.mse_loss(student_slice.squeeze(0), aligned_teacher_feature, reduction='mean')  # 中文注释：累加当前尺度的均方误差
+                        pair_counter += 1  # 中文注释：更新有效样本尺度对数量
+            if pair_counter > 0:  # 中文注释：仅在存在有效比较对时才生成损失项
+                trainable_teacher_losses['loss_trainable_teacher_mse'] = (mse_accumulator / pair_counter) * self.trainable_teacher_loss_weight  # 中文注释：平均化均方误差并乘以权重写入损失字典
+        if trainable_teacher_losses:  # 中文注释：当存在可训练教师损失时合并到总损失中
+            losses.update(trainable_teacher_losses)  # 中文注释：确保损失字典包含可训练教师对齐项
         ##############################################################################################################
 
         # student training
@@ -535,10 +599,16 @@ class DomainGeneralizationDetector(BaseDetector):
 
         return losses
 
+    def get_trainable_diff_teacher_parameters(self) -> List[nn.Parameter]:
+        """中文注释：暴露底层可训练扩散教师的参数列表以便优化器构建额外参数组。"""
+        if hasattr(self.model, 'get_trainable_diff_teacher_parameters'):  # 中文注释：确认底层模型实现了参数收集接口
+            return self.model.get_trainable_diff_teacher_parameters()  # 中文注释：直接复用底层实现返回的参数列表
+        return []  # 中文注释：默认情况下返回空列表表示不存在额外教师参数
+
     def roi_head_loss_with_kd(self,
-                            student_x: Tuple[Tensor],
-                            grouped_diff_x: Dict[str, Any],
-                            rpn_results_list,
+                              student_x: Tuple[Tensor],
+                              grouped_diff_x: Dict[str, Any],
+                              rpn_results_list,
                             batch_data_samples,
                             sensor_tags: List[str]):  # 中文注释：基于传感器分组信息计算ROI级别的知识蒸馏损失
         assert len(rpn_results_list) == len(batch_data_samples)  # 中文注释：确保RPN输出与样本数量一致

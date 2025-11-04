@@ -43,19 +43,22 @@ train_cfg = dict(type='IterBasedTrainLoop', max_iters=20000, val_interval=1000) 
 val_cfg = dict(type='TeacherStudentValLoop')
 test_cfg = dict(type='TestLoop')
 param_scheduler = [
-    dict(type='LinearLR', start_factor=0.001, by_epoch=False, begin=0, end=500), # todo 500 warmup
+    dict(type='LinearLR', start_factor=0.001, by_epoch=False, begin=0, end=500,
+         paramwise_cfg=dict(custom_keys={'trainable_diff_teacher_modules': dict(lr_mult=1.0)})),  # 中文注释：为可训练教师显式指定与学生一致的预热调度
     dict(
         type='MultiStepLR',
         begin=0,
         end=20000, # todo
         by_epoch=False,
         milestones=[18000], #18000
-        gamma=0.1)
+        gamma=0.1,
+        paramwise_cfg=dict(custom_keys={'trainable_diff_teacher_modules': dict(lr_mult=1.0)}))
 ]
 
 optim_wrapper = dict(
     type='OptimWrapper',
     optimizer=dict(type='SGD', lr=0.02, momentum=0.9, weight_decay=0.0001),
+    paramwise_cfg=dict(custom_keys={'trainable_diff_teacher_modules': dict(lr_mult=1.0)}),  # 中文注释：将可训练教师参数注册为独立组以复用与学生一致的学习率
     clip_grad=dict(max_norm=2, norm_type=2))
 
 launcher = 'none'

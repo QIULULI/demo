@@ -2,6 +2,9 @@
 """导出学生权重到教师分支的训练后钩子实现。"""  # 提供模块级文档字符串简述功能用途
 
 import copy  # 引入copy模块以便对学生权重执行深拷贝操作
+from pathlib import Path  # 中文注释：用于构造权重导出路径
+
+import torch  # 中文注释：用于保存可训练教师的状态字典
 from mmengine.hooks import Hook  # 导入Hook基类以继承并实现训练阶段回调
 from mmengine.model import is_model_wrapper  # 导入工具函数以判断模型是否被分布式封装
 from mmengine.runner import Runner  # 导入Runner类型用于类型注解和更清晰的接口说明
@@ -32,3 +35,18 @@ class StudentToTeacherExportHook(Hook):  # 定义导出学生权重到教师分�
         logger = getattr(runner, 'logger', None)  # 再次尝试获取日志记录器以输出成功信息（若存在）
         if logger is not None:  # 若存在日志记录器则打印同步成功提示帮助确认钩子已执行
             logger.info('StudentToTeacherExportHook 已将学生分支权重同步至教师分支，确保旧版推理脚本兼容。')  # 输出信息级日志说明导出流程完成
+        if hasattr(model, 'trainable_diff_teacher_keys') and model.trainable_diff_teacher_keys:  # 中文注释：当模型存在可训练扩散教师时执行额外导出
+            export_state = {}  # 中文注释：初始化导出状态字典
+            for teacher_key in model.trainable_diff_teacher_keys:  # 中文注释：遍历所有可训练教师标识
+                if teacher_key not in getattr(model, 'diff_teacher_bank', {}):  # 中文注释：若教师未注册则跳过
+                    continue  # 中文注释：继续处理下一位教师
+                teacher_module = model.diff_teacher_bank[teacher_key]  # 中文注释：获取教师模块实例
+                teacher_cpu_state = {name: param.cpu() for name, param in teacher_module.state_dict().items()}  # 中文注释：将教师参数迁移至CPU后收集以减少磁盘占用
+                export_state[teacher_key] = teacher_cpu_state  # 中文注释：按教师键记录其状态字典
+            if export_state:  # 中文注释：仅当存在有效导出内容时才落盘
+                work_dir = getattr(runner, 'work_dir', None)  # 中文注释：读取当前运行目录以决定保存位置
+                if work_dir is not None:  # 中文注释：确保工作目录已设定
+                    export_path = Path(work_dir) / 'Dual_Diffusion_Teacher.pth'  # 中文注释：构建目标文件路径
+                    torch.save(export_state, export_path)  # 中文注释：将可训练教师的状态字典序列化保存
+                    if logger is not None:  # 中文注释：若存在日志记录器则反馈保存成功信息
+                        logger.info(f'StudentToTeacherExportHook 已导出可训练扩散教师权重至 {export_path}.')  # 中文注释：记录导出路径便于查验
