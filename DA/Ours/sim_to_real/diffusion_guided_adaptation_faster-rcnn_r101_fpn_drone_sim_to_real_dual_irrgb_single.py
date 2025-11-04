@@ -51,14 +51,14 @@ detector.diff_model = dict(  # 使用字典形式同时声明教师池与主教�
         dict(  # 第三名教师：真实域双模态扩散检测器
             name='dual_real_rgb',  # 唯一名称用于真实域双模态教师
             sensor='real_rgb',  # 指定服务的传感器标签对应真实RGB样本
-            config='DG/Ours/drone/diffusion_detector_drone_dual_ir_rgb.py',  # 指向双模态教师的模型配置文件以提供互补信息
-            pretrained_model='work_dirs/Dual_Diffusion_Teacher.pth',  # 明确双模态教师的检查点路径便于权重准备与加载
+            config='DG/Ours/drone/diffusion_detector_drone_dual_teacher.py',  # 指向专用双模态教师结构配置避免重复嵌套域泛化包装
+            pretrained_model='work_dirs/diffusion_detector_drone_dual_teacher/Dual_Diffusion_Teacher.pth',  # 指向阶段一训练导出的教师检查点便于后续域适应复用
         ),  # 真实域双模态教师配置结束
     ],  # 扩散教师列表定义完成
 )  # 扩散教师字典配置完成
 
 # 如果希望采用互学习后导出的单一双模态教师，请将上方列表替换为
-# dict(sensor='sim_rgb', config='DG/Ours/drone/diffusion_detector_drone_dual_ir_rgb.py', pretrained_model='work_dirs/Dual_Diffusion_Teacher.pth')
+# dict(sensor='sim_rgb', config='DG/Ours/drone/diffusion_detector_drone_dual_teacher.py', pretrained_model='work_dirs/diffusion_detector_drone_dual_teacher/Dual_Diffusion_Teacher.pth')
 # 并同步调整sensor标签，以便与SetSensorTag写入的值保持一致
 
 model = dict(  # 构建域适应检测器包装器
