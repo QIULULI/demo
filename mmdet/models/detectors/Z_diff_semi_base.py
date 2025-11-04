@@ -190,12 +190,28 @@ class SemiBaseDiffDetector(BaseDetector):
                 alias_candidates.add(alias_name)  # 将名称字段加入别名集合
             if fallback_sensor is not None:  # 若存在备用标签
                 alias_candidates.add(fallback_sensor)  # 将备用标签加入别名集合
+            trainable_flag = bool(self._fetch_config_value(current_cfg, 'trainable', False))  # 中文注释：解析可训练标识并在缺省情况下回退为False确保逻辑稳定
+            requires_training_flag = bool(self._fetch_config_value(current_cfg, 'requires_training', False))  # 中文注释：解析是否需要训练的标识以便后续teacher_meta直接读取
+            gradient_flag_overrides = {}  # 中文注释：准备额外的梯度开关字段集合便于透传自定义键
+            if isinstance(current_cfg, dict):  # 中文注释：仅在当前配置为字典时才遍历其键值
+                for candidate_key, candidate_value in current_cfg.items():  # 中文注释：遍历所有键值对以筛选梯度相关开关
+                    if not isinstance(candidate_key, str):  # 中文注释：若键非字符串则跳过避免lower操作报错
+                        continue  # 中文注释：继续处理下一个键值对
+                    lowered_key = candidate_key.lower()  # 中文注释：将键名转为小写以便统一匹配关键字
+                    if any(marker in lowered_key for marker in ('train', 'grad')) and isinstance(candidate_value, bool):  # 中文注释：仅捕获名称中包含train或grad且值为布尔的开关字段
+                        gradient_flag_overrides[candidate_key] = bool(candidate_value)  # 中文注释：将捕获的开关字段记录下来并显式转换为布尔值
             normalized_configs[sensor_key] = {  # 汇总解析结果
                 'config': config_path,  # 存储配置文件路径
                 'pretrained_model': pretrained_path,  # 存储预训练权重路径
                 'raw': current_cfg,  # 保留原始配置项便于后续构建
-                'aliases': alias_candidates  # 记录全部可匹配的别名集合
+                'aliases': alias_candidates,  # 记录全部可匹配的别名集合
+                'trainable': trainable_flag,  # 中文注释：直接记录可训练开关使teacher_meta可以快速读取
+                'requires_training': requires_training_flag  # 中文注释：记录是否需要训练的标识以匹配旧逻辑
             }
+            for extra_flag_key, extra_flag_value in gradient_flag_overrides.items():  # 中文注释：遍历额外的梯度开关并写回标准化配置
+                if extra_flag_key in normalized_configs[sensor_key]:  # 中文注释：若该键已存在则跳过以保留更明确的字段值
+                    continue  # 中文注释：避免覆盖已有字段
+                normalized_configs[sensor_key][extra_flag_key] = extra_flag_value  # 中文注释：将额外的梯度开关写入标准化配置方便后续直接读取
         return normalized_configs  # 返回标准化后的配置字典
 
     @staticmethod
