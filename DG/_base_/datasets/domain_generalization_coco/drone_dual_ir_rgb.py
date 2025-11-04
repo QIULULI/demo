@@ -46,6 +46,7 @@ def build_train_pipeline(sensor_tag):  # 定义函数用于根据传感器标签
 
 train_pipeline_ir = build_train_pipeline(sensor_tag='sim_ir')  # 构建红外训练流水线并写入仿真IR标签
 train_pipeline_rgb = build_train_pipeline(sensor_tag='sim_rgb')  # 构建可见光训练流水线并写入仿真RGB标签
+train_pipeline_dual = build_train_pipeline(sensor_tag='dual_rgb')  # 构建双模态训练流水线并写入双RGB标签
 
 test_pipeline = [  # 定义验证/测试流水线
     dict(type='LoadImageFromFile', backend_args=backend_args),  # 加载图像
@@ -81,7 +82,18 @@ train_dataset = dict(  # 构建训练数据集组合
                 ann_file='sim_drone_ann/rgb/train.json',  # 可见光训练标注文件
                 data_prefix=dict(img=rgb_img_prefix),  # 可见光图像前缀
                 filter_cfg=dict(filter_empty_gt=True),  # 过滤无目标图像
-                pipeline=train_pipeline_rgb))  # 引用可见光专属流水线
+                pipeline=train_pipeline_rgb)),  # 引用可见光专属流水线
+        dict(  # 双RGB数据分支配置
+            type='RepeatDataset',  # 使用重复机制保证采样频次一致
+            times=rgb_repeat,  # 复用可见光重复次数以保持比例
+            dataset=dict(  # 双RGB数据集配置
+                type=dataset_type,  # 指定数据集类型
+                data_root=data_root,  # 指定数据根目录
+                metainfo=dict(classes=classes),  # 写入类别信息
+                ann_file='sim_drone_ann/rgb/train.json',  # 复用可见光训练标注文件
+                data_prefix=dict(img=rgb_img_prefix),  # 可见光图像前缀路径
+                filter_cfg=dict(filter_empty_gt=True),  # 过滤无目标图像
+                pipeline=train_pipeline_dual))  # 引用双RGB专属流水线确保传感器标记正确
     ])  # 结束数据集列表定义
 
 val_dataset = dict(  # 构建验证数据集
