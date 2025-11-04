@@ -37,13 +37,13 @@ detector.diff_model = dict(  # 配置扩散教师信息
             config='DG/Ours/drone/diffusion_detector_drone_rgb_sim.py',  # 教师配置路径
             pretrained_model='/mnt/ssd/lql/Fitness-Generalization-Transferability/work_dirs/diffusion_detector_drone_rgb_sim/best_coco_bbox_mAP_50_iter_20000.pth'),  # 可见光教师权重
         dict(  # 新增真实RGB教师配置
-            name='real_rgb_teacher',  # 中文注释：为可训练教师命名以便后续引用
-            sensor='dual_rgb',  # 中文注释：将可训练教师的传感器标签改为双RGB以匹配新增数据流水线
-            config='DG/Ours/drone/diffusion_detector_drone_rgb_sim.py',  # 中文注释：复用仿真RGB结构作为初始架构
-            pretrained_model='/mnt/ssd/lql/Fitness-Generalization-Transferability/work_dirs/diffusion_detector_drone_rgb_sim/best_coco_bbox_mAP_50_iter_20000.pth',  # 中文注释：加载已收敛的基础权重作为初始化
-            trainable=True,  # 中文注释：显式标记该教师需参与训练以便后续逻辑开启梯度
-            requires_training=True  # 中文注释：再次强调该分支应被调度器视为待优化对象
-            )  # 中文注释：可训练教师配置结束
+            name='real_rgb_teacher',  # 为可训练教师命名以便后续引用
+            sensor='dual_rgb',  # 将可训练教师的传感器标签改为双RGB以匹配新增数据流水线
+            config='DG/Ours/drone/diffusion_detector_drone_rgb_sim.py',  # 复用仿真RGB结构作为初始架构
+            pretrained_model='/mnt/ssd/lql/Fitness-Generalization-Transferability/work_dirs/diffusion_detector_drone_rgb_sim/best_coco_bbox_mAP_50_iter_20000.pth',  # 加载已收敛的基础权重作为初始化
+            trainable=True,  # 显式标记该教师需参与训练以便后续逻辑开启梯度
+            requires_training=True  # 再次强调该分支应被调度器视为待优化对象
+            )  # 可训练教师配置结束
     ])  # 教师列表定义完毕
 
 detector.semi_test_cfg = dict(  # 重写半监督测试配置以便互学习后的学生承担推理职责
@@ -57,14 +57,14 @@ model = dict(  # 构建域泛化训练包装器
     detector=detector,  # 注入扩散师生检测器
     data_preprocessor=detector.data_preprocessor,  # 复用预处理器
     train_cfg=dict(  # 配置训练阶段策略
-        burn_up_iters=5000,  # 前5000迭代仅更新学生主干
+        burn_up_iters=2000,  # 前2000迭代仅更新学生主干
         cross_loss_cfg=dict(  # 交叉蒸馏配置
             enable_cross_loss=True,  # 启用交叉蒸馏
             cross_loss_weight=0.4,  # 默认交叉蒸馏权重
-            cross_feature_loss_weight=0.3,  # 中文注释：设置交叉特征蒸馏损失的相对权重便于平衡特征对齐
-            cls_consistency_weight=0.1,  # 中文注释：设置分类一致性正则的权重帮助约束学生教师分类输出
-            reg_consistency_weight=0.1,  # 中文注释：设置边框回归一致性正则权重以稳定定位
-            cross_roi_kd_weight=0.2,  # 中文注释：设置交叉ROI级蒸馏的额外权重兼容需要该项的训练逻辑
+            cross_feature_loss_weight=0.3,  # 设置交叉特征蒸馏损失的相对权重便于平衡特征对齐
+            cls_consistency_weight=0.1,  # 设置分类一致性正则的权重帮助约束学生教师分类输出
+            reg_consistency_weight=0.1,  # 设置边框回归一致性正则权重以稳定定位
+            cross_roi_kd_weight=0.2,  # 设置交叉ROI级蒸馏的额外权重兼容需要该项的训练逻辑
             schedule=[  # 阶段性调度表
                 dict(  # 阶段一配置
                     start_iter=0,  # 迭代0开始进入阶段一
@@ -72,12 +72,12 @@ model = dict(  # 构建域泛化训练包装器
                     cross_loss_weight=0.0,  # 阶段一关闭交叉蒸馏避免扰动初始学生
                     trainable_teacher_loss_weight=0.0),  # 阶段一禁用可训练教师损失避免无梯度阶段浪费计算
                 dict(  # 阶段二配置
-                    start_iter=8000,  # 迭代8000开始进入阶段二
+                    start_iter=5000,  # 迭代5000开始进入阶段二
                     active_teacher='sim_ir',  # 阶段二切换仿真IR教师以提供跨模态信息
                     cross_loss_weight=0.4,  # 阶段二恢复交叉蒸馏权重以进行互学习
                     trainable_teacher_loss_weight=0.8),  # 阶段二为可训练教师分支提供较高损失权重促进收敛
                 dict(  # 阶段三配置
-                    start_iter=14000,  # 迭代14000开始进入阶段三
+                    start_iter=10000,  # 迭代10000开始进入阶段三
                     active_teacher='sim_rgb',  # 阶段三回归仿真RGB教师巩固性能
                     cross_loss_weight=0.5,  # 阶段三进一步提升交叉蒸馏强度
                     trainable_teacher_loss_weight=1.0),  # 阶段三将可训练教师损失权重恢复至基准实现充分训练
@@ -86,11 +86,11 @@ model = dict(  # 构建域泛化训练包装器
             enable_feature_loss=True,  # 启用特征蒸馏
             feature_loss_type='mse',  # 采用均方误差
             feature_loss_weight=0.5,  # 特征蒸馏权重
-            cross_feature_loss_weight=0.3,  # 中文注释：同步定义交叉特征蒸馏权重以兼容旧版读取逻辑
-            cross_consistency_cfg=dict(  # 中文注释：兼容旧字段的交叉一致性配置
-                cls_weight=0.1,  # 中文注释：旧字段中的分类一致性权重与新配置保持一致
-                reg_weight=0.1  # 中文注释：旧字段中的回归一致性权重与新配置保持一致
-            )),  # 中文注释：特征蒸馏配置结束
+            cross_feature_loss_weight=0.3,  # 同步定义交叉特征蒸馏权重以兼容旧版读取逻辑
+            cross_consistency_cfg=dict(  # 兼容旧字段的交叉一致性配置
+                cls_weight=0.1,  # 旧字段中的分类一致性权重与新配置保持一致
+                reg_weight=0.1  # 旧字段中的回归一致性权重与新配置保持一致
+            )),  # 特征蒸馏配置结束
         kd_cfg=dict(  # ROI蒸馏配置
             loss_cls_kd=dict(  # 分类蒸馏损失
                 type='KnowledgeDistillationKLDivLoss',  # KL散度损失

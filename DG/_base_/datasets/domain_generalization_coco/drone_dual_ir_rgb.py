@@ -8,7 +8,6 @@ backend_args = None  # 图像加载默认使用mmcv后端
 
 ir_img_prefix = '/mnt/ssd/lql/Fitness-Generalization-Transferability/data/sim_drone_ir/Town01_Opt/carla_data'  # 红外图像前缀路径
 rgb_img_prefix = '/mnt/ssd/lql/Fitness-Generalization-Transferability/data/sim_drone_rgb/Town01_Opt/carla_data'  # 可见光图像前缀路径
-real_rgb_img_prefix = 'data/real_drone_rgb/val'  # 可见光图像前缀路径
 
 ir_repeat = 1  # 红外数据重复次数，可通过修改该值控制采样比例
 rgb_repeat = 1  # 可见光数据重复次数，可通过修改该值控制采样比例
