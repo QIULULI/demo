@@ -554,8 +554,37 @@ class DomainGeneralizationDetector(BaseDetector):
             return torch.cat(ordered_slices, dim=0) if ordered_slices else None  # 中文注释：拼接所有片段并返回
         return reference_feature  # 中文注释：针对非常规结构直接返回参考对象
 
+    def _is_accuracy_metric(self, metric_name: str) -> bool:
+        """判断给定的指标名称是否代表准确率信息。"""
+        return metric_name.endswith('_acc') or ('acc' in metric_name and 'loss' not in metric_name)  # 中文注释：满足_acc结尾或包含acc但不含loss时视为准确率
+
+    def _merge_metrics_with_average(self, aggregated_losses: Dict[str, Any], sensor_losses: Dict[str, Any], sample_count: int,
+                                    accuracy_buffers: Dict[str, Tuple[Any, int]]) -> None:
+        """累积损失项并对准确率指标记录样本加权正确数。"""
+        for metric_name, metric_value in sensor_losses.items():  # 中文注释：遍历单个传感器产生的所有损失或指标
+            if self._is_accuracy_metric(metric_name):  # 中文注释：当指标属于准确率时单独进入加权统计
+                correct_increment = metric_value * sample_count  # 中文注释：将准确率乘以样本数量得到正确样本数
+                if metric_name not in accuracy_buffers:  # 中文注释：首次遇到该准确率指标时初始化缓存
+                    accuracy_buffers[metric_name] = (correct_increment, sample_count)  # 中文注释：记录当前正确样本数与样本总数
+                else:  # 中文注释：若已存在缓存则进行累加
+                    accumulated_correct, accumulated_total = accuracy_buffers[metric_name]  # 中文注释：取出已累计的正确样本数与样本数量
+                    accuracy_buffers[metric_name] = (accumulated_correct + correct_increment,
+                                                     accumulated_total + sample_count)  # 中文注释：更新缓存为新的累计值
+            else:  # 中文注释：对于普通损失直接累加
+                if metric_name in aggregated_losses:  # 中文注释：当总损失中已存在相同键时执行加法
+                    aggregated_losses[metric_name] = aggregated_losses[metric_name] + metric_value  # 中文注释：累加相同损失项的值
+                else:  # 中文注释：首次出现的损失项直接写入
+                    aggregated_losses[metric_name] = metric_value  # 中文注释：将新损失项记录到总损失字典
+
+    def _finalize_accuracy_metrics(self, aggregated_losses: Dict[str, Any], accuracy_buffers: Dict[str, Tuple[Any, int]]) -> None:
+        """根据累计的正确样本数恢复平均准确率并写回损失字典。"""
+        for metric_name, (correct_count, total_count) in accuracy_buffers.items():  # 中文注释：遍历所有准确率缓存条目
+            if total_count > 0:  # 中文注释：仅在累计样本数量大于零时计算平均值
+                aggregated_losses[metric_name] = correct_count / total_count  # 中文注释：将正确样本数除以总样本数得到平均准确率
+
     def cross_loss_diff_to_student(self, grouped_samples: Dict[str, SampleList], grouped_features: Dict[str, list]):  # 中文注释：按传感器分组计算交叉蒸馏损失
         losses = dict()  # 中文注释：初始化损失字典用于累计各传感器的结果
+        accuracy_buffers: Dict[str, Tuple[Any, int]] = dict()  # 中文注释：初始化准确率缓存字典用于记录加权结果
         for sensor_tag, samples in grouped_samples.items():  # 中文注释：遍历每个传感器下的样本列表
             if not samples:  # 中文注释：若该传感器下无样本则跳过
                 continue  # 中文注释：继续处理其他传感器
@@ -579,8 +608,8 @@ class DomainGeneralizationDetector(BaseDetector):
                 sensor_losses.update(rename_loss_dict('cross_', rpn_losses))  # 中文注释：汇总带有交叉蒸馏前缀的RPN损失
                 roi_losses = self.model.student.roi_head.loss(diff_fpn, rpn_results_list, samples)  # 中文注释：基于教师候选框计算ROI头损失
                 sensor_losses.update(rename_loss_dict('cross_', roi_losses))  # 中文注释：记录ROI蒸馏损失
-            for key, value in sensor_losses.items():  # 中文注释：遍历当前传感器的损失项
-                losses[key] = losses[key] + value if key in losses else value  # 中文注释：将损失累加到总字典中
+            self._merge_metrics_with_average(losses, sensor_losses, len(samples), accuracy_buffers)  # 中文注释：通过辅助函数合并损失并累积准确率指标
+        self._finalize_accuracy_metrics(losses, accuracy_buffers)  # 中文注释：在处理完所有传感器后恢复准确率的平均值
         losses = reweight_loss_dict(losses=losses, weight=self.cross_loss_weight)  # 中文注释：按照调度权重重标定交叉蒸馏损失
         return losses  # 中文注释：返回累计后的交叉蒸馏损失
 
