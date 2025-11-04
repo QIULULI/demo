@@ -55,6 +55,9 @@ class SemiBaseDiffDetector(BaseDetector):
         self.diff_detector = None  # 初始化扩散教师占位符
         self.diff_detectors = dict()  # 创建扩散教师存储字典
         self.diff_teacher_bank = self.diff_detectors  # 将教师资源库引用到同一字典以便统一维护
+        self.trainable_diff_teacher_keys: List[str] = []  # 中文注释：记录需要训练的扩散教师标识列表以便后续逻辑快速判断
+        self.trainable_diff_teachers: List[nn.Module] = []  # 中文注释：缓存所有可训练扩散教师模块对象方便外部优化器访问
+        self._trainable_diff_teacher_modules = nn.ModuleDict()  # 中文注释：使用ModuleDict注册可训练教师以便state_dict与优化器捕获参数
         self.active_diff_key = None  # 记录当前激活的扩散教师标识
         normalized_teachers = self._normalize_diff_teacher_configs(diff_model)  # 调用解析函数获取标准化教师配置
         main_teacher_hint = self._fetch_config_value(diff_model, 'main_teacher') if diff_model is not None else None  # 读取主教师提示
@@ -74,7 +77,16 @@ class SemiBaseDiffDetector(BaseDetector):
             if pretrained_path:  # 若存在对应权重
                 load_checkpoint(teacher_instance, pretrained_path, map_location='cpu', strict=True)  # 加载预训练权重确保参数一致
             teacher_instance.cuda()  # 将教师模型迁移至GPU以加速推理
-            self.freeze(teacher_instance)  # 冻结教师模型参数避免训练阶段被更新
+            is_trainable_teacher = bool(teacher_meta.get('trainable', False) or teacher_meta.get('requires_training', False))  # 中文注释：根据配置标识判断当前教师是否需要参与训练
+            if is_trainable_teacher:  # 中文注释：当教师需要训练时跳过冻结流程
+                for param in teacher_instance.parameters():  # 中文注释：遍历所有参数确保梯度开关处于激活状态
+                    param.requires_grad = True  # 中文注释：显式开启梯度以防加载权重过程中被关闭
+                teacher_instance.train(True)  # 中文注释：设置为训练模式以便批归一化等层更新统计量
+                self.trainable_diff_teacher_keys.append(teacher_key)  # 中文注释：记录可训练教师的键值方便后续检索
+                self.trainable_diff_teachers.append(teacher_instance)  # 中文注释：将教师实例加入可训练列表供优化器构建参数组
+                self._trainable_diff_teacher_modules[teacher_key] = teacher_instance  # 中文注释：将可训练教师注册到ModuleDict以确保参数写入state_dict
+            else:  # 中文注释：对于仅推理使用的教师仍保持冻结逻辑
+                self.freeze(teacher_instance)  # 中文注释：冻结教师模型参数避免训练阶段被更新
             self.diff_detectors[teacher_key] = teacher_instance  # 将实例化教师写入字典并以标识符索引
             alias_set = teacher_meta.get('aliases', set())  # 取出可选别名集合用于主教师匹配
             if self.active_diff_key is None and main_teacher_hint is not None and (main_teacher_hint == teacher_key or main_teacher_hint in alias_set):  # 若尚未确定主教师且提示匹配当前教师
@@ -210,7 +222,10 @@ class SemiBaseDiffDetector(BaseDetector):
     def train(self, mode: bool = True) -> None:  # 重载train方法，统一保持教师处于评估模式
         """Set the same train mode for teacher and student model."""
         for detector_name, detector_module in getattr(self, 'diff_detectors', {}).items():  # 遍历所有扩散教师
-            detector_module.train(False)  # 强制所有扩散教师保持评估模式
+            if detector_name in self.trainable_diff_teacher_keys:  # 中文注释：当教师被标记为可训练时根据传入mode设置训练状态
+                detector_module.train(mode)  # 中文注释：保持与外部训练模式一致以参与梯度更新
+            else:  # 中文注释：普通教师仍固定在评估模式以稳定伪标签生成
+                detector_module.train(False)  # 中文注释：确保仅推理教师不会受到train()调用影响
         super().train(mode)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -234,7 +249,10 @@ class SemiBaseDiffDetector(BaseDetector):
             return  # 忽略非法请求
         object.__setattr__(self, 'diff_detector', self.diff_detectors[name])  # 直接替换当前扩散教师引用
         self.active_diff_key = name  # 更新当前教师标识
-        self.diff_detector.train(False)  # 确保新教师保持评估模式
+        if name in self.trainable_diff_teacher_keys:  # 中文注释：若当前激活教师需要训练则维持训练模式
+            self.diff_detector.train(True)  # 中文注释：允许激活教师继续更新统计量并参与梯度
+        else:  # 中文注释：否则强制其处于评估模式
+            self.diff_detector.train(False)  # 中文注释：确保纯推理教师不会切换到训练模式
 
     def loss(self, multi_batch_inputs: Dict[str, Tensor],
              multi_batch_data_samples: Dict[str, SampleList]) -> dict:
@@ -361,7 +379,7 @@ class SemiBaseDiffDetector(BaseDetector):
         return batch_data_samples, batch_info
     
     @torch.no_grad()
-    def get_pseudo_instances_diff(
+    def _get_pseudo_instances_diff_inference(
             self, batch_inputs: Tensor, batch_data_samples: SampleList
     ) -> Tuple[SampleList, Optional[dict]]:
         """Get pseudo instances from teacher model."""
@@ -545,7 +563,64 @@ class SemiBaseDiffDetector(BaseDetector):
             cross_teacher_payload['cls_consistency'] = cls_consistency_value  # 中文注释：写入跨教师分类一致性的平均结果
             cross_teacher_payload['reg_consistency'] = reg_consistency_value  # 中文注释：写入跨教师回归一致性的平均结果
             distill_feature['cross_teacher'] = cross_teacher_payload  # 中文注释：将交叉教师信息补充到整体返回字典
-        return batch_data_samples, batch_info, distill_feature  # 返回伪标签、批信息与多教师特征
+            return batch_data_samples, batch_info, distill_feature  # 返回伪标签、批信息与多教师特征
+
+    def get_pseudo_instances_diff(
+            self, batch_inputs: Tensor, batch_data_samples: SampleList
+    ) -> Tuple[SampleList, Optional[dict]]:
+        """中文注释：联合推理与可训练教师前向以生成伪标签并返回可用于蒸馏的特征。"""
+        pseudo_samples, batch_info, distill_feature = self._get_pseudo_instances_diff_inference(batch_inputs, batch_data_samples)  # 中文注释：先运行无梯度推理分支生成伪标签与基础特征
+        if not self.trainable_diff_teacher_keys:  # 中文注释：若不存在可训练教师则直接返回推理结果
+            return pseudo_samples, batch_info, distill_feature  # 中文注释：无需附加信息时直接退出
+        sensor_map = distill_feature.get('sensor_map')  # 中文注释：尝试获取逐样本传感器标签用于匹配可训练教师
+        if sensor_map is None:  # 中文注释：当推理阶段未返回传感器映射时使用样本元信息兜底
+            sensor_map = [sample.metainfo.get('sensor') if hasattr(sample, 'metainfo') else None for sample in pseudo_samples]  # 中文注释：从数据样本元数据提取传感器标签
+        trainable_payload = self._forward_trainable_diff_teachers(batch_inputs, pseudo_samples, sensor_map, distill_feature)  # 中文注释：执行可训练教师的正常前向以获取带梯度的特征与预测
+        if trainable_payload:  # 中文注释：仅在存在可训练教师输出时才扩展特征字典
+            distill_feature['trainable_teachers'] = trainable_payload  # 中文注释：将可训练教师的详细输出写入特征包
+        return pseudo_samples, batch_info, distill_feature  # 中文注释：返回融合后的伪标签、批信息与特征
+
+    def _forward_trainable_diff_teachers(self,
+                                         batch_inputs: Tensor,
+                                         batch_data_samples: SampleList,
+                                         sensor_map: List[Optional[str]],
+                                         distill_feature: dict) -> Dict[str, dict]:
+        """中文注释：对标记为可训练的扩散教师执行常规前向并返回梯度可追踪的特征。"""
+        trainable_outputs: Dict[str, dict] = {}  # 中文注释：初始化返回字典用于存放各个可训练教师的输出
+        grouped_features: Dict[str, Any] = distill_feature.get('grouped_main_teacher', {})  # 中文注释：获取或初始化按传感器组织的特征字典
+        main_feature_list: List[Any] = distill_feature.get('main_teacher', [])  # 中文注释：获取逐样本主教师特征列表以便替换为带梯度结果
+        for teacher_key in self.trainable_diff_teacher_keys:  # 中文注释：遍历所有可训练教师标识
+            if teacher_key not in self.diff_teacher_bank:  # 中文注释：若教师未注册则跳过防止异常
+                continue  # 中文注释：继续处理下一个教师
+            sample_indices = [idx for idx, tag in enumerate(sensor_map) if tag == teacher_key]  # 中文注释：根据传感器映射筛选当前教师负责的样本索引
+            if not sample_indices:  # 中文注释：若当前批次无对应样本则无需前向
+                continue  # 中文注释：跳过当前教师
+            teacher_model = self.diff_teacher_bank[teacher_key]  # 中文注释：获取教师实例
+            teacher_model.train(True)  # 中文注释：确保教师处于训练模式以便统计更新
+            group_inputs = batch_inputs[sample_indices]  # 中文注释：按索引提取对应的输入图像张量
+            group_samples = [copy.deepcopy(batch_data_samples[i]) for i in sample_indices]  # 中文注释：深拷贝样本避免前向过程中修改原对象
+            predictions, feature_payload = teacher_model.predict(group_inputs, group_samples, rescale=False, return_feature=True)  # 中文注释：执行常规预测以获取特征并保留梯度信息
+            normalized_features, per_sample_features = self._normalize_group_feature_payload(feature_payload, len(sample_indices))  # 中文注释：将返回特征整理为统一结构并拆分为逐样本列表
+            grouped_features[teacher_key] = normalized_features  # 中文注释：以传感器键存储多尺度特征供后续蒸馏使用
+            for local_idx, global_idx in enumerate(sample_indices):  # 中文注释：遍历当前教师负责的样本索引
+                main_feature_list[global_idx] = per_sample_features[local_idx]  # 中文注释：使用带梯度的特征覆盖推理阶段的占位
+            trainable_outputs[teacher_key] = {  # 中文注释：组装当前教师的输出包
+                'features': per_sample_features,  # 中文注释：逐样本多尺度特征列表
+                'group_features': normalized_features,  # 中文注释：按尺度整理的整体特征
+                'predictions': [result.pred_instances for result in predictions]  # 中文注释：保存预测实例以便构造自监督损失
+            }
+        distill_feature['grouped_main_teacher'] = grouped_features  # 中文注释：回写最新的按传感器特征映射
+        distill_feature['main_teacher'] = main_feature_list  # 中文注释：更新主教师特征列表确保外部读取到带梯度的张量
+        return trainable_outputs  # 中文注释：返回可训练教师的输出详情供上层模块构建损失
+
+    def get_trainable_diff_teacher_parameters(self) -> List[nn.Parameter]:
+        """中文注释：收集所有可训练扩散教师的参数以便优化器创建独立参数组。"""
+        parameters: List[nn.Parameter] = []  # 中文注释：初始化参数容器
+        for teacher_module in self.trainable_diff_teachers:  # 中文注释：遍历全部可训练教师模块
+            for param in teacher_module.parameters():  # 中文注释：遍历教师内部所有参数张量
+                if param.requires_grad:  # 中文注释：仅保留已启用梯度的参数以避免冗余
+                    parameters.append(param)  # 中文注释：将参数加入结果列表
+        return parameters  # 中文注释：返回聚合后的参数列表供外部优化器使用
 
     def _parse_diff_feature(self, diff_feature: Any, batch_info: dict) -> dict:
         """中文注释：将扩散教师返回的特征结构统一整理便于后续蒸馏使用。"""
@@ -553,11 +628,13 @@ class SemiBaseDiffDetector(BaseDetector):
         cross_teacher_info = None  # 中文注释：初始化交叉教师信息为空
         sensor_map = None  # 中文注释：初始化传感器标签映射占位
         grouped_main_teacher = None  # 中文注释：初始化按传感器划分的主教师特征结构
+        trainable_teacher_info = None  # 中文注释：初始化可训练教师信息占位
         if isinstance(diff_feature, dict):  # 中文注释：当特征以字典形式提供时按约定键解析
             main_teacher_feature = diff_feature.get('main_teacher', diff_feature.get('teacher_feature', diff_feature))  # 中文注释：优先读取主教师特征键并在缺失时回退
             cross_teacher_info = diff_feature.get('cross_teacher')  # 中文注释：获取交叉教师相关信息块
             sensor_map = diff_feature.get('sensor_map')  # 中文注释：尝试读取逐样本传感器标签列表
             grouped_main_teacher = diff_feature.get('grouped_main_teacher')  # 中文注释：尝试读取按传感器整理的主教师特征
+            trainable_teacher_info = diff_feature.get('trainable_teachers')  # 中文注释：提取可训练教师的附加输出以便上层构建损失
         parsed_feature = {'main_teacher': main_teacher_feature}  # 中文注释：构建标准化返回字典并写入主教师特征
         if sensor_map is not None:  # 中文注释：若提供逐样本传感器映射则保留
             parsed_feature['sensor_map'] = sensor_map  # 中文注释：记录传感器标签列表
@@ -575,6 +652,8 @@ class SemiBaseDiffDetector(BaseDetector):
             parsed_feature['cross_teacher'] = cross_teacher_info  # 中文注释：在解析结果中保留交叉教师完整信息
         elif cross_teacher_info is not None:  # 中文注释：若交叉教师信息存在但非字典则直接透传
             parsed_feature['cross_teacher'] = cross_teacher_info  # 中文注释：保持原始结构避免信息丢失
+        if trainable_teacher_info is not None:  # 中文注释：若可训练教师提供了额外输出则保留
+            parsed_feature['trainable_teachers'] = trainable_teacher_info  # 中文注释：在解析结果中记录可训练教师信息供上层损失读取
         return parsed_feature  # 中文注释：返回解析后的特征字典
 
     def project_pseudo_instances(self, batch_pseudo_instances: SampleList,
