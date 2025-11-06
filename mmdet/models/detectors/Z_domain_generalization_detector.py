@@ -49,7 +49,9 @@ class DomainGeneralizationDetector(BaseDetector):
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
         self.model = MODELS.build(detector)
         self.detector_name = detector.get('type')
-        self.train_cfg = train_cfg
+        self.train_cfg = train_cfg  # 中文注释：缓存训练阶段配置以便统一读取超参数
+        self.warmup_start_iters = self.train_cfg.get('warmup_start_iters', 0)  # 中文注释：读取蒸馏预热起始迭代默认0保持兼容
+        self.warmup_ramp_iters = self.train_cfg.get('warmup_ramp_iters', 0)  # 中文注释：读取蒸馏预热爬坡时长默认0表示立即生效
             
         # cross model setting
         self.cross_loss_cfg = self.train_cfg.cross_loss_cfg  # 中文注释：缓存交叉蒸馏配置以便复用子项
@@ -89,8 +91,19 @@ class DomainGeneralizationDetector(BaseDetector):
         self.loss_cls_kd = MODELS.build(self.train_cfg.kd_cfg['loss_cls_kd'])
         self.loss_reg_kd = MODELS.build(self.train_cfg.kd_cfg['loss_reg_kd'])
         
-        self.burn_up_iters = self.train_cfg.get('burn_up_iters', 0)
-        self.local_iter = 0
+        self.burn_up_iters = self.train_cfg.get('burn_up_iters', 0)  # 中文注释：继承原有烧入迭代设置控制蒸馏开始
+        self.local_iter = 0  # 中文注释：初始化迭代计数器用于预热调度
+
+    def _get_distill_warmup_weight(self, current_iter: int) -> float:
+        """中文注释：根据当前迭代位置计算蒸馏损失的预热权重。"""
+        if current_iter < self.warmup_start_iters:  # 中文注释：当迭代尚未到达预热起点时蒸馏权重为0
+            return 0.0  # 中文注释：完全关闭蒸馏相关损失
+        if self.warmup_ramp_iters <= 0:  # 中文注释：未设置爬坡时直接返回满权重
+            return 1.0  # 中文注释：立即按目标权重计算蒸馏损失
+        ramp_progress = current_iter - self.warmup_start_iters  # 中文注释：计算距离预热起点的迭代步数
+        ramp_progress = max(ramp_progress, 0)  # 中文注释：避免出现负值导致权重异常
+        ramp_progress = min(ramp_progress, self.warmup_ramp_iters)  # 中文注释：将进度限定在爬坡区间上限
+        return ramp_progress / self.warmup_ramp_iters  # 中文注释：线性映射获得0到1之间的蒸馏权重
 
     def _update_cross_schedule(self) -> None:
         """动态调整交叉蒸馏权重以及底层扩散教师的启用状态。"""
@@ -132,13 +145,17 @@ class DomainGeneralizationDetector(BaseDetector):
         """
         self._update_cross_schedule()  # 在每次迭代前更新调度状态
         losses = dict()  # 初始化损失容器
-        if self.local_iter >= self.burn_up_iters:
-            # losses.update(**self.model.student.loss(batch_inputs, batch_data_samples))
-            losses.update(**self.loss_cross(batch_inputs, batch_data_samples))
-        else:
-            losses.update(**self.model.student.loss(batch_inputs, batch_data_samples))
-        self.local_iter += 1
-        return losses
+        current_iter = self.local_iter  # 中文注释：缓存当前迭代索引用于预热调度判断
+        distill_blocked = (current_iter < self.burn_up_iters  # 中文注释：保留旧版烧入逻辑
+                           or current_iter < self.warmup_start_iters)  # 中文注释：在预热起点前禁止蒸馏
+        if distill_blocked:  # 中文注释：当蒸馏未开放时仅训练学生监督损失
+            losses.update(**self.model.student.loss(batch_inputs, batch_data_samples))  # 中文注释：执行学生分支常规训练
+        else:  # 中文注释：满足条件后进入蒸馏阶段
+            warmup_weight = self._get_distill_warmup_weight(current_iter)  # 中文注释：计算当前迭代的蒸馏预热系数
+            losses.update(**self.loss_cross(
+                batch_inputs, batch_data_samples, warmup_weight=warmup_weight))  # 中文注释：带预热系数计算跨模态损失
+        self.local_iter += 1  # 中文注释：递增局部迭代计数器
+        return losses  # 中文注释：返回累计损失
 
     def predict(self, batch_inputs: Tensor,  # 新增中文注释：输入的图像张量
                 batch_data_samples: SampleList,  # 新增中文注释：输入的样本信息列表
@@ -614,8 +631,9 @@ class DomainGeneralizationDetector(BaseDetector):
         losses = reweight_loss_dict(losses=losses, weight=self.cross_loss_weight)  # 中文注释：按照调度权重重标定交叉蒸馏损失
         return losses  # 中文注释：返回累计后的交叉蒸馏损失
 
-    def loss_cross(self, batch_inputs: Tensor,
-                batch_data_samples: SampleList) -> dict:
+    def loss_cross(self, batch_inputs: Tensor,  # 中文注释：输入图像张量
+                   batch_data_samples: SampleList,  # 中文注释：输入样本列表
+                   warmup_weight: float = 1.0) -> dict:  # 中文注释：蒸馏预热系数默认1代表完全启用
         """Calculate losses from a batch of inputs and data samples.
 
         Args:
@@ -794,7 +812,15 @@ class DomainGeneralizationDetector(BaseDetector):
             losses.update(scaled_cross_roi_losses)  # 中文注释：将交叉ROI蒸馏损失并入总损失
         ##############################################################################################################
 
-        return losses
+        if warmup_weight < 1.0:  # 中文注释：仅在预热阶段需要缩放蒸馏相关损失
+            warmup_targets = dict()  # 中文注释：创建待缩放的蒸馏损失子集
+            for key, value in losses.items():  # 中文注释：遍历全部损失条目
+                if key.startswith('cross_') or key == 'pkd_feature_loss':  # 中文注释：筛选交叉蒸馏与特征蒸馏主项
+                    warmup_targets[key] = value  # 中文注释：记录需要缩放的损失项
+            scaled_losses = reweight_loss_dict(warmup_targets, warmup_weight)  # 中文注释：调用工具函数执行统一缩放
+            for key, value in scaled_losses.items():  # 中文注释：遍历缩放结果
+                losses[key] = value  # 中文注释：将缩放后的损失写回总字典
+        return losses  # 中文注释：返回应用预热后的损失
 
     def get_trainable_diff_teacher_parameters(self) -> List[nn.Parameter]:
         """中文注释：暴露底层可训练扩散教师的参数列表以便优化器构建额外参数组。"""
