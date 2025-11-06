@@ -50,7 +50,12 @@ class DomainAdaptationDetector(BaseDetector):
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
         self.model = MODELS.build(detector)
         self.detector_name = detector.get('type')
-        self.train_cfg = train_cfg
+        self.train_cfg = train_cfg  # 中文注释：缓存训练配置方便后续读取蒸馏调度参数
+        detector_cfg = self.train_cfg.detector_cfg  # 中文注释：提取检测器子配置以便访问蒸馏相关阈值
+        self.warmup_start_iters = self.train_cfg.get(  # 中文注释：读取蒸馏预热起始迭代默认0保持兼容
+            'warmup_start_iters', detector_cfg.get('warmup_start_iters', 0))
+        self.warmup_ramp_iters = self.train_cfg.get(  # 中文注释：读取蒸馏预热线性爬坡长度默认0表示无预热
+            'warmup_ramp_iters', detector_cfg.get('warmup_ramp_iters', 0))
         
         feature_loss_cfg = self.train_cfg.feature_loss_cfg  # 中文注释：提取特征蒸馏配置方便后续多次使用
         self.feature_loss_type = feature_loss_cfg.get(
@@ -73,8 +78,8 @@ class DomainAdaptationDetector(BaseDetector):
             'reg_weight', 0.0)  # 中文注释：获取交叉教师回归一致性损失的权重默认关闭
         self.cross_consistency_debug_log = self.cross_consistency_cfg.get(
             'debug_log', False)  # 中文注释：读取是否启用交叉一致性损失的调试日志输出开关
-        self.burn_up_iters = self.train_cfg.detector_cfg.get('burn_up_iters', 0)
-        self.local_iter = 0
+        self.burn_up_iters = detector_cfg.get('burn_up_iters', 0)  # 中文注释：保留原有烧入阶段迭代控制逻辑
+        self.local_iter = 0  # 中文注释：初始化局部迭代计数器供预热调度使用
 
     @property
     def with_rpn(self):
@@ -86,6 +91,17 @@ class DomainAdaptationDetector(BaseDetector):
     @property
     def with_student(self):
         return hasattr(self.model, 'student')
+
+    def _get_distill_warmup_weight(self, current_iter: int) -> float:
+        """中文注释：根据当前迭代计算蒸馏损失对应的预热权重。"""
+        if current_iter < self.warmup_start_iters:  # 中文注释：在预热起点之前蒸馏权重保持为0
+            return 0.0  # 中文注释：完全关闭蒸馏分支
+        if self.warmup_ramp_iters <= 0:  # 中文注释：当未设置线性爬坡长度时直接启用完整蒸馏权重
+            return 1.0  # 中文注释：立即返回满权重
+        ramp_progress = current_iter - self.warmup_start_iters  # 中文注释：计算相对预热起点的进度
+        ramp_progress = max(ramp_progress, 0)  # 中文注释：确保进度不为负值
+        ramp_progress = min(ramp_progress, self.warmup_ramp_iters)  # 中文注释：将进度限制在爬坡区间内
+        return ramp_progress / self.warmup_ramp_iters  # 中文注释：按比例映射到0到1之间的权重
 
     def loss(self, multi_batch_inputs: Dict[str, Tensor],
              multi_batch_data_samples: Dict[str, SampleList]) -> dict:
@@ -104,15 +120,34 @@ class DomainAdaptationDetector(BaseDetector):
             self.local_iter += 1
             
         elif self.train_cfg.detector_cfg.get('type') in ['SemiBaseDiff']:
-            if self.local_iter >= self.burn_up_iters:
-                semi_loss, diff_feature = self.model.loss_diff_adaptation(multi_batch_inputs, multi_batch_data_samples)
-                feature_loss = self.loss_feature(multi_batch_inputs['unsup_teacher'], diff_feature)
-                losses.update(**semi_loss)
-                losses.update(**feature_loss)
-            else:
-                losses.update(**self.model.loss_by_gt_instances(multi_batch_inputs['sup'], multi_batch_data_samples['sup']))
-                
-            self.local_iter += 1
+            current_iter = self.local_iter  # 中文注释：缓存当前迭代索引用于判断预热阶段
+            distill_blocked = (current_iter < self.burn_up_iters  # 中文注释：遵循旧版烧入阶段限制
+                               or current_iter < self.warmup_start_iters)  # 中文注释：在预热起点前禁止蒸馏
+            if distill_blocked:  # 中文注释：当蒸馏尚未开放时仅执行有监督分支
+                losses.update(**self.model.loss_by_gt_instances(
+                    multi_batch_inputs['sup'], multi_batch_data_samples['sup']))  # 中文注释：计算监督学习损失
+            else:  # 中文注释：当满足蒸馏开放条件时执行跨模型与特征蒸馏分支
+                warmup_weight = self._get_distill_warmup_weight(current_iter)  # 中文注释：根据迭代进度获取预热权重
+                semi_loss, diff_feature = self.model.loss_diff_adaptation(
+                    multi_batch_inputs, multi_batch_data_samples)  # 中文注释：获取跨模型损失与教师特征
+                feature_loss = self.loss_feature(
+                    multi_batch_inputs['unsup_teacher'], diff_feature)  # 中文注释：计算特征蒸馏损失
+                losses.update(**semi_loss)  # 中文注释：合并跨模型损失项
+                losses.update(**feature_loss)  # 中文注释：合并特征蒸馏损失项
+                if warmup_weight < 1.0:  # 中文注释：仅在预热阶段对蒸馏损失执行线性缩放
+                    warmup_targets = dict()  # 中文注释：准备收集需要缩放的蒸馏损失条目
+                    for key, value in semi_loss.items():  # 中文注释：遍历跨模型损失字典
+                        if key.startswith('cross_') or key == 'pkd_feature_loss':  # 中文注释：筛选符合规则的蒸馏项
+                            warmup_targets[key] = value  # 中文注释：记录待缩放的损失条目
+                    for key, value in feature_loss.items():  # 中文注释：遍历特征蒸馏损失字典
+                        if key.startswith('cross_') or key == 'pkd_feature_loss':  # 中文注释：保持与跨模型一致的筛选条件
+                            warmup_targets[key] = value  # 中文注释：将匹配的特征蒸馏损失纳入缩放集合
+                    scaled_losses = reweight_loss_dict(warmup_targets, warmup_weight)  # 中文注释：调用通用工具执行统一缩放
+                    for key, value in scaled_losses.items():  # 中文注释：遍历缩放后的损失条目
+                        if key in losses:  # 中文注释：仅在最终损失字典存在对应键时才写回
+                            losses[key] = value  # 中文注释：用缩放结果覆盖原始损失确保预热策略生效
+
+            self.local_iter += 1  # 中文注释：更新局部迭代计数器以驱动后续调度
         else:
             raise "detector type not in ['SemiBase','SoftTeacher','SemiBaseDiff'] "
         return losses
