@@ -52,6 +52,7 @@ class DomainGeneralizationDetector(BaseDetector):
         self.train_cfg = train_cfg  # 中文注释：缓存训练阶段配置以便统一读取超参数
         self.warmup_start_iters = self.train_cfg.get('warmup_start_iters', 0)  # 中文注释：读取蒸馏预热起始迭代默认0保持兼容
         self.warmup_ramp_iters = self.train_cfg.get('warmup_ramp_iters', 0)  # 中文注释：读取蒸馏预热爬坡时长默认0表示立即生效
+        self.warmup_scale_trainable_teacher = bool(self.train_cfg.get('warmup_scale_trainable_teacher', False))  # 中文注释：读取可训练教师损失是否参与预热缩放的布尔开关默认False
             
         # cross model setting
         self.cross_loss_cfg = self.train_cfg.cross_loss_cfg  # 中文注释：缓存交叉蒸馏配置以便复用子项
@@ -152,6 +153,8 @@ class DomainGeneralizationDetector(BaseDetector):
             losses.update(**self.model.student.loss(batch_inputs, batch_data_samples))  # 中文注释：执行学生分支常规训练
         else:  # 中文注释：满足条件后进入蒸馏阶段
             warmup_weight = self._get_distill_warmup_weight(current_iter)  # 中文注释：计算当前迭代的蒸馏预热系数
+            if current_iter % 50 == 0:  # 中文注释：每隔50步打印一次预热状态以便监控
+                print(f'[DG Warmup] iter={current_iter} w={warmup_weight:.4f}')  # 中文注释：输出包含迭代索引与预热系数的日志
             losses.update(**self.loss_cross(
                 batch_inputs, batch_data_samples, warmup_weight=warmup_weight))  # 中文注释：带预热系数计算跨模态损失
         self.local_iter += 1  # 中文注释：递增局部迭代计数器
@@ -814,12 +817,26 @@ class DomainGeneralizationDetector(BaseDetector):
 
         if warmup_weight < 1.0:  # 中文注释：仅在预热阶段需要缩放蒸馏相关损失
             warmup_targets = dict()  # 中文注释：创建待缩放的蒸馏损失子集
+            explicit_keys = {  # 中文注释：定义需要额外纳入预热缩放的关键损失名称集合
+                'pkd_feature_loss',  # 中文注释：主教师特征蒸馏损失
+                'loss_cross_feature',  # 中文注释：交叉教师特征蒸馏损失
+                'loss_cls_kd',  # 中文注释：分类知识蒸馏损失
+                'loss_reg_kd',  # 中文注释：回归知识蒸馏损失
+                'cross_cls_consistency_loss',  # 中文注释：交叉分类一致性损失
+                'cross_reg_consistency_loss',  # 中文注释：交叉回归一致性损失
+            }
+            if self.warmup_scale_trainable_teacher:  # 中文注释：当配置要求对可训练教师损失进行预热缩放时
+                explicit_keys.add('loss_trainable_teacher_mse')  # 中文注释：将可训练教师MSE损失加入缩放集合
             for key, value in losses.items():  # 中文注释：遍历全部损失条目
-                if key.startswith('cross_') or key == 'pkd_feature_loss':  # 中文注释：筛选交叉蒸馏与特征蒸馏主项
-                    warmup_targets[key] = value  # 中文注释：记录需要缩放的损失项
-            scaled_losses = reweight_loss_dict(warmup_targets, warmup_weight)  # 中文注释：调用工具函数执行统一缩放
-            for key, value in scaled_losses.items():  # 中文注释：遍历缩放结果
-                losses[key] = value  # 中文注释：将缩放后的损失写回总字典
+                if key.startswith('cross_'):  # 中文注释：所有交叉前缀的损失均需要在预热阶段缩放
+                    warmup_targets[key] = value  # 中文注释：记录交叉损失以便统一缩放
+            for key in explicit_keys:  # 中文注释：遍历额外指定的损失键名
+                if key in losses:  # 中文注释：仅当损失字典中存在该键时才参与缩放
+                    warmup_targets[key] = losses[key]  # 中文注释：收集额外指定的损失项
+            if warmup_targets:  # 中文注释：确保存在需要缩放的目标后再执行重加权
+                scaled_losses = reweight_loss_dict(warmup_targets, warmup_weight)  # 中文注释：调用工具函数执行统一缩放
+                for key, value in scaled_losses.items():  # 中文注释：遍历缩放结果
+                    losses[key] = value  # 中文注释：将缩放后的损失写回总字典
         return losses  # 中文注释：返回应用预热后的损失
 
     def get_trainable_diff_teacher_parameters(self) -> List[nn.Parameter]:
