@@ -1,0 +1,202 @@
+# Copyright (c) OpenMMLab. All rights reserved.  # 声明版权信息
+import copy  # 引入用于深拷贝数据结构的标准库
+from typing import Dict, Optional  # 引入类型注解工具以提高代码可读性
+
+import torch  # 引入 PyTorch 主库以便进行张量运算
+import torch.nn.functional as F  # 引入函数式神经网络接口用于损失计算
+from torch import Tensor  # 从 torch 中单独引入 Tensor 类型以便注解
+
+from mmdet.models.utils import rename_loss_dict  # 引入工具函数用于统一损失字典前缀
+from mmdet.registry import MODELS  # 引入注册表以注册新的检测器模块
+from mmdet.structures import SampleList  # 引入样本列表类型注解
+from mmdet.structures.bbox import bbox2roi  # 引入将 proposal 转换为 RoI 的工具函数
+from .base import BaseDetector  # 引入检测器基类以实现通用接口
+from .Z_diffusion_detector import DiffusionDetector  # 引入扩散检测器类型用于类型检查
+
+
+@MODELS.register_module()  # 将该类注册到模型注册表中方便配置化构建
+class Diff2DiffDistiller(BaseDetector):  # 定义 Diff2Diff 知识蒸馏检测器类
+    """Diffusion-to-diffusion distillation detector for RGB->IR transfer."""  # 提供类的中文描述字符串
+
+    def __init__(self,  # 初始化函数定义开始
+                 student: DiffusionDetector,  # 学生模型必须是 DiffusionDetector 类型
+                 teacher: DiffusionDetector,  # 老师模型同样是 DiffusionDetector 类型
+                 freeze_teacher: bool = True,  # 是否在训练中冻结老师模型参数
+                 use_ema_teacher: bool = False,  # 是否使用 EMA 策略更新老师模型
+                 cmt_update: bool = False,  # 是否启用对比动量式更新策略占位符
+                 kd_loss_weights: Optional[Dict[str, float]] = None,  # 蒸馏损失权重配置字典
+                 ema_momentum: float = 0.999,  # EMA 更新的动量系数默认建议 0.999
+                 data_preprocessor=None,  # 可选数据预处理器参数
+                 init_cfg: Optional[Dict] = None) -> None:  # 可选初始化配置
+        if data_preprocessor is None and hasattr(student, 'data_preprocessor'):  # 若未显式提供预处理器则继承学生配置
+            data_preprocessor = student.data_preprocessor  # 使用学生模型自带的数据预处理器
+        super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)  # 初始化父类确保预处理器生效
+
+        student = MODELS.build(student) if isinstance(student, dict) else student
+        teacher = MODELS.build(teacher) if isinstance(teacher, dict) else teacher
+        assert isinstance(student, DiffusionDetector)
+        assert isinstance(teacher, DiffusionDetector)
+
+        self.student = student  # 保存学生模型实例
+        self.teacher = teacher  # 保存老师模型实例
+        self.freeze_teacher = freeze_teacher  # 记录是否需要冻结老师模型
+        self.use_ema_teacher = use_ema_teacher  # 记录是否启用 EMA 更新
+        self.cmt_update = cmt_update  # 记录是否启用对比动量更新占位符
+        self.ema_momentum = ema_momentum  # 保存 EMA 动量系数
+
+        default_weights = dict(  # 定义默认的各类蒸馏损失权重
+            feature=1.0,  # 特征蒸馏损失默认权重为 1.0
+            rpn_cls=1.0,  # RPN 分类蒸馏损失默认权重为 1.0
+            rpn_reg=1.0,  # RPN 回归蒸馏损失默认权重为 1.0
+            roi_cls=1.0,  # ROI 分类蒸馏损失默认权重为 1.0
+            roi_reg=1.0)  # ROI 回归蒸馏损失默认权重为 1.0
+        if kd_loss_weights is None:  # 如果未提供自定义权重
+            kd_loss_weights = default_weights  # 使用默认权重配置
+        else:  # 如果提供了自定义权重
+            merged_weights = default_weights.copy()  # 复制默认配置以便合并
+            merged_weights.update(kd_loss_weights)  # 更新默认配置为用户提供的权重
+            kd_loss_weights = merged_weights  # 使用合并后的权重字典
+        self.kd_loss_weights = kd_loss_weights  # 保存蒸馏损失权重字典
+
+        if self.freeze_teacher:  # 如果需要冻结老师模型
+            self._freeze_module(self.teacher)  # 调用内部函数冻结老师模型参数
+
+    @staticmethod  # 声明静态方法无需访问实例属性
+    def _freeze_module(module: DiffusionDetector) -> None:  # 定义冻结模块的辅助函数
+        module.eval()  # 将模块设置为评估模式
+        for param in module.parameters():  # 遍历模块的所有参数张量
+            param.requires_grad = False  # 关闭参数的梯度计算以冻结
+
+    def momentum_update(self) -> None:  # 定义 EMA 更新老师模型参数的方法
+        if not self.use_ema_teacher:  # 若未启用 EMA 则直接返回
+            return  # 不执行任何操作
+        with torch.no_grad():  # 在无梯度上下文中更新参数
+            for param_t, param_s in zip(self.teacher.parameters(),  # 同步遍历老师和学生参数
+                                        self.student.parameters()):  # 获取学生参数用于 EMA
+                param_t.data.mul_(self.ema_momentum).add_(  # 使用动量衰减老师历史权重
+                    param_s.data, alpha=1.0 - self.ema_momentum)  # 按比例融合学生当前权重
+
+    @property  # 定义只读属性以遵循 BaseDetector 接口
+    def with_rpn(self) -> bool:  # 暴露 RPN 是否存在的属性
+        return self.student.with_rpn  # 委托学生模型判断是否含有 RPN
+
+    @property  # 定义只读属性用于判断是否存在 ROI 头
+    def with_roi_head(self) -> bool:  # 暴露 ROI 头存在性的属性
+        return self.student.with_roi_head  # 委托学生模型判断是否含有 ROI 头
+
+    def train(self, mode: bool = True) -> None:  # 重写训练模式切换以维持老师冻结状态
+        self.student.train(mode)  # 设置学生模型的训练模式
+        if self.freeze_teacher:  # 如果老师模型应冻结
+            self.teacher.eval()  # 强制老师模型保持评估模式
+        else:  # 若允许老师参与训练
+            self.teacher.train(mode)  # 同步老师模型的训练状态
+        super().train(mode)  # 调用父类实现以保持一致行为
+
+    def loss(self,  # 定义训练阶段的损失计算函数
+             batch_inputs: Tensor,  # 输入的 RGB 图像批次张量
+             batch_data_samples: SampleList) -> Dict[str, Tensor]:  # 对应的标注数据列表
+        if self.use_ema_teacher or self.cmt_update:  # 若启用 EMA 或未来的动量更新
+            self.momentum_update()  # 更新老师模型参数以保持稳定性
+
+        teacher_feats = self.teacher.extract_feat(batch_inputs)  # 老师模型提取 FPN 特征
+        student_feats = self.student.extract_feat(batch_inputs)  # 学生模型提取 FPN 特征
+
+        teacher_rpn_scores, teacher_rpn_bboxes = [], []  # 初始化老师 RPN 输出列表
+        if self.teacher.with_rpn:  # 若老师模型包含 RPN
+            teacher_rpn_scores, teacher_rpn_bboxes = self.teacher.rpn_head(teacher_feats)  # 获取老师 RPN 分类与回归输出
+            teacher_rpn_scores = [score.detach() for score in teacher_rpn_scores]  # 脱离计算图以防反向传播
+            teacher_rpn_bboxes = [bbox.detach() for bbox in teacher_rpn_bboxes]  # 脱离回归分支梯度
+
+        student_rpn_scores, student_rpn_bboxes = [], []  # 初始化学生 RPN 输出列表
+        if self.student.with_rpn:  # 若学生模型包含 RPN
+            student_rpn_scores, student_rpn_bboxes = self.student.rpn_head(student_feats)  # 获取学生 RPN 分类与回归输出
+
+        losses: Dict[str, Tensor] = dict()  # 初始化总损失字典
+
+        if self.student.with_rpn:  # 若学生具备 RPN 则计算监督损失
+            proposal_cfg = self.student.train_cfg.get('rpn_proposal',  # 获取 RPN proposal 的训练配置
+                                                      self.student.test_cfg.rpn)  # 训练配置缺省时使用测试配置
+            rpn_data_samples = copy.deepcopy(batch_data_samples)  # 深拷贝数据以避免原始标签被修改
+            for data_sample in rpn_data_samples:  # 遍历每个数据样本
+                data_sample.gt_instances.labels = torch.zeros_like(  # 将 RPN 标签重置为背景类别
+                    data_sample.gt_instances.labels)  # 确保 RPN 分类目标统一
+            rpn_losses, rpn_results_list = self.student.rpn_head.loss_and_predict(  # 同时获取 RPN 损失与候选框
+                student_feats, rpn_data_samples, proposal_cfg=proposal_cfg)  # 传入特征与配置计算
+            losses.update(rename_loss_dict('sup_', rpn_losses))  # 为监督 RPN 损失添加前缀并合并
+        else:  # 若学生模型不包含 RPN
+            rpn_results_list = [data_sample.proposals for data_sample in batch_data_samples]  # 使用外部提供的 proposals
+
+        if self.student.with_roi_head:  # 若学生包含 ROI 头
+            roi_losses = self.student.roi_head.loss(student_feats, rpn_results_list,  # 计算 ROI 监督损失
+                                                    batch_data_samples)  # 使用监督标签计算损失
+            losses.update(rename_loss_dict('sup_', roi_losses))  # 合并带有监督前缀的 ROI 损失
+        else:  # 若没有 ROI 头
+            roi_losses = dict()  # 保留空字典用于后续逻辑兼容
+
+        feature_weight = self.kd_loss_weights.get('feature', 0.0)  # 读取特征蒸馏权重
+        if feature_weight > 0 and len(student_feats) == len(teacher_feats):  # 当权重有效且层级一致时计算特征蒸馏
+            feat_loss = torch.zeros(1, device=batch_inputs.device)  # 初始化特征蒸馏损失张量
+            for s_feat, t_feat in zip(student_feats, teacher_feats):  # 遍历对应层级的特征图
+                feat_loss = feat_loss + F.mse_loss(s_feat, t_feat.detach())  # 累加层级间的 MSE 损失
+            feat_loss = feat_loss / max(len(student_feats), 1)  # 对损失取平均避免层数影响
+            losses['loss_kd_feature'] = feat_loss * feature_weight  # 记录加权后的特征蒸馏损失
+
+        if self.student.with_rpn and teacher_rpn_scores and teacher_rpn_bboxes:  # 若存在 RPN 蒸馏所需输出
+            rpn_cls_weight = self.kd_loss_weights.get('rpn_cls', 0.0)  # 读取 RPN 分类蒸馏权重
+            if rpn_cls_weight > 0:  # 当权重有效时计算分类蒸馏
+                rpn_cls_loss = torch.zeros(1, device=batch_inputs.device)  # 初始化 RPN 分类蒸馏损失
+                for s_score, t_score in zip(student_rpn_scores, teacher_rpn_scores):  # 遍历各尺度输出
+                    rpn_cls_loss = rpn_cls_loss + F.mse_loss(s_score, t_score)  # 计算对应尺度的 MSE 损失
+                rpn_cls_loss = rpn_cls_loss / max(len(student_rpn_scores), 1)  # 对损失进行平均
+                losses['loss_kd_rpn_cls'] = rpn_cls_loss * rpn_cls_weight  # 记录加权后的 RPN 分类蒸馏损失
+            rpn_reg_weight = self.kd_loss_weights.get('rpn_reg', 0.0)  # 读取 RPN 回归蒸馏权重
+            if rpn_reg_weight > 0:  # 当权重有效时计算回归蒸馏
+                rpn_reg_loss = torch.zeros(1, device=batch_inputs.device)  # 初始化 RPN 回归蒸馏损失
+                for s_bbox, t_bbox in zip(student_rpn_bboxes, teacher_rpn_bboxes):  # 遍历各尺度回归输出
+                    rpn_reg_loss = rpn_reg_loss + F.mse_loss(s_bbox, t_bbox)  # 计算对应尺度的 MSE 损失
+                rpn_reg_loss = rpn_reg_loss / max(len(student_rpn_bboxes), 1)  # 对损失进行平均
+                losses['loss_kd_rpn_reg'] = rpn_reg_loss * rpn_reg_weight  # 记录加权后的 RPN 回归蒸馏损失
+
+        if self.student.with_roi_head and self.teacher.with_roi_head:  # 当双方均具备 ROI 头时进行 ROI 蒸馏
+            proposals = [res.bboxes for res in rpn_results_list]  # 收集学生 RPN 生成的候选框
+            if proposals and all(proposal.numel() > 0 for proposal in proposals):  # 确保存在有效候选框
+                rois = bbox2roi(proposals)  # 将候选框转换为 RoI 张量
+                student_bbox_results = self.student.roi_head._bbox_forward(  # 学生 ROI 前向计算调用开始
+                    student_feats, rois)  # 传入学生特征与 RoI 获得 ROI logits
+                with torch.no_grad():  # 在无梯度模式下计算老师 ROI 输出
+                    teacher_bbox_results = self.teacher.roi_head._bbox_forward(  # 老师 ROI 前向计算调用开始
+                        teacher_feats, rois)  # 传入老师特征与 RoI 获得 ROI logits
+                roi_cls_weight = self.kd_loss_weights.get('roi_cls', 0.0)  # 读取 ROI 分类蒸馏权重
+                if (roi_cls_weight > 0 and 'cls_score' in student_bbox_results  # 校验学生 ROI 分类输出存在
+                        and 'cls_score' in teacher_bbox_results):  # 校验老师 ROI 分类输出存在
+                    student_logit = student_bbox_results['cls_score']  # 学生 ROI 分类 logits
+                    teacher_logit = teacher_bbox_results['cls_score'].detach()  # 老师 ROI 分类 logits 并断开梯度
+                    student_log_prob = F.log_softmax(student_logit, dim=-1)  # 学生 logits 转换为对数概率
+                    teacher_prob = F.softmax(teacher_logit, dim=-1)  # 老师 logits 转换为软标签概率
+                    roi_cls_loss = F.kl_div(student_log_prob, teacher_prob, reduction='batchmean')  # 计算 KL 散度蒸馏损失
+                    losses['loss_kd_roi_cls'] = roi_cls_loss * roi_cls_weight  # 记录加权后的 ROI 分类蒸馏损失
+                roi_reg_weight = self.kd_loss_weights.get('roi_reg', 0.0)  # 读取 ROI 回归蒸馏权重
+                if (roi_reg_weight > 0 and 'bbox_pred' in student_bbox_results  # 校验学生 ROI 回归输出存在
+                        and 'bbox_pred' in teacher_bbox_results):  # 校验老师 ROI 回归输出存在
+                    student_bbox_pred = student_bbox_results['bbox_pred']  # 学生 ROI 回归输出
+                    teacher_bbox_pred = teacher_bbox_results['bbox_pred'].detach()  # 老师 ROI 回归输出并断开梯度
+                    roi_reg_loss = F.mse_loss(student_bbox_pred, teacher_bbox_pred)  # 计算 ROI 回归蒸馏 MSE 损失
+                    losses['loss_kd_roi_reg'] = roi_reg_loss * roi_reg_weight  # 记录加权后的 ROI 回归蒸馏损失
+
+        return losses  # 返回综合后的损失字典
+
+    def predict(self,  # 定义推理阶段的预测函数
+                batch_inputs: Tensor,  # 输入的 RGB 图像批次张量
+                batch_data_samples: SampleList,  # 对应的数据样本列表
+                rescale: bool = True,  # 是否对最终结果进行缩放复原
+                return_feature: bool = False):  # 是否返回特征图以便调试
+        return self.student.predict(batch_inputs, batch_data_samples,  # 直接调用学生模型的预测逻辑
+                                     rescale=rescale, return_feature=return_feature)  # 传递参数保持接口一致
+
+
+if __name__ == '__main__':  # 提供小型自检入口
+    dummy_student = DiffusionDetector.__new__(DiffusionDetector)  # 通过低级构造绕过初始化生成学生占位实例
+    dummy_teacher = DiffusionDetector.__new__(DiffusionDetector)  # 通过低级构造绕过初始化生成老师占位实例
+    distiller = Diff2DiffDistiller(  # 构建蒸馏器实例进行基本的导入测试
+        student=dummy_student, teacher=dummy_teacher, freeze_teacher=True)  # 传入占位对象并保持老师冻结
+    print(distiller.__class__.__name__)  # 打印类名验证模块可用

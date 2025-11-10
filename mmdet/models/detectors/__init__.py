@@ -12,6 +12,7 @@ from .cornernet import CornerNet
 from .crowddet import CrowdDet
 from .d2_wrapper import Detectron2Wrapper
 from .dab_detr import DABDETR
+from .diff2diff_distiller import Diff2DiffDistiller  # 中文注释: 引入 Diff2Diff 蒸馏检测器类
 from .ddod import DDOD
 from .ddq_detr import DDQDETR
 from .deformable_detr import DeformableDETR
@@ -75,5 +76,6 @@ __all__ = [
     'RTMDet', 'Detectron2Wrapper', 'CrowdDet', 'CondInst', 'BoxInst',
     'DetectionTransformer', 'ConditionalDETR', 'DINO', 'DABDETR', 'GLIP',
     'DDQDETR', 'GroundingDINO', 'DomainAdaptationDetector',
-    'SemiBaseDiffDetector', 'DiffusionDetector', 'DomainGeneralizationDetector'
+    'SemiBaseDiffDetector', 'DiffusionDetector', 'DomainGeneralizationDetector',
+    'Diff2DiffDistiller'  # 中文注释: 新增 Diff2Diff 蒸馏检测器到导出列表
 ]
