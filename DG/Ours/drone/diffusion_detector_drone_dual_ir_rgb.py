@@ -37,7 +37,7 @@ detector.diff_model = dict(  # 配置扩散教师信息
             config='DG/Ours/drone/diffusion_detector_drone_rgb_sim.py',  # 教师配置路径
             pretrained_model='/mnt/ssd/lql/Fitness-Generalization-Transferability/work_dirs/diffusion_detector_drone_rgb_sim/best_coco_bbox_mAP_50_iter_20000.pth'),  # 可见光教师权重
         dict(  # 新增真实RGB教师配置
-            name='real_rgb_teacher',  # 为可训练教师命名以便后续引用
+            name='dual_rgb_teacher',  # 为可训练教师命名以便后续引用
             sensor='dual_rgb',  # 将可训练教师的传感器标签改为双RGB以匹配新增数据流水线
             config='DG/Ours/drone/diffusion_detector_drone_rgb_sim.py',  # 复用仿真RGB结构作为初始架构
             pretrained_model='/mnt/ssd/lql/Fitness-Generalization-Transferability/work_dirs/diffusion_detector_drone_rgb_sim/best_coco_bbox_mAP_50_iter_20000.pth',  # 加载已收敛的基础权重作为初始化
