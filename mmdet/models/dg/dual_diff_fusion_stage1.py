@@ -242,7 +242,7 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
 
         if loss_total is None:  # 中文注释：若未累加任何损失则创建零张量占位
             loss_total = student_feats[0].sum() * 0  # 中文注释：使用学生特征创建零值张量保持梯度设备一致
-        losses['loss_total'] = loss_total  # 中文注释：记录总损失供日志与反向传播使用
+        losses['total_weighted_log'] = _detach_if_tensor(loss_total)  # 中文注释：记录仅用于监控的总损失日志条目并显式detach防止重复求和
         losses['meta_w_sup'] = student_feats[0].new_tensor(self.w_sup)  # 中文注释：记录学生监督损失权重常数张量并确保与主损失同设备
         losses['meta_w_cross'] = student_feats[0].new_tensor(self.w_cross)  # 中文注释：记录交叉蒸馏损失权重常数张量用于日志监控
         losses['meta_w_feat_kd'] = student_feats[0].new_tensor(self.w_feat_kd)  # 中文注释：记录特征蒸馏损失权重常数张量以便调试
