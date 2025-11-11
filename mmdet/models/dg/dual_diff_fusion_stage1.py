@@ -124,6 +124,7 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
             return value.detach() if isinstance(value, Tensor) else value  # 中文注释：若输入是张量则调用detach否则直接返回原值
 
         stu_rpn_results: Optional[List] = None  # 中文注释：记录学生RPN生成的候选框供后续复用
+        roi_kd_proposals: Optional[List] = None  # 中文注释：预先声明ROI蒸馏专用的候选框副本以避免被监督阶段改写
         if self.w_sup > 0:  # 中文注释：仅当学生监督权重大于零时计算监督损失
             if self.with_rpn and hasattr(self.student_rgb, 'rpn_head'):  # 中文注释：当学生包含RPN头部时计算RPN损失
                 proposal_cfg = self._get_proposal_cfg()  # 中文注释：读取RPN候选框配置
@@ -152,6 +153,9 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
             if self.with_roi_head and hasattr(self.student_rgb, 'roi_head'):  # 中文注释：当学生包含ROI头部时计算ROI损失
                 roi_inputs = stu_rpn_results if stu_rpn_results is not None else self._prepare_roi_inputs(  # 中文注释：优先复用学生RPN候选框否则动态生成
                     student_feats, batch_data_samples)  # 中文注释：当缺少RPN结果时重新生成候选框
+                if (self.enable_roi_kd and self.w_roi_kd > 0  # 中文注释：仅在启用ROI蒸馏时才复制候选框避免不必要的开销
+                        and roi_kd_proposals is None):  # 中文注释：确保只在第一次需要时才创建副本
+                    roi_kd_proposals = self._clone_proposals_for_kd(roi_inputs)  # 中文注释：调用内部工具函数深拷贝候选框以供蒸馏使用
                 roi_losses = self.student_rgb.roi_head.loss(student_feats, roi_inputs, batch_data_samples)  # 中文注释：基于学生特征计算ROI监督损失
                 for key, value in rename_loss_dict('stu_', roi_losses).items():  # 中文注释：为ROI损失添加stu_前缀
                     if 'loss' in key:  # 中文注释：仅对包含loss字样的键应用权重缩放
@@ -219,10 +223,15 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
         if (self.enable_roi_kd and self.w_roi_kd > 0 and self.with_roi_head
                 and hasattr(self.student_rgb, 'roi_head')
                 and hasattr(self.student_rgb.roi_head, 'forward')):  # 中文注释：当启用ROI蒸馏且接口齐全时执行
-            roi_inputs_for_kd = stu_rpn_results if stu_rpn_results is not None else self._prepare_roi_inputs(  # 中文注释：优先复用学生监督阶段的候选框
-                student_feats, batch_data_samples)  # 中文注释：若未计算监督RPN则重新生成候选框
-            student_roi_outputs = self.student_rgb.roi_head.forward(student_feats, roi_inputs_for_kd, batch_data_samples)  # 中文注释：获取学生ROI前向输出
-            teacher_roi_outputs = self.student_rgb.roi_head.forward(teacher_feats, roi_inputs_for_kd, batch_data_samples)  # 中文注释：获取教师ROI前向输出
+            kd_source_proposals = roi_kd_proposals  # 中文注释：优先使用监督阶段提前保存的候选框副本
+            if kd_source_proposals is None:  # 中文注释：当监督阶段未生成副本时需要重新准备候选框
+                raw_roi_inputs = stu_rpn_results if stu_rpn_results is not None else self._prepare_roi_inputs(  # 中文注释：优先复用学生RPN候选框否则动态生成
+                    student_feats, batch_data_samples)  # 中文注释：当缺少RPN结果时重新生成候选框
+                kd_source_proposals = self._clone_proposals_for_kd(raw_roi_inputs)  # 中文注释：将原始候选框深拷贝后作为蒸馏基准
+            student_kd_proposals = self._clone_proposals_for_kd(kd_source_proposals)  # 中文注释：为学生前向创建独立的候选框副本防止修改相互影响
+            teacher_kd_proposals = self._clone_proposals_for_kd(kd_source_proposals)  # 中文注释：为教师前向创建独立的候选框副本确保包含bboxes字段
+            student_roi_outputs = self.student_rgb.roi_head.forward(student_feats, student_kd_proposals, batch_data_samples)  # 中文注释：获取学生ROI前向输出
+            teacher_roi_outputs = self.student_rgb.roi_head.forward(teacher_feats, teacher_kd_proposals, batch_data_samples)  # 中文注释：获取教师ROI前向输出
             if len(student_roi_outputs) >= 1 and len(teacher_roi_outputs) >= 1:  # 中文注释：存在分类输出时计算KL蒸馏
                 stu_cls = student_roi_outputs[0]  # 中文注释：提取学生分类logits
                 tea_cls = teacher_roi_outputs[0]  # 中文注释：提取教师分类logits
@@ -268,6 +277,18 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
         if isinstance(module_or_cfg, dict):  # 中文注释：当传入配置字典时通过注册表构建
             return MODELS.build(module_or_cfg)  # 中文注释：使用注册表实例化检测器
         raise TypeError(f'{name} must be DiffusionDetector or config dict, but got {type(module_or_cfg)!r}')  # 中文注释：类型不匹配时抛出异常
+
+    def _clone_proposals_for_kd(self, proposals: List) -> List:  # 中文注释：定义辅助函数用于深拷贝ROI候选框供蒸馏使用
+        cloned_list: List = []  # 中文注释：创建列表用于保存克隆后的候选框实例
+        for proposal in proposals:  # 中文注释：遍历传入的每一个候选框对象
+            if hasattr(proposal, 'clone') and callable(getattr(proposal, 'clone')):  # 中文注释：优先使用对象自带的clone方法以保持结构一致
+                cloned = proposal.clone()  # 中文注释：调用clone生成独立副本
+            else:  # 中文注释：当对象缺少clone方法时回退到深拷贝策略
+                cloned = copy.deepcopy(proposal)  # 中文注释：使用标准库深拷贝生成结构化副本
+            if hasattr(cloned, 'bboxes') and isinstance(cloned.bboxes, Tensor):  # 中文注释：若克隆对象包含bboxes张量则需额外拷贝数据
+                cloned.bboxes = cloned.bboxes.clone()  # 中文注释：对bbox张量执行clone以避免后续原地修改
+            cloned_list.append(cloned)  # 中文注释：将克隆得到的候选框加入列表
+        return cloned_list  # 中文注释：返回完整的克隆候选框列表供ROI蒸馏使用
 
     def _prepare_roi_inputs(self, feats: Tuple[Tensor, ...], batch_data_samples: SampleList) -> List:  # 中文注释：根据特征与标注准备ROI阶段候选框
         if self.with_rpn and hasattr(self.student_rgb, 'rpn_head'):  # 中文注释：若学生包含RPN则使用给定特征生成候选框
