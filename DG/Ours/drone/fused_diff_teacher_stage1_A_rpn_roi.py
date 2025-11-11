@@ -44,6 +44,7 @@ student_rgb['init_cfg'] = dict(type='Pretrained', checkpoint=student_rgb_default
 student_rgb['data_preprocessor'] = det_data_preprocessor  # 中文注释：指定学生的数据预处理器确保输入管线一致
 
 model = dict(  # 中文注释：构建DualDiffFusionStage1检测器顶层配置
+    _delete_=True,  # 中文注释：声明覆盖基础配置并删除原始backbone、neck、rpn_head等键避免残留冲突
     type='DualDiffFusionStage1',  # 中文注释：指定使用第一阶段扩散融合蒸馏框架
     teacher_ir=teacher_ir,  # 中文注释：注入冻结的红外教师分支配置
     student_rgb=student_rgb,  # 中文注释：注入可训练的仿真RGB学生分支配置
@@ -192,4 +193,5 @@ if __name__ == '__main__':  # 中文注释：提供最小化自检脚本方便�
     with torch.no_grad():  # 中文注释：关闭梯度计算以进行快速前向测试
         _ = detector.extract_feat_student(dummy_inputs)  # 中文注释：调用学生分支特征提取验证前向流程
     print('提示：在正式训练前请将 teacher_ir/student_rgb 的 init_cfg.checkpoint 更新为真实权重路径')  # 中文注释：提醒用户替换真实权重避免占位符导致加载失败
+    print('提示：如需自定义融合教师导出目录，请使用 --work-dir 重新指定工作路径以覆盖默认 work_dirs')  # 中文注释：提示若想修改导出位置需显式传入工作目录
     print('DualDiffFusionStage1 配置自检通过')  # 中文注释：输出自检成功提示
