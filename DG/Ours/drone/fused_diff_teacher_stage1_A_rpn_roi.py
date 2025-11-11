@@ -50,10 +50,10 @@ model = dict(  # 中文注释：构建DualDiffFusionStage1检测器顶层配置
     data_preprocessor=det_data_preprocessor,  # 中文注释：顶层模型沿用学生预处理器保持训练数据一致
     train_cfg=dict(  # 中文注释：定义蒸馏阶段的核心超参数
         w_sup=1.0,  # 中文注释：学生监督损失权重建议保持1.0作为基准
-        w_cross=1.0,  # 中文注释：交叉蒸馏损失权重默认开启便于融合教师特征
-        w_feat_kd=0.0,  # 中文注释：特征蒸馏默认关闭按需通过配置文件覆盖
-        enable_roi_kd=False,  # 中文注释：ROI级蒸馏默认关闭避免早期不稳定
-        w_roi_kd=1.0,  # 中文注释：ROI蒸馏损失权重设置为1.0当启用时直接生效
+        w_cross=0.5,  # 中文注释：依据Stage-1规范推荐值0.5控制交叉蒸馏损失强度
+        w_feat_kd=0.5,  # 中文注释：依据Stage-1规范将特征蒸馏权重设置为0.5确保稳健对齐
+        enable_roi_kd=True,  # 中文注释：依据Stage-1规范启用ROI级蒸馏以增强局部指导
+        w_roi_kd=0.5,  # 中文注释：依据Stage-1规范将ROI蒸馏损失权重设为0.5方便后续覆写
         cross_warmup_iters=0,  # 中文注释：交叉蒸馏预热迭代默认0表示立即启用
         freeze_teacher=True,  # 中文注释：冻结教师权重确保第一阶段仅训练学生
     ),  # 中文注释：蒸馏配置结束
