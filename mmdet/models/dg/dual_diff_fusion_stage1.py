@@ -196,6 +196,11 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
         if loss_total is None:  # 中文注释：若未累加任何损失则创建零张量占位
             loss_total = student_feats[0].sum() * 0  # 中文注释：使用学生特征创建零值张量保持梯度设备一致
         losses['loss_total'] = loss_total  # 中文注释：记录总损失供日志与反向传播使用
+        losses['meta_w_sup'] = student_feats[0].new_tensor(self.w_sup)  # 中文注释：记录学生监督损失权重常数张量并确保与主损失同设备
+        losses['meta_w_cross'] = student_feats[0].new_tensor(self.w_cross)  # 中文注释：记录交叉蒸馏损失权重常数张量用于日志监控
+        losses['meta_w_feat_kd'] = student_feats[0].new_tensor(self.w_feat_kd)  # 中文注释：记录特征蒸馏损失权重常数张量以便调试
+        losses['meta_w_roi_kd'] = student_feats[0].new_tensor(self.w_roi_kd)  # 中文注释：记录ROI蒸馏损失权重常数张量便于追踪配置
+        losses['meta_cross_weight_effective'] = student_feats[0].new_tensor(cross_weight)  # 中文注释：记录考虑预热后的交叉蒸馏实际权重
         self.local_iter += 1  # 中文注释：自增内部迭代计数以支持交叉蒸馏预热
         return losses  # 中文注释：返回完整的损失字典
 
@@ -301,6 +306,8 @@ if __name__ == '__main__':  # 中文注释：提供最小化自检脚本方便�
     print('loss_keys', sorted(losses.keys()))  # 中文注释：打印损失键名验证命名规则
     required_rpn_keys = {'stu_rpn_loss_cls', 'stu_rpn_loss_bbox', 'cross_rpn_loss_cls', 'cross_rpn_loss_bbox'}  # 中文注释：定义必须存在的RPN键名集合
     print('rpn_keys_present', {key: (key in losses) for key in sorted(required_rpn_keys)})  # 中文注释：打印每个RPN键名是否存在
+    meta_keys = ['meta_w_sup', 'meta_w_cross', 'meta_w_feat_kd', 'meta_w_roi_kd', 'meta_cross_weight_effective']  # 中文注释：列出新增的权重日志键名
+    print('meta_keys_values', {key: float(losses[key]) for key in meta_keys})  # 中文注释：打印权重日志键对应的标量值确保存在且为常数张量
     part_keys = [key for key in losses.keys() if key not in ('loss_total', 'stu_loss_total', 'cross_loss_total')]  # 中文注释：过滤掉汇总项避免重复统计
     part_values = [losses[key] for key in part_keys]  # 中文注释：收集需要参与求和的损失值
     total_from_parts = torch.stack(part_values).sum() if part_values else torch.tensor(0.0, device=dummy_inputs.device)  # 中文注释：对有效损失进行求和
