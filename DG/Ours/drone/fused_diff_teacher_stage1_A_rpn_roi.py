@@ -2,11 +2,15 @@
 """无人机仿真RGB学生与冻结IR教师的第一阶段扩散融合训练配置。"""  # 顶部文档字符串简述配置功能
 
 from copy import deepcopy  # 中文注释：导入deepcopy以便在不共享引用的情况下复用基础模型配置
+from mmengine.config import Config  # 中文注释：导入Config类以显式读取基础模型配置内容
 
 _base_ = [  # 中文注释：列出需要继承的基础配置文件
     '../../_base_/models/faster-rcnn_diff_fpn.py',  # 中文注释：复用两阶段DIFF检测器结构定义
     '../../_base_/dg_setting/dg_20k.py',  # 中文注释：继承20k迭代训练调度与默认钩子设置
 ]  # 中文注释：基础配置列表结束
+
+base_cfg = Config.fromfile('../../_base_/models/faster-rcnn_diff_fpn.py')  # 中文注释：显式加载基础模型配置文件获取原始结构定义
+base_model_cfg = base_cfg.model  # 中文注释：提取基础配置中的模型字典以供教师与学生深拷贝复用
 
 classes = ('drone',)  # 中文注释：定义单类别任务仅包含无人机目标
 dataset_type = 'CocoDataset'  # 中文注释：指定数据集格式遵循COCO标注
@@ -33,12 +37,12 @@ det_data_preprocessor = dict(  # 中文注释：定义与仿真RGB模型一致�
     pad_size_divisor=64,  # 中文注释：将图像边长填充到64的倍数以利于多尺度特征对齐
 )  # 中文注释：预处理器配置结束
 
-teacher_ir = _apply_drone_specialization(deepcopy(_base_.model))  # 中文注释：基于基础DIFF模型深拷贝并套用无人机特化配置构建冻结教师
+teacher_ir = _apply_drone_specialization(deepcopy(base_model_cfg))  # 中文注释：基于显式读取的基础模型深拷贝并套用无人机特化配置构建冻结教师
 teacher_ir_default_ckpt = 'work_dirs/pretrained/sim_ir_diff_detector.pth'  # 中文注释：默认教师权重占位路径可通过 --cfg-options model.teacher_ir.init_cfg.checkpoint=xxx 覆盖
 teacher_ir['init_cfg'] = dict(type='Pretrained', checkpoint=teacher_ir_default_ckpt)  # 中文注释：使用Pretrained初始化教师扩散检测器权重
 teacher_ir['data_preprocessor'] = det_data_preprocessor  # 中文注释：将教师的数据预处理器与学生保持一致避免分布差异
 
-student_rgb = _apply_drone_specialization(deepcopy(_base_.model))  # 中文注释：深拷贝基础模型构建学生分支并应用同样的无人机特化修改
+student_rgb = _apply_drone_specialization(deepcopy(base_model_cfg))  # 中文注释：深拷贝显式读取的基础模型构建学生分支并应用同样的无人机特化修改
 student_rgb_default_ckpt = 'work_dirs/pretrained/sim_rgb_diff_detector.pth'  # 中文注释：默认学生预热权重占位路径可通过 --cfg-options model.student_rgb.init_cfg.checkpoint=xxx 覆盖
 student_rgb['init_cfg'] = dict(type='Pretrained', checkpoint=student_rgb_default_ckpt)  # 中文注释：指定学生扩散检测器的预训练权重
 student_rgb['data_preprocessor'] = det_data_preprocessor  # 中文注释：指定学生的数据预处理器确保输入管线一致
