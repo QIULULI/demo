@@ -63,6 +63,7 @@ from .Z_domain_adaptation_detector import DomainAdaptationDetector
 from .Z_diff_semi_base import SemiBaseDiffDetector
 from .Z_diffusion_detector import DiffusionDetector
 from .Z_domain_generalization_detector import DomainGeneralizationDetector
+from ..dg import DualDiffFusionStage1  # 中文注释: 引入第一阶段扩散融合检测器供外部引用
 __all__ = [
     'ATSS', 'BaseDetector', 'SingleStageDetector', 'TwoStageDetector', 'RPN',
     'KnowledgeDistillationSingleStageDetector', 'FastRCNN', 'FasterRCNN',
@@ -77,5 +78,5 @@ __all__ = [
     'DetectionTransformer', 'ConditionalDETR', 'DINO', 'DABDETR', 'GLIP',
     'DDQDETR', 'GroundingDINO', 'DomainAdaptationDetector',
     'SemiBaseDiffDetector', 'DiffusionDetector', 'DomainGeneralizationDetector',
-    'Diff2DiffDistiller'  # 中文注释: 新增 Diff2Diff 蒸馏检测器到导出列表
+    'Diff2DiffDistiller', 'DualDiffFusionStage1'  # 中文注释: 新增第一阶段扩散融合检测器到导出列表
 ]
