@@ -34,9 +34,13 @@ det_data_preprocessor = dict(  # 中文注释：定义与仿真RGB模型一致�
 )  # 中文注释：预处理器配置结束
 
 teacher_ir = _apply_drone_specialization(deepcopy(_base_.model))  # 中文注释：基于基础DIFF模型深拷贝并套用无人机特化配置构建冻结教师
+teacher_ir_default_ckpt = 'work_dirs/pretrained/sim_ir_diff_detector.pth'  # 中文注释：默认教师权重占位路径可通过 --cfg-options model.teacher_ir.init_cfg.checkpoint=xxx 覆盖
+teacher_ir['init_cfg'] = dict(type='Pretrained', checkpoint=teacher_ir_default_ckpt)  # 中文注释：使用Pretrained初始化教师扩散检测器权重
 teacher_ir['data_preprocessor'] = det_data_preprocessor  # 中文注释：将教师的数据预处理器与学生保持一致避免分布差异
 
 student_rgb = _apply_drone_specialization(deepcopy(_base_.model))  # 中文注释：深拷贝基础模型构建学生分支并应用同样的无人机特化修改
+student_rgb_default_ckpt = 'work_dirs/pretrained/sim_rgb_diff_detector.pth'  # 中文注释：默认学生预热权重占位路径可通过 --cfg-options model.student_rgb.init_cfg.checkpoint=xxx 覆盖
+student_rgb['init_cfg'] = dict(type='Pretrained', checkpoint=student_rgb_default_ckpt)  # 中文注释：指定学生扩散检测器的预训练权重
 student_rgb['data_preprocessor'] = det_data_preprocessor  # 中文注释：指定学生的数据预处理器确保输入管线一致
 
 model = dict(  # 中文注释：构建DualDiffFusionStage1检测器顶层配置
@@ -187,4 +191,5 @@ if __name__ == '__main__':  # 中文注释：提供最小化自检脚本方便�
     dummy_inputs = torch.randn(1, 3, 640, 640)  # 中文注释：创建单张虚拟RGB图像作为输入
     with torch.no_grad():  # 中文注释：关闭梯度计算以进行快速前向测试
         _ = detector.extract_feat_student(dummy_inputs)  # 中文注释：调用学生分支特征提取验证前向流程
+    print('提示：在正式训练前请将 teacher_ir/student_rgb 的 init_cfg.checkpoint 更新为真实权重路径')  # 中文注释：提醒用户替换真实权重避免占位符导致加载失败
     print('DualDiffFusionStage1 配置自检通过')  # 中文注释：输出自检成功提示
