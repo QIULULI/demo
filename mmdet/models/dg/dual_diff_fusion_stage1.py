@@ -1,430 +1,430 @@
 
-import copy  # 中文注释：引入copy模块用于安全复制配置与样本对象
-from typing import Dict, List, Optional, Tuple, Union  # 中文注释：导入类型注解工具以增强代码可读性
+import copy  # 引入copy模块用于安全复制配置与样本对象
+from typing import Dict, List, Optional, Tuple, Union  # 导入类型注解工具以增强代码可读性
 
-import torch  # 中文注释：导入PyTorch主库以执行张量计算
-import torch.nn.functional as F  # 中文注释：导入PyTorch函数式接口以便计算均方误差等损失
-from torch import Tensor  # 中文注释：导入Tensor类型用于类型提示
+import torch  # 导入PyTorch主库以执行张量计算
+import torch.nn.functional as F  # 导入PyTorch函数式接口以便计算均方误差等损失
+from torch import Tensor  # 导入Tensor类型用于类型提示
 
-from mmdet.models.detectors.base import BaseDetector  # 中文注释：导入基础检测器父类以便继承
-from mmdet.models.detectors.Z_diffusion_detector import DiffusionDetector  # 中文注释：导入扩散检测器类型用于构建教师与学生分支
-from mmdet.models.losses import KnowledgeDistillationKLDivLoss, L1Loss  # 中文注释：导入KL散度蒸馏损失与L1损失用于ROI蒸馏
-from mmdet.models.utils import rename_loss_dict  # 中文注释：导入损失字典重命名工具以统一日志前缀
-from mmdet.registry import MODELS  # 中文注释：导入模型注册表用于通过配置构建模块
-from mmdet.structures import SampleList  # 中文注释：导入样本列表类型以明确接口约定
-from mmdet.utils import ConfigType, OptConfigType, OptMultiConfig  # 中文注释：导入配置类型别名以保持与框架兼容
+from mmdet.models.detectors.base import BaseDetector  # 导入基础检测器父类以便继承
+from mmdet.models.detectors.Z_diffusion_detector import DiffusionDetector  # 导入扩散检测器类型用于构建教师与学生分支
+from mmdet.models.losses import KnowledgeDistillationKLDivLoss, L1Loss  # 导入KL散度蒸馏损失与L1损失用于ROI蒸馏
+from mmdet.models.utils import rename_loss_dict  # 导入损失字典重命名工具以统一日志前缀
+from mmdet.registry import MODELS  # 导入模型注册表用于通过配置构建模块
+from mmdet.structures import SampleList  # 导入样本列表类型以明确接口约定
+from mmdet.utils import ConfigType, OptConfigType, OptMultiConfig  # 导入配置类型别名以保持与框架兼容
 
 
-@MODELS.register_module()  # 中文注释：将当前检测器注册到MMDetection框架的模型注册表中
-class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段红外-可见光扩散融合检测器
+@MODELS.register_module()  # 将当前检测器注册到MMDetection框架的模型注册表中
+class DualDiffFusionStage1(BaseDetector):  # 定义第一阶段红外-可见光扩散融合检测器
 
-    def __init__(self,  # 中文注释：初始化函数负责解析配置并构建教师与学生检测器
-                 teacher_ir: Union[DiffusionDetector, ConfigType],  # 中文注释：教师分支既可以传入实例也可以传入配置字典
-                 student_rgb: Union[DiffusionDetector, ConfigType],  # 中文注释：学生分支同样支持实例或配置字典
-                 train_cfg: OptConfigType = None,  # 中文注释：训练阶段附加配置用于设置蒸馏权重与调度参数
-                 data_preprocessor: OptConfigType = None,  # 中文注释：数据预处理配置按照父类约定传递
-                 init_cfg: OptMultiConfig = None) -> None:  # 中文注释：初始化权重的可选配置
-        super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)  # 中文注释：调用父类初始化确保基础组件正确注册
-        self.teacher_ir = self._build_branch(teacher_ir, 'teacher_ir')  # 中文注释：构建教师分支或直接引用已有实例
-        self.student_rgb = self._build_branch(student_rgb, 'student_rgb')  # 中文注释：构建学生分支或引用已有实例
-        self.train_cfg = copy.deepcopy(train_cfg) if train_cfg is not None else dict()  # 中文注释：深拷贝训练配置防止外部副作用
-        self.w_sup = float(self.train_cfg.get('w_sup', 1.0))  # 中文注释：读取学生监督损失权重默认值为1.0
-        self.w_cross = float(self.train_cfg.get('w_cross', 1.0))  # 中文注释：读取交叉蒸馏损失权重默认值为1.0
-        self.w_feat_kd = float(self.train_cfg.get('w_feat_kd', 0.0))  # 中文注释：读取特征蒸馏损失权重默认关闭
-        self.enable_roi_kd = bool(self.train_cfg.get('enable_roi_kd', False))  # 中文注释：读取是否启用ROI蒸馏的布尔开关
-        self.w_roi_kd = float(self.train_cfg.get('w_roi_kd', 1.0))  # 中文注释：读取ROI蒸馏损失权重默认值为1.0
-        self.cross_warmup_iters = int(self.train_cfg.get('cross_warmup_iters', 0))  # 中文注释：读取交叉蒸馏预热迭代数默认0立即生效
-        self.freeze_teacher = bool(self.train_cfg.get('freeze_teacher', True))  # 中文注释：读取是否冻结教师分支的布尔开关
-        if self.freeze_teacher:  # 中文注释：当需要冻结教师时
-            for param in self.teacher_ir.parameters():  # 中文注释：遍历教师模型的所有参数
-                param.requires_grad_(False)  # 中文注释：显式禁止教师参数更新梯度
-            self.teacher_ir.eval()  # 中文注释：冻结时将教师切换到评估模式以固定归一化统计量
-        else:  # 中文注释：当教师需要联合训练时
-            self.teacher_ir.train()  # 中文注释：允许教师保持训练模式参与梯度更新
-        self._teacher_grad_check_passed = False  # 中文注释：初始化教师冻结断言缓存标记为未通过以便首次检测
-        self.roi_cls_kd_criterion = KnowledgeDistillationKLDivLoss(  # 中文注释：构建ROI分类蒸馏使用的KL散度损失
-            class_reduction='mean', reduction='mean', loss_weight=1.0)  # 中文注释：设置类别维度平均与批量平均的默认方式
-        self.roi_reg_kd_criterion = L1Loss(reduction='mean', loss_weight=1.0)  # 中文注释：构建ROI回归蒸馏使用的L1损失
-        self.local_iter = 0  # 中文注释：记录当前训练迭代计数以驱动交叉蒸馏预热
-
-    @property
-    def with_rpn(self) -> bool:  # 中文注释：判断学生检测器是否包含RPN头部
-        return getattr(self.student_rgb, 'with_rpn', False)  # 中文注释：直接查询学生模型的with_rpn属性
+    def __init__(self,  # 初始化函数负责解析配置并构建教师与学生检测器
+                 teacher_ir: Union[DiffusionDetector, ConfigType],  # 教师分支既可以传入实例也可以传入配置字典
+                 student_rgb: Union[DiffusionDetector, ConfigType],  # 学生分支同样支持实例或配置字典
+                 train_cfg: OptConfigType = None,  # 训练阶段附加配置用于设置蒸馏权重与调度参数
+                 data_preprocessor: OptConfigType = None,  # 数据预处理配置按照父类约定传递
+                 init_cfg: OptMultiConfig = None) -> None:  # 初始化权重的可选配置
+        super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg)  # 调用父类初始化确保基础组件正确注册
+        self.teacher_ir = self._build_branch(teacher_ir, 'teacher_ir')  # 构建教师分支或直接引用已有实例
+        self.student_rgb = self._build_branch(student_rgb, 'student_rgb')  # 构建学生分支或引用已有实例
+        self.train_cfg = copy.deepcopy(train_cfg) if train_cfg is not None else dict()  # 深拷贝训练配置防止外部副作用
+        self.w_sup = float(self.train_cfg.get('w_sup', 1.0))  # 读取学生监督损失权重默认值为1.0
+        self.w_cross = float(self.train_cfg.get('w_cross', 1.0))  # 读取交叉蒸馏损失权重默认值为1.0
+        self.w_feat_kd = float(self.train_cfg.get('w_feat_kd', 0.0))  # 读取特征蒸馏损失权重默认关闭
+        self.enable_roi_kd = bool(self.train_cfg.get('enable_roi_kd', False))  # 读取是否启用ROI蒸馏的布尔开关
+        self.w_roi_kd = float(self.train_cfg.get('w_roi_kd', 1.0))  # 读取ROI蒸馏损失权重默认值为1.0
+        self.cross_warmup_iters = int(self.train_cfg.get('cross_warmup_iters', 0))  # 读取交叉蒸馏预热迭代数默认0立即生效
+        self.freeze_teacher = bool(self.train_cfg.get('freeze_teacher', True))  # 读取是否冻结教师分支的布尔开关
+        if self.freeze_teacher:  # 当需要冻结教师时
+            for param in self.teacher_ir.parameters():  # 遍历教师模型的所有参数
+                param.requires_grad_(False)  # 显式禁止教师参数更新梯度
+            self.teacher_ir.eval()  # 冻结时将教师切换到评估模式以固定归一化统计量
+        else:  # 当教师需要联合训练时
+            self.teacher_ir.train()  # 允许教师保持训练模式参与梯度更新
+        self._teacher_grad_check_passed = False  # 初始化教师冻结断言缓存标记为未通过以便首次检测
+        self.roi_cls_kd_criterion = KnowledgeDistillationKLDivLoss(  # 构建ROI分类蒸馏使用的KL散度损失
+            class_reduction='mean', reduction='mean', loss_weight=1.0)  # 设置类别维度平均与批量平均的默认方式
+        self.roi_reg_kd_criterion = L1Loss(reduction='mean', loss_weight=1.0)  # 构建ROI回归蒸馏使用的L1损失
+        self.local_iter = 0  # 记录当前训练迭代计数以驱动交叉蒸馏预热
 
     @property
-    def with_roi_head(self) -> bool:  # 中文注释：判断学生检测器是否包含ROI头部
-        return getattr(self.student_rgb, 'with_roi_head', False)  # 中文注释：直接查询学生模型的with_roi_head属性
+    def with_rpn(self) -> bool:  # 判断学生检测器是否包含RPN头部
+        return getattr(self.student_rgb, 'with_rpn', False)  # 直接查询学生模型的with_rpn属性
 
-    def extract_feat_student(self, batch_inputs: Tensor) -> Tuple[Tensor, ...]:  # 中文注释：封装学生分支的特征提取流程
-        student_feats = self.student_rgb.extract_feat(batch_inputs)  # 中文注释：调用学生模型提取多尺度特征
-        if isinstance(student_feats, (list, tuple)):  # 中文注释：当返回列表或元组时直接转换
-            return tuple(student_feats)  # 中文注释：转换为元组以便后续统一处理
-        return (student_feats,)  # 中文注释：单尺度情况时包装成单元素元组保持接口一致
+    @property
+    def with_roi_head(self) -> bool:  # 判断学生检测器是否包含ROI头部
+        return getattr(self.student_rgb, 'with_roi_head', False)  # 直接查询学生模型的with_roi_head属性
 
-    def extract_feat(self, batch_inputs: Tensor) -> Tuple[Tensor, ...]:  # 中文注释：实现BaseDetector抽象接口要求的extract_feat方法
-        feats = self.extract_feat_student(batch_inputs)  # 中文注释：直接复用学生分支的特征提取逻辑
-        if isinstance(feats, (list, tuple)):  # 中文注释：当复用结果为列表或元组时确保统一转换
-            return tuple(feats)  # 中文注释：统一转换为元组形式保持返回类型一致
-        return (feats,)  # 中文注释：当复用结果为单个张量时包装成元组满足接口约定
+    def extract_feat_student(self, batch_inputs: Tensor) -> Tuple[Tensor, ...]:  # 封装学生分支的特征提取流程
+        student_feats = self.student_rgb.extract_feat(batch_inputs)  # 调用学生模型提取多尺度特征
+        if isinstance(student_feats, (list, tuple)):  # 当返回列表或元组时直接转换
+            return tuple(student_feats)  # 转换为元组以便后续统一处理
+        return (student_feats,)  # 单尺度情况时包装成单元素元组保持接口一致
 
-    def train(self, mode: bool = True) -> 'DualDiffFusionStage1':  # 中文注释：重写train方法以确保冻结教师时维持评估模式
-        super().train(mode)  # 中文注释：首先调用父类逻辑以正确设置学生模型及其子模块的训练状态
-        if self.freeze_teacher:  # 中文注释：仅当配置要求冻结教师分支时才执行额外的模式矫正
-            self.teacher_ir.eval()  # 中文注释：再次显式切换教师到eval防止父类调用将其改回train从而破坏冻结效果
-        return self  # 中文注释：返回自身以支持与PyTorch一致的链式调用语义
+    def extract_feat(self, batch_inputs: Tensor) -> Tuple[Tensor, ...]:  # 实现BaseDetector抽象接口要求的extract_feat方法
+        feats = self.extract_feat_student(batch_inputs)  # 直接复用学生分支的特征提取逻辑
+        if isinstance(feats, (list, tuple)):  # 当复用结果为列表或元组时确保统一转换
+            return tuple(feats)  # 统一转换为元组形式保持返回类型一致
+        return (feats,)  # 当复用结果为单个张量时包装成元组满足接口约定
 
-    def extract_feat_teacher(self, batch_inputs: Tensor) -> Tuple[Tensor, ...]:  # 中文注释：封装教师分支的特征提取流程
-        if self.freeze_teacher:  # 中文注释：若教师被冻结则使用无梯度上下文
-            with torch.no_grad():  # 中文注释：关闭梯度避免教师参数更新
-                teacher_feats = self.teacher_ir.extract_feat(batch_inputs)  # 中文注释：提取教师特征
-        else:  # 中文注释：教师未冻结时直接执行前向
-            teacher_feats = self.teacher_ir.extract_feat(batch_inputs)  # 中文注释：提取教师特征并允许梯度传播
-        if isinstance(teacher_feats, (list, tuple)):  # 中文注释：当返回列表或元组时直接转换
-            return tuple(teacher_feats)  # 中文注释：转换为元组保证统一接口
-        return (teacher_feats,)  # 中文注释：单尺度情况时包装成元组
+    def train(self, mode: bool = True) -> 'DualDiffFusionStage1':  # 重写train方法以确保冻结教师时维持评估模式
+        super().train(mode)  # 首先调用父类逻辑以正确设置学生模型及其子模块的训练状态
+        if self.freeze_teacher:  # 仅当配置要求冻结教师分支时才执行额外的模式矫正
+            self.teacher_ir.eval()  # 再次显式切换教师到eval防止父类调用将其改回train从而破坏冻结效果
+        return self  # 返回自身以支持与PyTorch一致的链式调用语义
 
-    def loss(self, batch_inputs: Tensor, batch_data_samples: SampleList) -> Dict[str, Tensor]:  # 中文注释：实现整体训练损失计算逻辑
-        if self.freeze_teacher:  # 中文注释：仅当需要冻结教师时才执行断言校验
-            if not getattr(self, '_teacher_grad_check_passed', False):  # 中文注释：通过缓存标记避免重复遍历参数
-                offending_name: Optional[str] = None  # 中文注释：记录第一个未被冻结的参数名称
-                for name, param in self.teacher_ir.named_parameters():  # 中文注释：遍历教师模型所有具名参数检查梯度状态
-                    if param.requires_grad:  # 中文注释：一旦发现仍允许梯度的参数即刻记录
-                        offending_name = name  # 中文注释：保存触发问题的参数名称便于排查
-                        break  # 中文注释：找到问题后提前结束遍历提高效率
-                if offending_name is not None:  # 中文注释：若检测到仍可训练的参数则立即抛出异常
-                    raise AssertionError(  # 中文注释：抛出断言异常提示开发者检查冻结逻辑
-                        '检测到freeze_teacher=True但教师参数仍保留梯度：'  # 中文注释：明确问题发生的场景
-                        f'{offending_name}。请确认train_cfg.freeze_teacher为True，'  # 中文注释：提示检查配置项
-                        '不要对teacher_ir参数调用requires_grad_(True)，并确保优化器未包含教师参数。')  # 中文注释：给出排查优化器与梯度设置的建议
-                self._teacher_grad_check_passed = True  # 中文注释：若所有参数均已冻结则缓存结果避免后续重复检查
-        student_feats = self.extract_feat_student(batch_inputs)  # 中文注释：首先提取学生的多尺度特征
-        teacher_feats = self.extract_feat_teacher(batch_inputs)  # 中文注释：随后提取教师的多尺度特征
-        level_mismatch_msg = 'Student and teacher feature levels must match.'  # 中文注释：预定义层数不匹配的提示语
-        assert len(student_feats) == len(teacher_feats), level_mismatch_msg  # 中文注释：断言FPN层数匹配
-        for level_index, (stu_feat, tea_feat) in enumerate(zip(student_feats, teacher_feats)):  # 中文注释：逐层遍历学生与教师特征
-            stu_shape = tuple(stu_feat.shape)  # 中文注释：记录学生当前层特征形状
-            tea_shape = tuple(tea_feat.shape)  # 中文注释：记录教师当前层特征形状
-            dim_mismatch_template = 'Feature dim mismatch (level {}): stu {} vs tea {}.'  # 中文注释：定义精简的维度不匹配模板
-            dim_mismatch_msg = dim_mismatch_template.format(level_index, stu_shape, tea_shape)  # 中文注释：生成带层级与形状的维度提示
-            assert stu_feat.dim() == tea_feat.dim(), dim_mismatch_msg  # 中文注释：断言维度数量一致
-            stu_channels = stu_feat.shape[1]  # 中文注释：记录学生特征通道数
-            tea_channels = tea_feat.shape[1]  # 中文注释：记录教师特征通道数
-            channel_mismatch_template = 'Feature channel mismatch (level {}): stu {} vs tea {}.'  # 中文注释：定义精简的通道不匹配模板
-            channel_mismatch_msg = channel_mismatch_template.format(level_index, stu_channels, tea_channels)  # 中文注释：生成带层级与通道数的提示
-            assert stu_feat.shape[1] == tea_feat.shape[1], channel_mismatch_msg  # 中文注释：断言通道数一致
-        losses: Dict[str, Tensor] = dict()  # 中文注释：初始化最终损失字典
-        loss_total: Optional[Tensor] = None  # 中文注释：初始化总损失累加器
-        stu_total: Optional[Tensor] = None  # 中文注释：初始化学生监督损失累加器
-        cross_total: Optional[Tensor] = None  # 中文注释：初始化交叉蒸馏损失累加器
+    def extract_feat_teacher(self, batch_inputs: Tensor) -> Tuple[Tensor, ...]:  # 封装教师分支的特征提取流程
+        if self.freeze_teacher:  # 若教师被冻结则使用无梯度上下文
+            with torch.no_grad():  # 关闭梯度避免教师参数更新
+                teacher_feats = self.teacher_ir.extract_feat(batch_inputs)  # 提取教师特征
+        else:  # 教师未冻结时直接执行前向
+            teacher_feats = self.teacher_ir.extract_feat(batch_inputs)  # 提取教师特征并允许梯度传播
+        if isinstance(teacher_feats, (list, tuple)):  # 当返回列表或元组时直接转换
+            return tuple(teacher_feats)  # 转换为元组保证统一接口
+        return (teacher_feats,)  # 单尺度情况时包装成元组
 
-        def _accumulate(current: Optional[Tensor], value: Tensor) -> Tensor:  # 中文注释：定义内部函数用于累加张量
-            return value if current is None else current + value  # 中文注释：当累加器为空时直接返回当前值否则执行加法
+    def loss(self, batch_inputs: Tensor, batch_data_samples: SampleList) -> Dict[str, Tensor]:  # 实现整体训练损失计算逻辑
+        if self.freeze_teacher:  # 仅当需要冻结教师时才执行断言校验
+            if not getattr(self, '_teacher_grad_check_passed', False):  # 通过缓存标记避免重复遍历参数
+                offending_name: Optional[str] = None  # 记录第一个未被冻结的参数名称
+                for name, param in self.teacher_ir.named_parameters():  # 遍历教师模型所有具名参数检查梯度状态
+                    if param.requires_grad:  # 一旦发现仍允许梯度的参数即刻记录
+                        offending_name = name  # 保存触发问题的参数名称便于排查
+                        break  # 找到问题后提前结束遍历提高效率
+                if offending_name is not None:  # 若检测到仍可训练的参数则立即抛出异常
+                    raise AssertionError(  # 抛出断言异常提示开发者检查冻结逻辑
+                        '检测到freeze_teacher=True但教师参数仍保留梯度：'  # 明确问题发生的场景
+                        f'{offending_name}。请确认train_cfg.freeze_teacher为True，'  # 提示检查配置项
+                        '不要对teacher_ir参数调用requires_grad_(True)，并确保优化器未包含教师参数。')  # 给出排查优化器与梯度设置的建议
+                self._teacher_grad_check_passed = True  # 若所有参数均已冻结则缓存结果避免后续重复检查
+        student_feats = self.extract_feat_student(batch_inputs)  # 首先提取学生的多尺度特征
+        teacher_feats = self.extract_feat_teacher(batch_inputs)  # 随后提取教师的多尺度特征
+        level_mismatch_msg = 'Student and teacher feature levels must match.'  # 预定义层数不匹配的提示语
+        assert len(student_feats) == len(teacher_feats), level_mismatch_msg  # 断言FPN层数匹配
+        for level_index, (stu_feat, tea_feat) in enumerate(zip(student_feats, teacher_feats)):  # 逐层遍历学生与教师特征
+            stu_shape = tuple(stu_feat.shape)  # 记录学生当前层特征形状
+            tea_shape = tuple(tea_feat.shape)  # 记录教师当前层特征形状
+            dim_mismatch_template = 'Feature dim mismatch (level {}): stu {} vs tea {}.'  # 定义精简的维度不匹配模板
+            dim_mismatch_msg = dim_mismatch_template.format(level_index, stu_shape, tea_shape)  # 生成带层级与形状的维度提示
+            assert stu_feat.dim() == tea_feat.dim(), dim_mismatch_msg  # 断言维度数量一致
+            stu_channels = stu_feat.shape[1]  # 记录学生特征通道数
+            tea_channels = tea_feat.shape[1]  # 记录教师特征通道数
+            channel_mismatch_template = 'Feature channel mismatch (level {}): stu {} vs tea {}.'  # 定义精简的通道不匹配模板
+            channel_mismatch_msg = channel_mismatch_template.format(level_index, stu_channels, tea_channels)  # 生成带层级与通道数的提示
+            assert stu_feat.shape[1] == tea_feat.shape[1], channel_mismatch_msg  # 断言通道数一致
+        losses: Dict[str, Tensor] = dict()  # 初始化最终损失字典
+        loss_total: Optional[Tensor] = None  # 初始化总损失累加器
+        stu_total: Optional[Tensor] = None  # 初始化学生监督损失累加器
+        cross_total: Optional[Tensor] = None  # 初始化交叉蒸馏损失累加器
 
-        def _detach_if_tensor(value):  # 中文注释：定义辅助函数用于在需要时剥离梯度
-            return value.detach() if isinstance(value, Tensor) else value  # 中文注释：若输入是张量则调用detach否则直接返回原值
+        def _accumulate(current: Optional[Tensor], value: Tensor) -> Tensor:  # 定义内部函数用于累加张量
+            return value if current is None else current + value  # 当累加器为空时直接返回当前值否则执行加法
 
-        reference_tensor = student_feats[0]  # 中文注释：选择学生第一层特征作为构造同设备零张量的参考
+        def _detach_if_tensor(value):  # 定义辅助函数用于在需要时剥离梯度
+            return value.detach() if isinstance(value, Tensor) else value  # 若输入是张量则调用detach否则直接返回原值
 
-        def _aggregate_loss_value(raw_value) -> Tensor:  # 中文注释：定义内部函数将可能为列表的损失聚合成标量张量
-            if isinstance(raw_value, Tensor):  # 中文注释：当输入本身已经是张量时直接返回
-                return raw_value  # 中文注释：无需额外处理直接使用原始张量
-            if isinstance(raw_value, (list, tuple)):  # 中文注释：当输入是列表或元组时需要显式聚合
-                if len(raw_value) == 0:  # 中文注释：针对空列表的情况返回零张量避免求和异常
-                    return reference_tensor.sum() * 0  # 中文注释：使用参考特征构造同设备零张量
-                if all(isinstance(item, Tensor) for item in raw_value):  # 中文注释：当全部元素都是张量时执行堆叠求和
-                    reduced_items = [item if item.dim() == 0 else item.sum() for item in raw_value]  # 中文注释：逐个张量求和以确保每个元素为标量
-                    return torch.stack(reduced_items).sum()  # 中文注释：通过堆叠再求和生成单个标量张量
-                python_sum = sum(raw_value)  # 中文注释：当元素是数值时先用Python内置求和得到标量
-                return reference_tensor.new_tensor(python_sum)  # 中文注释：将标量转换为与参考张量同设备的张量
-            return reference_tensor.new_tensor(float(raw_value))  # 中文注释：兜底处理可转换为浮点的标量情况
+        reference_tensor = student_feats[0]  # 选择学生第一层特征作为构造同设备零张量的参考
 
-        stu_rpn_results: Optional[List] = None  # 中文注释：记录学生RPN生成的候选框供后续复用
-        roi_kd_proposals: Optional[List] = None  # 中文注释：预先声明ROI蒸馏专用的候选框副本以避免被监督阶段改写
-        if self.w_sup > 0:  # 中文注释：仅当学生监督权重大于零时计算监督损失
-            if self.with_rpn and hasattr(self.student_rgb, 'rpn_head'):  # 中文注释：当学生包含RPN头部时计算RPN损失
-                proposal_cfg = self._get_proposal_cfg()  # 中文注释：读取RPN候选框配置
-                rpn_losses, stu_rpn_results = self.student_rgb.rpn_head.loss_and_predict(  # 中文注释：基于学生特征计算RPN损失与候选框
-                    student_feats, batch_data_samples, proposal_cfg=proposal_cfg)  # 中文注释：传入学生特征与真实标注
-                if 'loss_cls' in rpn_losses:  # 中文注释：判断是否存在标准命名的分类损失
-                    stu_rpn_loss_cls_raw = rpn_losses['loss_cls']  # 中文注释：读取分类损失张量
-                elif 'loss_rpn_cls' in rpn_losses:  # 中文注释：兼容以loss_rpn_cls命名的分类损失
-                    stu_rpn_loss_cls_raw = rpn_losses['loss_rpn_cls']  # 中文注释：读取分类损失张量
-                else:  # 中文注释：缺失分类损失时抛出异常提醒配置问题
-                    raise KeyError('RPN losses must contain loss_cls or loss_rpn_cls for student branch.')  # 中文注释：提示学生分支缺少分类损失
-                if 'loss_bbox' in rpn_losses:  # 中文注释：判断是否存在标准命名的回归损失
-                    stu_rpn_loss_bbox_raw = rpn_losses['loss_bbox']  # 中文注释：读取回归损失张量
-                elif 'loss_rpn_bbox' in rpn_losses:  # 中文注释：兼容以loss_rpn_bbox命名的回归损失
-                    stu_rpn_loss_bbox_raw = rpn_losses['loss_rpn_bbox']  # 中文注释：读取回归损失张量
-                else:  # 中文注释：缺失回归损失时抛出异常提醒配置问题
-                    raise KeyError('RPN losses must contain loss_bbox or loss_rpn_bbox for student branch.')  # 中文注释：提示学生分支缺少回归损失
-                stu_rpn_loss_cls_tensor = _aggregate_loss_value(stu_rpn_loss_cls_raw)  # 中文注释：将学生RPN分类损失聚合为标量张量
-                stu_rpn_loss_bbox_tensor = _aggregate_loss_value(stu_rpn_loss_bbox_raw)  # 中文注释：将学生RPN回归损失聚合为标量张量
-                stu_rpn_loss_cls_weighted = stu_rpn_loss_cls_tensor * self.w_sup  # 中文注释：将聚合后的分类损失乘以学生监督权重
-                stu_rpn_loss_bbox_weighted = stu_rpn_loss_bbox_tensor * self.w_sup  # 中文注释：将聚合后的回归损失乘以学生监督权重
-                losses['stu_rpn_loss_cls'] = stu_rpn_loss_cls_weighted  # 中文注释：写入学生RPN分类损失并统一键名
-                losses['stu_rpn_loss_bbox'] = stu_rpn_loss_bbox_weighted  # 中文注释：写入学生RPN回归损失并统一键名
-                loss_total = _accumulate(loss_total, stu_rpn_loss_cls_weighted)  # 中文注释：将学生分类损失累加到总损失
-                loss_total = _accumulate(loss_total, stu_rpn_loss_bbox_weighted)  # 中文注释：将学生回归损失累加到总损失
-                stu_total = _accumulate(stu_total, stu_rpn_loss_cls_weighted)  # 中文注释：将学生分类损失累加到学生监督总和
-                stu_total = _accumulate(stu_total, stu_rpn_loss_bbox_weighted)  # 中文注释：将学生回归损失累加到学生监督总和
-            if self.with_roi_head and hasattr(self.student_rgb, 'roi_head'):  # 中文注释：当学生包含ROI头部时计算ROI损失
-                roi_inputs = stu_rpn_results if stu_rpn_results is not None else self._prepare_roi_inputs(  # 中文注释：优先复用学生RPN候选框否则动态生成
-                    student_feats, batch_data_samples)  # 中文注释：当缺少RPN结果时重新生成候选框
-                if (self.enable_roi_kd and self.w_roi_kd > 0  # 中文注释：仅在启用ROI蒸馏时才复制候选框避免不必要的开销
-                        and roi_kd_proposals is None):  # 中文注释：确保只在第一次需要时才创建副本
-                    roi_kd_proposals = self._clone_proposals_for_kd(roi_inputs)  # 中文注释：调用内部工具函数深拷贝候选框以供蒸馏使用
-                roi_losses = self.student_rgb.roi_head.loss(student_feats, roi_inputs, batch_data_samples)  # 中文注释：基于学生特征计算ROI监督损失
-                for key, value in rename_loss_dict('stu_', roi_losses).items():  # 中文注释：为ROI损失添加stu_前缀
-                    if 'loss' in key:  # 中文注释：仅对包含loss字样的键应用权重缩放
-                        weighted = value * self.w_sup  # 中文注释：乘以学生监督权重
-                        losses[key] = weighted  # 中文注释：写入缩放后的损失张量
-                        loss_total = _accumulate(loss_total, weighted)  # 中文注释：累加缩放后的损失到总损失
-                        stu_total = _accumulate(stu_total, weighted)  # 中文注释：累加缩放后的损失到学生监督总和
-                    else:  # 中文注释：对于非损失项保持原值避免被错误缩放
-                        losses[key] = _detach_if_tensor(value)  # 中文注释：若为张量则detach后记录避免梯度传播
-        if stu_total is not None:  # 中文注释：若存在学生监督损失则记录汇总指标
-            losses['stu_total_log'] = _detach_if_tensor(stu_total)  # 中文注释：以日志键记录学生监督损失总和并剥离梯度
+        def _aggregate_loss_value(raw_value) -> Tensor:  # 定义内部函数将可能为列表的损失聚合成标量张量
+            if isinstance(raw_value, Tensor):  # 当输入本身已经是张量时直接返回
+                return raw_value  # 无需额外处理直接使用原始张量
+            if isinstance(raw_value, (list, tuple)):  # 当输入是列表或元组时需要显式聚合
+                if len(raw_value) == 0:  # 针对空列表的情况返回零张量避免求和异常
+                    return reference_tensor.sum() * 0  # 使用参考特征构造同设备零张量
+                if all(isinstance(item, Tensor) for item in raw_value):  # 当全部元素都是张量时执行堆叠求和
+                    reduced_items = [item if item.dim() == 0 else item.sum() for item in raw_value]  # 逐个张量求和以确保每个元素为标量
+                    return torch.stack(reduced_items).sum()  # 通过堆叠再求和生成单个标量张量
+                python_sum = sum(raw_value)  # 当元素是数值时先用Python内置求和得到标量
+                return reference_tensor.new_tensor(python_sum)  # 将标量转换为与参考张量同设备的张量
+            return reference_tensor.new_tensor(float(raw_value))  # 兜底处理可转换为浮点的标量情况
 
-        cross_weight = self.w_cross if self.local_iter >= self.cross_warmup_iters else 0.0  # 中文注释：根据预热迭代数决定交叉蒸馏权重
-        cross_rpn_results: Optional[List] = None  # 中文注释：记录教师特征驱动的候选框供复用
-        if cross_weight > 0:  # 中文注释：仅当交叉蒸馏权重大于零时执行
-            if self.with_rpn and hasattr(self.student_rgb, 'rpn_head'):  # 中文注释：当学生包含RPN头部时计算交叉RPN损失
-                proposal_cfg = self._get_proposal_cfg()  # 中文注释：读取候选框配置
-                rpn_losses, cross_rpn_results = self.student_rgb.rpn_head.loss_and_predict(  # 中文注释：基于教师特征计算学生RPN损失
-                    teacher_feats, batch_data_samples, proposal_cfg=proposal_cfg)  # 中文注释：传入教师特征与真实标注
-                if 'loss_cls' in rpn_losses:  # 中文注释：判断是否存在标准命名的分类损失
-                    cross_rpn_loss_cls_raw = rpn_losses['loss_cls']  # 中文注释：读取分类损失张量
-                elif 'loss_rpn_cls' in rpn_losses:  # 中文注释：兼容以loss_rpn_cls命名的分类损失
-                    cross_rpn_loss_cls_raw = rpn_losses['loss_rpn_cls']  # 中文注释：读取分类损失张量
-                else:  # 中文注释：缺失分类损失时抛出异常提醒配置问题
-                    raise KeyError('RPN losses must contain loss_cls or loss_rpn_cls for cross branch.')  # 中文注释：提示交叉分支缺少分类损失
-                if 'loss_bbox' in rpn_losses:  # 中文注释：判断是否存在标准命名的回归损失
-                    cross_rpn_loss_bbox_raw = rpn_losses['loss_bbox']  # 中文注释：读取回归损失张量
-                elif 'loss_rpn_bbox' in rpn_losses:  # 中文注释：兼容以loss_rpn_bbox命名的回归损失
-                    cross_rpn_loss_bbox_raw = rpn_losses['loss_rpn_bbox']  # 中文注释：读取回归损失张量
-                else:  # 中文注释：缺失回归损失时抛出异常提醒配置问题
-                    raise KeyError('RPN losses must contain loss_bbox or loss_rpn_bbox for cross branch.')  # 中文注释：提示交叉分支缺少回归损失
-                cross_rpn_loss_cls_tensor = _aggregate_loss_value(cross_rpn_loss_cls_raw)  # 中文注释：将交叉RPN分类损失聚合为标量张量
-                cross_rpn_loss_bbox_tensor = _aggregate_loss_value(cross_rpn_loss_bbox_raw)  # 中文注释：将交叉RPN回归损失聚合为标量张量
-                cross_rpn_loss_cls_weighted = cross_rpn_loss_cls_tensor * cross_weight  # 中文注释：将聚合后的分类损失乘以交叉蒸馏权重
-                cross_rpn_loss_bbox_weighted = cross_rpn_loss_bbox_tensor * cross_weight  # 中文注释：将聚合后的回归损失乘以交叉蒸馏权重
-                losses['cross_rpn_loss_cls'] = cross_rpn_loss_cls_weighted  # 中文注释：写入交叉RPN分类损失并统一键名
-                losses['cross_rpn_loss_bbox'] = cross_rpn_loss_bbox_weighted  # 中文注释：写入交叉RPN回归损失并统一键名
-                loss_total = _accumulate(loss_total, cross_rpn_loss_cls_weighted)  # 中文注释：将交叉分类损失累加到总损失
-                loss_total = _accumulate(loss_total, cross_rpn_loss_bbox_weighted)  # 中文注释：将交叉回归损失累加到总损失
-                cross_total = _accumulate(cross_total, cross_rpn_loss_cls_weighted)  # 中文注释：将交叉分类损失累加到交叉总和
-                cross_total = _accumulate(cross_total, cross_rpn_loss_bbox_weighted)  # 中文注释：将交叉回归损失累加到交叉总和
-            if self.with_roi_head and hasattr(self.student_rgb, 'roi_head'):  # 中文注释：当学生包含ROI头部时计算交叉ROI损失
-                roi_inputs = cross_rpn_results if cross_rpn_results is not None else self._prepare_roi_inputs(  # 中文注释：优先复用教师特征驱动的候选框
-                    teacher_feats, batch_data_samples)  # 中文注释：当缺少候选框时重新生成
-                roi_losses = self.student_rgb.roi_head.loss(teacher_feats, roi_inputs, batch_data_samples)  # 中文注释：基于教师特征计算学生ROI损失
-                for key, value in rename_loss_dict('cross_', roi_losses).items():  # 中文注释：为交叉损失添加cross_前缀
-                    if 'loss' in key:  # 中文注释：仅对包含loss字样的键执行权重缩放
-                        weighted = value * cross_weight  # 中文注释：乘以交叉蒸馏权重
-                        losses[key] = weighted  # 中文注释：写入缩放后的交叉损失
-                        loss_total = _accumulate(loss_total, weighted)  # 中文注释：累加缩放后的交叉损失到总损失
-                        cross_total = _accumulate(cross_total, weighted)  # 中文注释：累加缩放后的交叉损失到交叉总和
-                    else:  # 中文注释：对于非损失项保持原值避免缩放日志
-                        losses[key] = _detach_if_tensor(value)  # 中文注释：若为张量则detach后记录以阻断梯度
-        if cross_total is not None:  # 中文注释：若存在交叉蒸馏损失则记录汇总指标
-            losses['cross_total_log'] = _detach_if_tensor(cross_total)  # 中文注释：以日志键记录交叉蒸馏损失总和并剥离梯度
+        stu_rpn_results: Optional[List] = None  # 记录学生RPN生成的候选框供后续复用
+        roi_kd_proposals: Optional[List] = None  # 预先声明ROI蒸馏专用的候选框副本以避免被监督阶段改写
+        if self.w_sup > 0:  # 仅当学生监督权重大于零时计算监督损失
+            if self.with_rpn and hasattr(self.student_rgb, 'rpn_head'):  # 当学生包含RPN头部时计算RPN损失
+                proposal_cfg = self._get_proposal_cfg()  # 读取RPN候选框配置
+                rpn_losses, stu_rpn_results = self.student_rgb.rpn_head.loss_and_predict(  # 基于学生特征计算RPN损失与候选框
+                    student_feats, batch_data_samples, proposal_cfg=proposal_cfg)  # 传入学生特征与真实标注
+                if 'loss_cls' in rpn_losses:  # 判断是否存在标准命名的分类损失
+                    stu_rpn_loss_cls_raw = rpn_losses['loss_cls']  # 读取分类损失张量
+                elif 'loss_rpn_cls' in rpn_losses:  # 兼容以loss_rpn_cls命名的分类损失
+                    stu_rpn_loss_cls_raw = rpn_losses['loss_rpn_cls']  # 读取分类损失张量
+                else:  # 缺失分类损失时抛出异常提醒配置问题
+                    raise KeyError('RPN losses must contain loss_cls or loss_rpn_cls for student branch.')  # 提示学生分支缺少分类损失
+                if 'loss_bbox' in rpn_losses:  # 判断是否存在标准命名的回归损失
+                    stu_rpn_loss_bbox_raw = rpn_losses['loss_bbox']  # 读取回归损失张量
+                elif 'loss_rpn_bbox' in rpn_losses:  # 兼容以loss_rpn_bbox命名的回归损失
+                    stu_rpn_loss_bbox_raw = rpn_losses['loss_rpn_bbox']  # 读取回归损失张量
+                else:  # 缺失回归损失时抛出异常提醒配置问题
+                    raise KeyError('RPN losses must contain loss_bbox or loss_rpn_bbox for student branch.')  # 提示学生分支缺少回归损失
+                stu_rpn_loss_cls_tensor = _aggregate_loss_value(stu_rpn_loss_cls_raw)  # 将学生RPN分类损失聚合为标量张量
+                stu_rpn_loss_bbox_tensor = _aggregate_loss_value(stu_rpn_loss_bbox_raw)  # 将学生RPN回归损失聚合为标量张量
+                stu_rpn_loss_cls_weighted = stu_rpn_loss_cls_tensor * self.w_sup  # 将聚合后的分类损失乘以学生监督权重
+                stu_rpn_loss_bbox_weighted = stu_rpn_loss_bbox_tensor * self.w_sup  # 将聚合后的回归损失乘以学生监督权重
+                losses['stu_rpn_loss_cls'] = stu_rpn_loss_cls_weighted  # 写入学生RPN分类损失并统一键名
+                losses['stu_rpn_loss_bbox'] = stu_rpn_loss_bbox_weighted  # 写入学生RPN回归损失并统一键名
+                loss_total = _accumulate(loss_total, stu_rpn_loss_cls_weighted)  # 将学生分类损失累加到总损失
+                loss_total = _accumulate(loss_total, stu_rpn_loss_bbox_weighted)  # 将学生回归损失累加到总损失
+                stu_total = _accumulate(stu_total, stu_rpn_loss_cls_weighted)  # 将学生分类损失累加到学生监督总和
+                stu_total = _accumulate(stu_total, stu_rpn_loss_bbox_weighted)  # 将学生回归损失累加到学生监督总和
+            if self.with_roi_head and hasattr(self.student_rgb, 'roi_head'):  # 当学生包含ROI头部时计算ROI损失
+                roi_inputs = stu_rpn_results if stu_rpn_results is not None else self._prepare_roi_inputs(  # 优先复用学生RPN候选框否则动态生成
+                    student_feats, batch_data_samples)  # 当缺少RPN结果时重新生成候选框
+                if (self.enable_roi_kd and self.w_roi_kd > 0  # 仅在启用ROI蒸馏时才复制候选框避免不必要的开销
+                        and roi_kd_proposals is None):  # 确保只在第一次需要时才创建副本
+                    roi_kd_proposals = self._clone_proposals_for_kd(roi_inputs)  # 调用内部工具函数深拷贝候选框以供蒸馏使用
+                roi_losses = self.student_rgb.roi_head.loss(student_feats, roi_inputs, batch_data_samples)  # 基于学生特征计算ROI监督损失
+                for key, value in rename_loss_dict('stu_', roi_losses).items():  # 为ROI损失添加stu_前缀
+                    if 'loss' in key:  # 仅对包含loss字样的键应用权重缩放
+                        weighted = value * self.w_sup  # 乘以学生监督权重
+                        losses[key] = weighted  # 写入缩放后的损失张量
+                        loss_total = _accumulate(loss_total, weighted)  # 累加缩放后的损失到总损失
+                        stu_total = _accumulate(stu_total, weighted)  # 累加缩放后的损失到学生监督总和
+                    else:  # 对于非损失项保持原值避免被错误缩放
+                        losses[key] = _detach_if_tensor(value)  # 若为张量则detach后记录避免梯度传播
+        if stu_total is not None:  # 若存在学生监督损失则记录汇总指标
+            losses['stu_total_log'] = _detach_if_tensor(stu_total)  # 以日志键记录学生监督损失总和并剥离梯度
 
-        if self.w_feat_kd > 0:  # 中文注释：当特征蒸馏权重大于零时计算特征KD损失
-            mse_values: List[Tensor] = []  # 中文注释：创建列表存储各层均方误差
-            for stu_feat, tea_feat in zip(student_feats, teacher_feats):  # 中文注释：逐层遍历学生与教师特征
-                mse_values.append(F.mse_loss(stu_feat, tea_feat.detach()))  # 中文注释：计算当前层的均方误差并阻断教师梯度
-            if mse_values:  # 中文注释：确保存在至少一层特征
-                feat_kd_loss = sum(mse_values) / float(len(mse_values))  # 中文注释：将所有层的均方误差求平均
-                weighted = feat_kd_loss * self.w_feat_kd  # 中文注释：乘以特征蒸馏权重
-                losses['feat_kd_loss'] = weighted  # 中文注释：记录特征蒸馏损失
-                loss_total = _accumulate(loss_total, weighted)  # 中文注释：累加到总损失
+        cross_weight = self.w_cross if self.local_iter >= self.cross_warmup_iters else 0.0  # 根据预热迭代数决定交叉蒸馏权重
+        cross_rpn_results: Optional[List] = None  # 记录教师特征驱动的候选框供复用
+        if cross_weight > 0:  # 仅当交叉蒸馏权重大于零时执行
+            if self.with_rpn and hasattr(self.student_rgb, 'rpn_head'):  # 当学生包含RPN头部时计算交叉RPN损失
+                proposal_cfg = self._get_proposal_cfg()  # 读取候选框配置
+                rpn_losses, cross_rpn_results = self.student_rgb.rpn_head.loss_and_predict(  # 基于教师特征计算学生RPN损失
+                    teacher_feats, batch_data_samples, proposal_cfg=proposal_cfg)  # 传入教师特征与真实标注
+                if 'loss_cls' in rpn_losses:  # 判断是否存在标准命名的分类损失
+                    cross_rpn_loss_cls_raw = rpn_losses['loss_cls']  # 读取分类损失张量
+                elif 'loss_rpn_cls' in rpn_losses:  # 兼容以loss_rpn_cls命名的分类损失
+                    cross_rpn_loss_cls_raw = rpn_losses['loss_rpn_cls']  # 读取分类损失张量
+                else:  # 缺失分类损失时抛出异常提醒配置问题
+                    raise KeyError('RPN losses must contain loss_cls or loss_rpn_cls for cross branch.')  # 提示交叉分支缺少分类损失
+                if 'loss_bbox' in rpn_losses:  # 判断是否存在标准命名的回归损失
+                    cross_rpn_loss_bbox_raw = rpn_losses['loss_bbox']  # 读取回归损失张量
+                elif 'loss_rpn_bbox' in rpn_losses:  # 兼容以loss_rpn_bbox命名的回归损失
+                    cross_rpn_loss_bbox_raw = rpn_losses['loss_rpn_bbox']  # 读取回归损失张量
+                else:  # 缺失回归损失时抛出异常提醒配置问题
+                    raise KeyError('RPN losses must contain loss_bbox or loss_rpn_bbox for cross branch.')  # 提示交叉分支缺少回归损失
+                cross_rpn_loss_cls_tensor = _aggregate_loss_value(cross_rpn_loss_cls_raw)  # 将交叉RPN分类损失聚合为标量张量
+                cross_rpn_loss_bbox_tensor = _aggregate_loss_value(cross_rpn_loss_bbox_raw)  # 将交叉RPN回归损失聚合为标量张量
+                cross_rpn_loss_cls_weighted = cross_rpn_loss_cls_tensor * cross_weight  # 将聚合后的分类损失乘以交叉蒸馏权重
+                cross_rpn_loss_bbox_weighted = cross_rpn_loss_bbox_tensor * cross_weight  # 将聚合后的回归损失乘以交叉蒸馏权重
+                losses['cross_rpn_loss_cls'] = cross_rpn_loss_cls_weighted  # 写入交叉RPN分类损失并统一键名
+                losses['cross_rpn_loss_bbox'] = cross_rpn_loss_bbox_weighted  # 写入交叉RPN回归损失并统一键名
+                loss_total = _accumulate(loss_total, cross_rpn_loss_cls_weighted)  # 将交叉分类损失累加到总损失
+                loss_total = _accumulate(loss_total, cross_rpn_loss_bbox_weighted)  # 将交叉回归损失累加到总损失
+                cross_total = _accumulate(cross_total, cross_rpn_loss_cls_weighted)  # 将交叉分类损失累加到交叉总和
+                cross_total = _accumulate(cross_total, cross_rpn_loss_bbox_weighted)  # 将交叉回归损失累加到交叉总和
+            if self.with_roi_head and hasattr(self.student_rgb, 'roi_head'):  # 当学生包含ROI头部时计算交叉ROI损失
+                roi_inputs = cross_rpn_results if cross_rpn_results is not None else self._prepare_roi_inputs(  # 优先复用教师特征驱动的候选框
+                    teacher_feats, batch_data_samples)  # 当缺少候选框时重新生成
+                roi_losses = self.student_rgb.roi_head.loss(teacher_feats, roi_inputs, batch_data_samples)  # 基于教师特征计算学生ROI损失
+                for key, value in rename_loss_dict('cross_', roi_losses).items():  # 为交叉损失添加cross_前缀
+                    if 'loss' in key:  # 仅对包含loss字样的键执行权重缩放
+                        weighted = value * cross_weight  # 乘以交叉蒸馏权重
+                        losses[key] = weighted  # 写入缩放后的交叉损失
+                        loss_total = _accumulate(loss_total, weighted)  # 累加缩放后的交叉损失到总损失
+                        cross_total = _accumulate(cross_total, weighted)  # 累加缩放后的交叉损失到交叉总和
+                    else:  # 对于非损失项保持原值避免缩放日志
+                        losses[key] = _detach_if_tensor(value)  # 若为张量则detach后记录以阻断梯度
+        if cross_total is not None:  # 若存在交叉蒸馏损失则记录汇总指标
+            losses['cross_total_log'] = _detach_if_tensor(cross_total)  # 以日志键记录交叉蒸馏损失总和并剥离梯度
+
+        if self.w_feat_kd > 0:  # 当特征蒸馏权重大于零时计算特征KD损失
+            mse_values: List[Tensor] = []  # 创建列表存储各层均方误差
+            for stu_feat, tea_feat in zip(student_feats, teacher_feats):  # 逐层遍历学生与教师特征
+                mse_values.append(F.mse_loss(stu_feat, tea_feat.detach()))  # 计算当前层的均方误差并阻断教师梯度
+            if mse_values:  # 确保存在至少一层特征
+                feat_kd_loss = sum(mse_values) / float(len(mse_values))  # 将所有层的均方误差求平均
+                weighted = feat_kd_loss * self.w_feat_kd  # 乘以特征蒸馏权重
+                losses['feat_kd_loss'] = weighted  # 记录特征蒸馏损失
+                loss_total = _accumulate(loss_total, weighted)  # 累加到总损失
 
         if (self.enable_roi_kd and self.w_roi_kd > 0 and self.with_roi_head
                 and hasattr(self.student_rgb, 'roi_head')
-                and hasattr(self.student_rgb.roi_head, 'forward')):  # 中文注释：当启用ROI蒸馏且接口齐全时执行
-            kd_source_proposals = roi_kd_proposals  # 中文注释：优先使用监督阶段提前保存的候选框副本
-            if kd_source_proposals is None:  # 中文注释：当监督阶段未生成副本时需要重新准备候选框
-                raw_roi_inputs = stu_rpn_results if stu_rpn_results is not None else self._prepare_roi_inputs(  # 中文注释：优先复用学生RPN候选框否则动态生成
-                    student_feats, batch_data_samples)  # 中文注释：当缺少RPN结果时重新生成候选框
-                kd_source_proposals = self._clone_proposals_for_kd(raw_roi_inputs)  # 中文注释：将原始候选框深拷贝后作为蒸馏基准
-            student_kd_proposals = self._clone_proposals_for_kd(kd_source_proposals)  # 中文注释：为学生前向创建独立的候选框副本防止修改相互影响
-            teacher_kd_proposals = self._clone_proposals_for_kd(kd_source_proposals)  # 中文注释：为教师前向创建独立的候选框副本确保包含bboxes字段
-            student_roi_outputs = self.student_rgb.roi_head.forward(student_feats, student_kd_proposals, batch_data_samples)  # 中文注释：获取学生ROI前向输出
-            teacher_roi_outputs = self.student_rgb.roi_head.forward(teacher_feats, teacher_kd_proposals, batch_data_samples)  # 中文注释：获取教师ROI前向输出
-            if len(student_roi_outputs) >= 1 and len(teacher_roi_outputs) >= 1:  # 中文注释：存在分类输出时计算KL蒸馏
-                stu_cls = student_roi_outputs[0]  # 中文注释：提取学生分类logits
-                tea_cls = teacher_roi_outputs[0]  # 中文注释：提取教师分类logits
-                if stu_cls.shape == tea_cls.shape:  # 中文注释：确保形状一致
-                    cls_loss = self.roi_cls_kd_criterion(stu_cls, tea_cls.detach())  # 中文注释：计算KL散度蒸馏损失
-                    weighted_cls = cls_loss * self.w_roi_kd  # 中文注释：乘以ROI蒸馏权重
-                    losses['roi_cls_kd_loss'] = weighted_cls  # 中文注释：记录分类蒸馏损失
-                    loss_total = _accumulate(loss_total, weighted_cls)  # 中文注释：累加到总损失
-            if len(student_roi_outputs) >= 2 and len(teacher_roi_outputs) >= 2:  # 中文注释：存在回归输出时计算L1蒸馏
-                stu_reg = student_roi_outputs[1]  # 中文注释：提取学生回归输出
-                tea_reg = teacher_roi_outputs[1]  # 中文注释：提取教师回归输出
-                if stu_reg.shape == tea_reg.shape:  # 中文注释：确保形状一致
-                    reg_loss = self.roi_reg_kd_criterion(stu_reg, tea_reg.detach())  # 中文注释：计算L1蒸馏损失
-                    weighted_reg = reg_loss * self.w_roi_kd  # 中文注释：乘以ROI蒸馏权重
-                    losses['roi_reg_kd_loss'] = weighted_reg  # 中文注释：记录回归蒸馏损失
-                    loss_total = _accumulate(loss_total, weighted_reg)  # 中文注释：累加到总损失
+                and hasattr(self.student_rgb.roi_head, 'forward')):  # 当启用ROI蒸馏且接口齐全时执行
+            kd_source_proposals = roi_kd_proposals  # 优先使用监督阶段提前保存的候选框副本
+            if kd_source_proposals is None:  # 当监督阶段未生成副本时需要重新准备候选框
+                raw_roi_inputs = stu_rpn_results if stu_rpn_results is not None else self._prepare_roi_inputs(  # 优先复用学生RPN候选框否则动态生成
+                    student_feats, batch_data_samples)  # 当缺少RPN结果时重新生成候选框
+                kd_source_proposals = self._clone_proposals_for_kd(raw_roi_inputs)  # 将原始候选框深拷贝后作为蒸馏基准
+            student_kd_proposals = self._clone_proposals_for_kd(kd_source_proposals)  # 为学生前向创建独立的候选框副本防止修改相互影响
+            teacher_kd_proposals = self._clone_proposals_for_kd(kd_source_proposals)  # 为教师前向创建独立的候选框副本确保包含bboxes字段
+            student_roi_outputs = self.student_rgb.roi_head.forward(student_feats, student_kd_proposals, batch_data_samples)  # 获取学生ROI前向输出
+            teacher_roi_outputs = self.student_rgb.roi_head.forward(teacher_feats, teacher_kd_proposals, batch_data_samples)  # 获取教师ROI前向输出
+            if len(student_roi_outputs) >= 1 and len(teacher_roi_outputs) >= 1:  # 存在分类输出时计算KL蒸馏
+                stu_cls = student_roi_outputs[0]  # 提取学生分类logits
+                tea_cls = teacher_roi_outputs[0]  # 提取教师分类logits
+                if stu_cls.shape == tea_cls.shape:  # 确保形状一致
+                    cls_loss = self.roi_cls_kd_criterion(stu_cls, tea_cls.detach())  # 计算KL散度蒸馏损失
+                    weighted_cls = cls_loss * self.w_roi_kd  # 乘以ROI蒸馏权重
+                    losses['roi_cls_kd_loss'] = weighted_cls  # 记录分类蒸馏损失
+                    loss_total = _accumulate(loss_total, weighted_cls)  # 累加到总损失
+            if len(student_roi_outputs) >= 2 and len(teacher_roi_outputs) >= 2:  # 存在回归输出时计算L1蒸馏
+                stu_reg = student_roi_outputs[1]  # 提取学生回归输出
+                tea_reg = teacher_roi_outputs[1]  # 提取教师回归输出
+                if stu_reg.shape == tea_reg.shape:  # 确保形状一致
+                    reg_loss = self.roi_reg_kd_criterion(stu_reg, tea_reg.detach())  # 计算L1蒸馏损失
+                    weighted_reg = reg_loss * self.w_roi_kd  # 乘以ROI蒸馏权重
+                    losses['roi_reg_kd_loss'] = weighted_reg  # 记录回归蒸馏损失
+                    loss_total = _accumulate(loss_total, weighted_reg)  # 累加到总损失
 
-        if loss_total is None:  # 中文注释：若未累加任何损失则创建零张量占位
-            loss_total = student_feats[0].sum() * 0  # 中文注释：使用学生特征创建零值张量保持梯度设备一致
-        if not any('loss' in key for key in losses.keys()):  # 中文注释：若损失字典中不存在任何包含loss字样的键名
-            stu_zero_placeholder = student_feats[0].sum() * 0  # 中文注释：构造零值占位损失以确保仍有梯度回传
-            losses['stu_zero_loss'] = stu_zero_placeholder  # 中文注释：写入遵循stu_前缀的占位损失键保持命名规范一致
-            loss_total = _accumulate(loss_total, stu_zero_placeholder)  # 中文注释：将占位损失累加到总和以维持日志一致性
-        losses['total_weighted_log'] = _detach_if_tensor(loss_total)  # 中文注释：记录仅用于监控的总损失日志条目并显式detach防止重复求和
-        losses['meta_w_sup'] = student_feats[0].new_tensor(self.w_sup)  # 中文注释：记录学生监督损失权重常数张量并确保与主损失同设备
-        losses['meta_w_cross'] = student_feats[0].new_tensor(self.w_cross)  # 中文注释：记录交叉蒸馏损失权重常数张量用于日志监控
-        losses['meta_w_feat_kd'] = student_feats[0].new_tensor(self.w_feat_kd)  # 中文注释：记录特征蒸馏损失权重常数张量以便调试
-        losses['meta_w_roi_kd'] = student_feats[0].new_tensor(self.w_roi_kd)  # 中文注释：记录ROI蒸馏损失权重常数张量便于追踪配置
-        losses['meta_cross_weight_effective'] = student_feats[0].new_tensor(cross_weight)  # 中文注释：记录考虑预热后的交叉蒸馏实际权重
-        self.local_iter += 1  # 中文注释：自增内部迭代计数以支持交叉蒸馏预热
-        return losses  # 中文注释：返回完整的损失字典
+        if loss_total is None:  # 若未累加任何损失则创建零张量占位
+            loss_total = student_feats[0].sum() * 0  # 使用学生特征创建零值张量保持梯度设备一致
+        if not any('loss' in key for key in losses.keys()):  # 若损失字典中不存在任何包含loss字样的键名
+            stu_zero_placeholder = student_feats[0].sum() * 0  # 构造零值占位损失以确保仍有梯度回传
+            losses['stu_zero_loss'] = stu_zero_placeholder  # 写入遵循stu_前缀的占位损失键保持命名规范一致
+            loss_total = _accumulate(loss_total, stu_zero_placeholder)  # 将占位损失累加到总和以维持日志一致性
+        losses['total_weighted_log'] = _detach_if_tensor(loss_total)  # 记录仅用于监控的总损失日志条目并显式detach防止重复求和
+        losses['meta_w_sup'] = student_feats[0].new_tensor(self.w_sup)  # 记录学生监督损失权重常数张量并确保与主损失同设备
+        losses['meta_w_cross'] = student_feats[0].new_tensor(self.w_cross)  # 记录交叉蒸馏损失权重常数张量用于日志监控
+        losses['meta_w_feat_kd'] = student_feats[0].new_tensor(self.w_feat_kd)  # 记录特征蒸馏损失权重常数张量以便调试
+        losses['meta_w_roi_kd'] = student_feats[0].new_tensor(self.w_roi_kd)  # 记录ROI蒸馏损失权重常数张量便于追踪配置
+        losses['meta_cross_weight_effective'] = student_feats[0].new_tensor(cross_weight)  # 记录考虑预热后的交叉蒸馏实际权重
+        self.local_iter += 1  # 自增内部迭代计数以支持交叉蒸馏预热
+        return losses  # 返回完整的损失字典
 
-    def predict(self, batch_inputs: Tensor, batch_data_samples: SampleList, rescale: bool = True) -> SampleList:  # 中文注释：推理接口直接委托学生模型
-        return self.student_rgb.predict(batch_inputs, batch_data_samples, rescale=rescale)  # 中文注释：复用学生模型预测逻辑确保部署一致
+    def predict(self, batch_inputs: Tensor, batch_data_samples: SampleList, rescale: bool = True) -> SampleList:  # 推理接口直接委托学生模型
+        return self.student_rgb.predict(batch_inputs, batch_data_samples, rescale=rescale)  # 复用学生模型预测逻辑确保部署一致
 
-    def _forward(self, batch_inputs: Tensor, batch_data_samples: SampleList) -> Tuple:  # 中文注释：定义前向推理接口以适配MMEngine导出
-        return self.student_rgb._forward(batch_inputs, batch_data_samples)  # 中文注释：直接复用学生模型的前向实现
+    def _forward(self, batch_inputs: Tensor, batch_data_samples: SampleList) -> Tuple:  # 定义前向推理接口以适配MMEngine导出
+        return self.student_rgb._forward(batch_inputs, batch_data_samples)  # 直接复用学生模型的前向实现
 
-    def export_fused_teacher(self, path: str) -> None:  # 中文注释：导出融合后的教师权重供后续阶段使用
-        torch.save(self.student_rgb.state_dict(), path)  # 中文注释：保存学生模型参数作为新的教师权重
+    def export_fused_teacher(self, path: str) -> None:  # 导出融合后的教师权重供后续阶段使用
+        torch.save(self.student_rgb.state_dict(), path)  # 保存学生模型参数作为新的教师权重
 
-    def _build_branch(self, module_or_cfg: Union[DiffusionDetector, ConfigType], name: str) -> DiffusionDetector:  # 中文注释：根据配置或实例构建检测分支
-        if isinstance(module_or_cfg, DiffusionDetector):  # 中文注释：当传入扩散检测器实例时直接返回
-            return module_or_cfg  # 中文注释：无需额外构建
-        if isinstance(module_or_cfg, BaseDetector):  # 中文注释：允许传入其他检测器实例方便调试
-            return module_or_cfg  # 中文注释：直接返回已有实例
-        if isinstance(module_or_cfg, dict):  # 中文注释：当传入配置字典时通过注册表构建
-            return MODELS.build(module_or_cfg)  # 中文注释：使用注册表实例化检测器
-        raise TypeError(f'{name} must be DiffusionDetector or config dict, but got {type(module_or_cfg)!r}')  # 中文注释：类型不匹配时抛出异常
+    def _build_branch(self, module_or_cfg: Union[DiffusionDetector, ConfigType], name: str) -> DiffusionDetector:  # 根据配置或实例构建检测分支
+        if isinstance(module_or_cfg, DiffusionDetector):  # 当传入扩散检测器实例时直接返回
+            return module_or_cfg  # 无需额外构建
+        if isinstance(module_or_cfg, BaseDetector):  # 允许传入其他检测器实例方便调试
+            return module_or_cfg  # 直接返回已有实例
+        if isinstance(module_or_cfg, dict):  # 当传入配置字典时通过注册表构建
+            return MODELS.build(module_or_cfg)  # 使用注册表实例化检测器
+        raise TypeError(f'{name} must be DiffusionDetector or config dict, but got {type(module_or_cfg)!r}')  # 类型不匹配时抛出异常
 
-    def _clone_proposals_for_kd(self, proposals: List) -> List:  # 中文注释：定义辅助函数用于深拷贝ROI候选框供蒸馏使用
-        cloned_list: List = []  # 中文注释：创建列表用于保存克隆后的候选框实例
-        for proposal in proposals:  # 中文注释：遍历传入的每一个候选框对象
-            if hasattr(proposal, 'clone') and callable(getattr(proposal, 'clone')):  # 中文注释：优先使用对象自带的clone方法以保持结构一致
-                cloned = proposal.clone()  # 中文注释：调用clone生成独立副本
-            else:  # 中文注释：当对象缺少clone方法时回退到深拷贝策略
-                cloned = copy.deepcopy(proposal)  # 中文注释：使用标准库深拷贝生成结构化副本
-            if hasattr(cloned, 'bboxes') and isinstance(cloned.bboxes, Tensor):  # 中文注释：若克隆对象包含bboxes张量则需额外拷贝数据
-                cloned.bboxes = cloned.bboxes.clone()  # 中文注释：对bbox张量执行clone以避免后续原地修改
-            cloned_list.append(cloned)  # 中文注释：将克隆得到的候选框加入列表
-        return cloned_list  # 中文注释：返回完整的克隆候选框列表供ROI蒸馏使用
+    def _clone_proposals_for_kd(self, proposals: List) -> List:  # 定义辅助函数用于深拷贝ROI候选框供蒸馏使用
+        cloned_list: List = []  # 创建列表用于保存克隆后的候选框实例
+        for proposal in proposals:  # 遍历传入的每一个候选框对象
+            if hasattr(proposal, 'clone') and callable(getattr(proposal, 'clone')):  # 优先使用对象自带的clone方法以保持结构一致
+                cloned = proposal.clone()  # 调用clone生成独立副本
+            else:  # 当对象缺少clone方法时回退到深拷贝策略
+                cloned = copy.deepcopy(proposal)  # 使用标准库深拷贝生成结构化副本
+            if hasattr(cloned, 'bboxes') and isinstance(cloned.bboxes, Tensor):  # 若克隆对象包含bboxes张量则需额外拷贝数据
+                cloned.bboxes = cloned.bboxes.clone()  # 对bbox张量执行clone以避免后续原地修改
+            cloned_list.append(cloned)  # 将克隆得到的候选框加入列表
+        return cloned_list  # 返回完整的克隆候选框列表供ROI蒸馏使用
 
-    def _prepare_roi_inputs(self, feats: Tuple[Tensor, ...], batch_data_samples: SampleList) -> List:  # 中文注释：根据特征与标注准备ROI阶段候选框
-        if self.with_rpn and hasattr(self.student_rgb, 'rpn_head'):  # 中文注释：若学生包含RPN则使用给定特征生成候选框
-            proposal_cfg = self._get_proposal_cfg()  # 中文注释：读取RPN候选框配置
-            _, proposals = self.student_rgb.rpn_head.loss_and_predict(feats, batch_data_samples, proposal_cfg=proposal_cfg)  # 中文注释：调用RPN获取候选框并忽略损失
-            return proposals  # 中文注释：返回候选框供ROI阶段使用
-        return [getattr(sample, 'proposals') for sample in batch_data_samples]  # 中文注释：无RPN时回退到样本中预生成的候选框
+    def _prepare_roi_inputs(self, feats: Tuple[Tensor, ...], batch_data_samples: SampleList) -> List:  # 根据特征与标注准备ROI阶段候选框
+        if self.with_rpn and hasattr(self.student_rgb, 'rpn_head'):  # 若学生包含RPN则使用给定特征生成候选框
+            proposal_cfg = self._get_proposal_cfg()  # 读取RPN候选框配置
+            _, proposals = self.student_rgb.rpn_head.loss_and_predict(feats, batch_data_samples, proposal_cfg=proposal_cfg)  # 调用RPN获取候选框并忽略损失
+            return proposals  # 返回候选框供ROI阶段使用
+        return [getattr(sample, 'proposals') for sample in batch_data_samples]  # 无RPN时回退到样本中预生成的候选框
 
-    def _get_proposal_cfg(self):  # 中文注释：获取RPN候选框配置对象
-        train_cfg = getattr(self.student_rgb, 'train_cfg', None)  # 中文注释：优先读取学生模型的训练配置
-        if train_cfg is not None and hasattr(train_cfg, 'rpn_proposal'):  # 中文注释：训练配置存在rpn_proposal时优先使用
-            return train_cfg.rpn_proposal  # 中文注释：返回训练态候选框配置
-        test_cfg = getattr(self.student_rgb, 'test_cfg', None)  # 中文注释：否则尝试从测试配置中读取
-        if test_cfg is not None and hasattr(test_cfg, 'rpn'):  # 中文注释：测试配置包含rpn字段时返回
-            return test_cfg.rpn  # 中文注释：返回测试态候选框配置
-        return None  # 中文注释：若均未配置则返回None表示使用默认逻辑
+    def _get_proposal_cfg(self):  # 获取RPN候选框配置对象
+        train_cfg = getattr(self.student_rgb, 'train_cfg', None)  # 优先读取学生模型的训练配置
+        if train_cfg is not None and hasattr(train_cfg, 'rpn_proposal'):  # 训练配置存在rpn_proposal时优先使用
+            return train_cfg.rpn_proposal  # 返回训练态候选框配置
+        test_cfg = getattr(self.student_rgb, 'test_cfg', None)  # 否则尝试从测试配置中读取
+        if test_cfg is not None and hasattr(test_cfg, 'rpn'):  # 测试配置包含rpn字段时返回
+            return test_cfg.rpn  # 返回测试态候选框配置
+        return None  # 若均未配置则返回None表示使用默认逻辑
 
 
-if __name__ == '__main__':  # 中文注释：提供最小化自检脚本方便快速验证逻辑
-    class _ToyRPNHead(torch.nn.Module):  # 中文注释：定义简化版RPN头用于自检
-        def loss_and_predict(self, feats, samples, proposal_cfg=None):  # 中文注释：实现最小接口返回固定损失与候选框
-            loss_cls = torch.tensor(1.0, device=feats[0].device)  # 中文注释：构造恒定的RPN分类损失值
-            loss_bbox = torch.tensor(0.5, device=feats[0].device)  # 中文注释：构造恒定的RPN回归损失值
-            losses = {'loss_cls': loss_cls, 'loss_bbox': loss_bbox}  # 中文注释：封装同时包含分类与回归的RPN损失字典
-            proposals = []  # 中文注释：创建候选框列表
-            for _ in samples:  # 中文注释：遍历每个样本
-                proposals.append(type('Proposal', (), {'bboxes': torch.zeros((1, 4), device=feats[0].device)})())  # 中文注释：为每个样本创建占位候选框对象
-            return losses, proposals  # 中文注释：返回损失字典与候选框列表
+if __name__ == '__main__':  # 提供最小化自检脚本方便快速验证逻辑
+    class _ToyRPNHead(torch.nn.Module):  # 定义简化版RPN头用于自检
+        def loss_and_predict(self, feats, samples, proposal_cfg=None):  # 实现最小接口返回固定损失与候选框
+            loss_cls = torch.tensor(1.0, device=feats[0].device)  # 构造恒定的RPN分类损失值
+            loss_bbox = torch.tensor(0.5, device=feats[0].device)  # 构造恒定的RPN回归损失值
+            losses = {'loss_cls': loss_cls, 'loss_bbox': loss_bbox}  # 封装同时包含分类与回归的RPN损失字典
+            proposals = []  # 创建候选框列表
+            for _ in samples:  # 遍历每个样本
+                proposals.append(type('Proposal', (), {'bboxes': torch.zeros((1, 4), device=feats[0].device)})())  # 为每个样本创建占位候选框对象
+            return losses, proposals  # 返回损失字典与候选框列表
 
-    class _ToyROIHead(torch.nn.Module):  # 中文注释：定义简化版ROI头用于自检
-        def loss(self, feats, proposals, samples):  # 中文注释：实现最小ROI监督损失接口
-            return {'loss_roi': torch.tensor(2.0, device=feats[0].device)}  # 中文注释：返回恒定的ROI损失值
+    class _ToyROIHead(torch.nn.Module):  # 定义简化版ROI头用于自检
+        def loss(self, feats, proposals, samples):  # 实现最小ROI监督损失接口
+            return {'loss_roi': torch.tensor(2.0, device=feats[0].device)}  # 返回恒定的ROI损失值
 
-        def forward(self, feats, proposals, samples=None):  # 中文注释：实现ROI前向输出用于蒸馏
-            cls_score = torch.ones((1, 2), device=feats[0].device)  # 中文注释：构造恒定的分类logits
-            bbox_pred = torch.zeros((1, 4), device=feats[0].device)  # 中文注释：构造恒定的回归输出
-            return (cls_score, bbox_pred)  # 中文注释：返回分类与回归输出元组
-
-        @property
-        def with_bbox(self):  # 中文注释：指示存在bbox分支
-            return True  # 中文注释：返回True以符合主类假设
-
-    class _ToyDetector(BaseDetector):  # 中文注释：定义简化版检测器用于构造教师与学生
-        def __init__(self):  # 中文注释：初始化简化检测器
-            super().__init__(data_preprocessor=None)  # 中文注释：调用父类初始化
-            self.rpn_head = _ToyRPNHead()  # 中文注释：挂载简化RPN头
-            self.roi_head = _ToyROIHead()  # 中文注释：挂载简化ROI头
+        def forward(self, feats, proposals, samples=None):  # 实现ROI前向输出用于蒸馏
+            cls_score = torch.ones((1, 2), device=feats[0].device)  # 构造恒定的分类logits
+            bbox_pred = torch.zeros((1, 4), device=feats[0].device)  # 构造恒定的回归输出
+            return (cls_score, bbox_pred)  # 返回分类与回归输出元组
 
         @property
-        def with_rpn(self):  # 中文注释：指示包含RPN
-            return True  # 中文注释：返回True
+        def with_bbox(self):  # 指示存在bbox分支
+            return True  # 返回True以符合主类假设
+
+    class _ToyDetector(BaseDetector):  # 定义简化版检测器用于构造教师与学生
+        def __init__(self):  # 初始化简化检测器
+            super().__init__(data_preprocessor=None)  # 调用父类初始化
+            self.rpn_head = _ToyRPNHead()  # 挂载简化RPN头
+            self.roi_head = _ToyROIHead()  # 挂载简化ROI头
 
         @property
-        def with_roi_head(self):  # 中文注释：指示包含ROI头
-            return True  # 中文注释：返回True
+        def with_rpn(self):  # 指示包含RPN
+            return True  # 返回True
 
-        def extract_feat(self, batch_inputs: Tensor):  # 中文注释：实现特征提取逻辑
-            feat1 = torch.ones((batch_inputs.size(0), 1, 1, 1), device=batch_inputs.device)  # 中文注释：构造第一层特征
-            feat2 = 2 * torch.ones((batch_inputs.size(0), 1, 1, 1), device=batch_inputs.device)  # 中文注释：构造第二层特征
-            return (feat1, feat2)  # 中文注释：返回由两层特征组成的元组
+        @property
+        def with_roi_head(self):  # 指示包含ROI头
+            return True  # 返回True
 
-        def loss(self, batch_inputs: Tensor, batch_data_samples: SampleList):  # 中文注释：实现占位监督损失接口
-            return {'loss_dummy': torch.tensor(0.0, device=batch_inputs.device)}  # 中文注释：返回零损失保持接口兼容
+        def extract_feat(self, batch_inputs: Tensor):  # 实现特征提取逻辑
+            feat1 = torch.ones((batch_inputs.size(0), 1, 1, 1), device=batch_inputs.device)  # 构造第一层特征
+            feat2 = 2 * torch.ones((batch_inputs.size(0), 1, 1, 1), device=batch_inputs.device)  # 构造第二层特征
+            return (feat1, feat2)  # 返回由两层特征组成的元组
 
-        def predict(self, batch_inputs: Tensor, batch_data_samples: SampleList, rescale: bool = True):  # 中文注释：实现占位预测接口
-            return []  # 中文注释：返回空列表作为占位预测结果
+        def loss(self, batch_inputs: Tensor, batch_data_samples: SampleList):  # 实现占位监督损失接口
+            return {'loss_dummy': torch.tensor(0.0, device=batch_inputs.device)}  # 返回零损失保持接口兼容
 
-        def _forward(self, batch_inputs: Tensor, batch_data_samples: SampleList):  # 中文注释：实现占位前向接口
-            return tuple()  # 中文注释：返回空元组
+        def predict(self, batch_inputs: Tensor, batch_data_samples: SampleList, rescale: bool = True):  # 实现占位预测接口
+            return []  # 返回空列表作为占位预测结果
 
-    class _ToyMismatchTeacher(_ToyDetector):  # 中文注释：定义通道数与学生不同的教师模型用于触发断言
-        def extract_feat(self, batch_inputs: Tensor):  # 中文注释：重写特征提取逻辑制造通道不匹配
-            feat1 = torch.ones((batch_inputs.size(0), 1, 1, 1), device=batch_inputs.device)  # 中文注释：第一层通道数保持一致
-            feat2 = 3 * torch.ones((batch_inputs.size(0), 2, 1, 1), device=batch_inputs.device)  # 中文注释：第二层通道数刻意设置为2制造不匹配
-            return (feat1, feat2)  # 中文注释：返回具有通道不一致的两层特征
+        def _forward(self, batch_inputs: Tensor, batch_data_samples: SampleList):  # 实现占位前向接口
+            return tuple()  # 返回空元组
 
-    class _ToySample:  # 中文注释：定义简化数据样本结构
-        def __init__(self):  # 中文注释：初始化样本
-            self.gt_instances = type('gt', (), {'labels': torch.zeros(1, dtype=torch.long)})()  # 中文注释：构造带标签字段的占位实例
-            self.proposals = type('prop', (), {'bboxes': torch.zeros((1, 4))})()  # 中文注释：构造占位候选框对象
+    class _ToyMismatchTeacher(_ToyDetector):  # 定义通道数与学生不同的教师模型用于触发断言
+        def extract_feat(self, batch_inputs: Tensor):  # 重写特征提取逻辑制造通道不匹配
+            feat1 = torch.ones((batch_inputs.size(0), 1, 1, 1), device=batch_inputs.device)  # 第一层通道数保持一致
+            feat2 = 3 * torch.ones((batch_inputs.size(0), 2, 1, 1), device=batch_inputs.device)  # 第二层通道数刻意设置为2制造不匹配
+            return (feat1, feat2)  # 返回具有通道不一致的两层特征
 
-    teacher = _ToyDetector()  # 中文注释：实例化教师模型
-    student = _ToyDetector()  # 中文注释：实例化学生模型
-    model = DualDiffFusionStage1(teacher, student, train_cfg=dict(  # 中文注释：构建融合模型并设置权重
-        w_sup=2.0, w_cross=3.0, w_feat_kd=4.0, enable_roi_kd=True, w_roi_kd=5.0, cross_warmup_iters=0, freeze_teacher=True))  # 中文注释：设置示例配置确保全部分支生效
-    model.train()  # 中文注释：显式调用train以模拟训练阶段并校验冻结教师时的模式控制
-    assert model.teacher_ir.training is False, 'freeze_teacher=True时教师应保持eval模式'  # 中文注释：断言教师仍处于评估模式确保冻结逻辑生效
-    dummy_inputs = torch.randn(1, 3, 4, 4)  # 中文注释：构造随机输入张量
-    feats_via_interface = model.extract_feat(dummy_inputs)  # 中文注释：调用新增的extract_feat接口确保符合框架要求
-    print('extract_feat_len', len(feats_via_interface))  # 中文注释：打印返回的特征层数量验证接口有效
-    dummy_samples = [_ToySample()]  # 中文注释：构造单个简化样本列表
-    losses = model.loss(dummy_inputs, dummy_samples)  # 中文注释：执行一次损失计算验证流程
-    print('loss_keys', sorted(losses.keys()))  # 中文注释：打印损失键名验证命名规则
-    required_rpn_keys = {'stu_rpn_loss_cls', 'stu_rpn_loss_bbox', 'cross_rpn_loss_cls', 'cross_rpn_loss_bbox'}  # 中文注释：定义必须存在的RPN键名集合
-    print('rpn_keys_present', {key: (key in losses) for key in sorted(required_rpn_keys)})  # 中文注释：打印每个RPN键名是否存在
-    meta_keys = ['meta_w_sup', 'meta_w_cross', 'meta_w_feat_kd', 'meta_w_roi_kd', 'meta_cross_weight_effective']  # 中文注释：列出新增的权重日志键名
-    print('meta_keys_values', {key: float(losses[key]) for key in meta_keys})  # 中文注释：打印权重日志键对应的标量值确保存在且为常数张量
-    log_keys = ['stu_total_log', 'cross_total_log']  # 中文注释：列出仅用于日志记录的总损失键
-    print('log_keys_requires_grad', {key: (isinstance(losses.get(key), torch.Tensor) and losses[key].requires_grad) for key in log_keys if key in losses})  # 中文注释：确认日志键对应的张量不参与梯度
-    part_keys = [key for key in losses.keys() if ('loss' in key)]  # 中文注释：收集所有包含loss字样的损失键以核对求和结果
-    part_values = [losses[key] for key in part_keys]  # 中文注释：收集需要参与求和的损失值
-    total_from_parts = torch.stack(part_values).sum() if part_values else torch.tensor(0.0, device=dummy_inputs.device)  # 中文注释：对有效损失进行求和
-    total_log_tensor = losses['total_weighted_log']  # 中文注释：读取仅用于日志的总损失标量
-    if not isinstance(total_log_tensor, torch.Tensor):  # 中文注释：当日志值不是张量时需要显式转换
-        total_log_tensor = torch.tensor(float(total_log_tensor), device=dummy_inputs.device)  # 中文注释：将标量转换为与输入同设备的张量
-    print('consistency', torch.allclose(total_log_tensor, total_from_parts.detach()))  # 中文注释：验证日志记录的总损失等于各项损失之和
-    mismatch_teacher = _ToyMismatchTeacher()  # 中文注释：实例化通道数与学生不同的教师模型
-    mismatch_student = _ToyDetector()  # 中文注释：实例化保持通道数量的学生模型
-    mismatch_model = DualDiffFusionStage1(mismatch_teacher, mismatch_student, train_cfg=dict(  # 中文注释：构造未冻结教师的模型用于断言测试
-        w_sup=1.0, w_cross=0.0, w_feat_kd=0.0, enable_roi_kd=False, cross_warmup_iters=0, freeze_teacher=False))  # 中文注释：使用最小配置同时允许教师参与训练
-    try:  # 中文注释：通过try捕获预期的通道不匹配断言
-        mismatch_model.loss(dummy_inputs, dummy_samples)  # 中文注释：执行一次损失计算以触发通道检查
-    except AssertionError as err:  # 中文注释：捕获断言错误并打印提示信息
-        print('channel_mismatch_assert_captured', str(err))  # 中文注释：输出捕获到的断言信息证明检查生效
-    else:  # 中文注释：若未触发断言则说明检查失效
-        raise RuntimeError('Expected channel mismatch assertion was not raised.')  # 中文注释：主动抛出异常提醒开发者修复检查逻辑
+    class _ToySample:  # 定义简化数据样本结构
+        def __init__(self):  # 初始化样本
+            self.gt_instances = type('gt', (), {'labels': torch.zeros(1, dtype=torch.long)})()  # 构造带标签字段的占位实例
+            self.proposals = type('prop', (), {'bboxes': torch.zeros((1, 4))})()  # 构造占位候选框对象
+
+    teacher = _ToyDetector()  # 实例化教师模型
+    student = _ToyDetector()  # 实例化学生模型
+    model = DualDiffFusionStage1(teacher, student, train_cfg=dict(  # 构建融合模型并设置权重
+        w_sup=2.0, w_cross=3.0, w_feat_kd=4.0, enable_roi_kd=True, w_roi_kd=5.0, cross_warmup_iters=0, freeze_teacher=True))  # 设置示例配置确保全部分支生效
+    model.train()  # 显式调用train以模拟训练阶段并校验冻结教师时的模式控制
+    assert model.teacher_ir.training is False, 'freeze_teacher=True时教师应保持eval模式'  # 断言教师仍处于评估模式确保冻结逻辑生效
+    dummy_inputs = torch.randn(1, 3, 4, 4)  # 构造随机输入张量
+    feats_via_interface = model.extract_feat(dummy_inputs)  # 调用新增的extract_feat接口确保符合框架要求
+    print('extract_feat_len', len(feats_via_interface))  # 打印返回的特征层数量验证接口有效
+    dummy_samples = [_ToySample()]  # 构造单个简化样本列表
+    losses = model.loss(dummy_inputs, dummy_samples)  # 执行一次损失计算验证流程
+    print('loss_keys', sorted(losses.keys()))  # 打印损失键名验证命名规则
+    required_rpn_keys = {'stu_rpn_loss_cls', 'stu_rpn_loss_bbox', 'cross_rpn_loss_cls', 'cross_rpn_loss_bbox'}  # 定义必须存在的RPN键名集合
+    print('rpn_keys_present', {key: (key in losses) for key in sorted(required_rpn_keys)})  # 打印每个RPN键名是否存在
+    meta_keys = ['meta_w_sup', 'meta_w_cross', 'meta_w_feat_kd', 'meta_w_roi_kd', 'meta_cross_weight_effective']  # 列出新增的权重日志键名
+    print('meta_keys_values', {key: float(losses[key]) for key in meta_keys})  # 打印权重日志键对应的标量值确保存在且为常数张量
+    log_keys = ['stu_total_log', 'cross_total_log']  # 列出仅用于日志记录的总损失键
+    print('log_keys_requires_grad', {key: (isinstance(losses.get(key), torch.Tensor) and losses[key].requires_grad) for key in log_keys if key in losses})  # 确认日志键对应的张量不参与梯度
+    part_keys = [key for key in losses.keys() if ('loss' in key)]  # 收集所有包含loss字样的损失键以核对求和结果
+    part_values = [losses[key] for key in part_keys]  # 收集需要参与求和的损失值
+    total_from_parts = torch.stack(part_values).sum() if part_values else torch.tensor(0.0, device=dummy_inputs.device)  # 对有效损失进行求和
+    total_log_tensor = losses['total_weighted_log']  # 读取仅用于日志的总损失标量
+    if not isinstance(total_log_tensor, torch.Tensor):  # 当日志值不是张量时需要显式转换
+        total_log_tensor = torch.tensor(float(total_log_tensor), device=dummy_inputs.device)  # 将标量转换为与输入同设备的张量
+    print('consistency', torch.allclose(total_log_tensor, total_from_parts.detach()))  # 验证日志记录的总损失等于各项损失之和
+    mismatch_teacher = _ToyMismatchTeacher()  # 实例化通道数与学生不同的教师模型
+    mismatch_student = _ToyDetector()  # 实例化保持通道数量的学生模型
+    mismatch_model = DualDiffFusionStage1(mismatch_teacher, mismatch_student, train_cfg=dict(  # 构造未冻结教师的模型用于断言测试
+        w_sup=1.0, w_cross=0.0, w_feat_kd=0.0, enable_roi_kd=False, cross_warmup_iters=0, freeze_teacher=False))  # 使用最小配置同时允许教师参与训练
+    try:  # 通过try捕获预期的通道不匹配断言
+        mismatch_model.loss(dummy_inputs, dummy_samples)  # 执行一次损失计算以触发通道检查
+    except AssertionError as err:  # 捕获断言错误并打印提示信息
+        print('channel_mismatch_assert_captured', str(err))  # 输出捕获到的断言信息证明检查生效
+    else:  # 若未触发断言则说明检查失效
+        raise RuntimeError('Expected channel mismatch assertion was not raised.')  # 主动抛出异常提醒开发者修复检查逻辑
