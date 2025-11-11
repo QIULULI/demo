@@ -73,7 +73,19 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
     def loss(self, batch_inputs: Tensor, batch_data_samples: SampleList) -> Dict[str, Tensor]:  # 中文注释：实现整体训练损失计算逻辑
         student_feats = self.extract_feat_student(batch_inputs)  # 中文注释：首先提取学生的多尺度特征
         teacher_feats = self.extract_feat_teacher(batch_inputs)  # 中文注释：随后提取教师的多尺度特征
-        assert len(student_feats) == len(teacher_feats), 'Student and teacher feature levels must match.'  # 中文注释：断言两者FPN层数一致
+        level_mismatch_msg = 'Student and teacher feature levels must match.'  # 中文注释：预定义层数不匹配的提示语
+        assert len(student_feats) == len(teacher_feats), level_mismatch_msg  # 中文注释：断言FPN层数匹配
+        for level_index, (stu_feat, tea_feat) in enumerate(zip(student_feats, teacher_feats)):  # 中文注释：逐层遍历学生与教师特征
+            stu_shape = tuple(stu_feat.shape)  # 中文注释：记录学生当前层特征形状
+            tea_shape = tuple(tea_feat.shape)  # 中文注释：记录教师当前层特征形状
+            dim_mismatch_template = 'Feature dim mismatch (level {}): stu {} vs tea {}.'  # 中文注释：定义精简的维度不匹配模板
+            dim_mismatch_msg = dim_mismatch_template.format(level_index, stu_shape, tea_shape)  # 中文注释：生成带层级与形状的维度提示
+            assert stu_feat.dim() == tea_feat.dim(), dim_mismatch_msg  # 中文注释：断言维度数量一致
+            stu_channels = stu_feat.shape[1]  # 中文注释：记录学生特征通道数
+            tea_channels = tea_feat.shape[1]  # 中文注释：记录教师特征通道数
+            channel_mismatch_template = 'Feature channel mismatch (level {}): stu {} vs tea {}.'  # 中文注释：定义精简的通道不匹配模板
+            channel_mismatch_msg = channel_mismatch_template.format(level_index, stu_channels, tea_channels)  # 中文注释：生成带层级与通道数的提示
+            assert stu_feat.shape[1] == tea_feat.shape[1], channel_mismatch_msg  # 中文注释：断言通道数一致
         losses: Dict[str, Tensor] = dict()  # 中文注释：初始化最终损失字典
         loss_total: Optional[Tensor] = None  # 中文注释：初始化总损失累加器
         stu_total: Optional[Tensor] = None  # 中文注释：初始化学生监督损失累加器
@@ -286,6 +298,12 @@ if __name__ == '__main__':  # 中文注释：提供最小化自检脚本方便�
         def _forward(self, batch_inputs: Tensor, batch_data_samples: SampleList):  # 中文注释：实现占位前向接口
             return tuple()  # 中文注释：返回空元组
 
+    class _ToyMismatchTeacher(_ToyDetector):  # 中文注释：定义通道数与学生不同的教师模型用于触发断言
+        def extract_feat(self, batch_inputs: Tensor):  # 中文注释：重写特征提取逻辑制造通道不匹配
+            feat1 = torch.ones((batch_inputs.size(0), 1, 1, 1), device=batch_inputs.device)  # 中文注释：第一层通道数保持一致
+            feat2 = 3 * torch.ones((batch_inputs.size(0), 2, 1, 1), device=batch_inputs.device)  # 中文注释：第二层通道数刻意设置为2制造不匹配
+            return (feat1, feat2)  # 中文注释：返回具有通道不一致的两层特征
+
     class _ToySample:  # 中文注释：定义简化数据样本结构
         def __init__(self):  # 中文注释：初始化样本
             self.gt_instances = type('gt', (), {'labels': torch.zeros(1, dtype=torch.long)})()  # 中文注释：构造带标签字段的占位实例
@@ -305,3 +323,13 @@ if __name__ == '__main__':  # 中文注释：提供最小化自检脚本方便�
     part_values = [losses[key] for key in part_keys]  # 中文注释：收集需要参与求和的损失值
     total_from_parts = torch.stack(part_values).sum() if part_values else torch.tensor(0.0, device=dummy_inputs.device)  # 中文注释：对有效损失进行求和
     print('consistency', torch.allclose(losses['loss_total'], total_from_parts))  # 中文注释：验证总损失等于各项损失之和
+    mismatch_teacher = _ToyMismatchTeacher()  # 中文注释：实例化通道数与学生不同的教师模型
+    mismatch_student = _ToyDetector()  # 中文注释：实例化保持通道数量的学生模型
+    mismatch_model = DualDiffFusionStage1(mismatch_teacher, mismatch_student, train_cfg=dict(  # 中文注释：构造未冻结教师的模型用于断言测试
+        w_sup=1.0, w_cross=0.0, w_feat_kd=0.0, enable_roi_kd=False, cross_warmup_iters=0, freeze_teacher=False))  # 中文注释：使用最小配置同时允许教师参与训练
+    try:  # 中文注释：通过try捕获预期的通道不匹配断言
+        mismatch_model.loss(dummy_inputs, dummy_samples)  # 中文注释：执行一次损失计算以触发通道检查
+    except AssertionError as err:  # 中文注释：捕获断言错误并打印提示信息
+        print('channel_mismatch_assert_captured', str(err))  # 中文注释：输出捕获到的断言信息证明检查生效
+    else:  # 中文注释：若未触发断言则说明检查失效
+        raise RuntimeError('Expected channel mismatch assertion was not raised.')  # 中文注释：主动抛出异常提醒开发者修复检查逻辑
