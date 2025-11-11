@@ -66,6 +66,11 @@ class FusedTeacherExportHook(Hook):  # 中文注释：定义用于导出融合�
         export_callable = getattr(model, 'export_fused_teacher', None)  # 中文注释：尝试获取模型中的导出方法
         if export_callable is None:  # 中文注释：当模型不支持导出接口时无需继续执行
             return  # 中文注释：直接返回以避免抛出异常
+        runner_rank = int(getattr(runner, 'rank', 0))  # 中文注释：读取运行器当前进程的rank并默认主进程为0
+        runner_world_size = int(getattr(runner, 'world_size', 1))  # 中文注释：读取总进程数用于判断是否处于分布式环境
+        runner_distributed = bool(getattr(runner, 'distributed', runner_world_size > 1))  # 中文注释：推断分布式标志用于兼容不同运行器实现
+        if (runner_world_size > 1 or runner_distributed) and runner_rank != 0:  # 中文注释：在非主进程且确认为分布式训练时跳过写盘
+            return  # 中文注释：直接返回确保只有rank 0执行导出操作
         work_dir: Optional[str] = getattr(runner, 'work_dir', None)  # 中文注释：读取运行器当前工作目录
         export_root = Path(work_dir) if work_dir is not None else Path('.')  # 中文注释：若未设置工作目录则退回当前目录
         export_root.mkdir(parents=True, exist_ok=True)  # 中文注释：确保导出目录存在以避免保存失败
@@ -89,14 +94,17 @@ if __name__ == '__main__':  # 中文注释：提供最小化自检脚本便于�
             self.called += 1  # 中文注释：导出完成后累加调用计数
 
     class _DummyRunner:  # 中文注释：构造满足钩子接口需求的最小运行器占位对象
-        def __init__(self):  # 中文注释：初始化伪Runner时配置必要属性
+        def __init__(self, rank: int = 0, world_size: int = 1, distributed: bool = False, work_dir: str = './work_dirs/unit_test'):  # 中文注释：初始化伪Runner时支持配置分布式属性与导出目录
             self.model = _DummyModel()  # 中文注释：挂载伪模型
-            self.work_dir = './work_dirs/unit_test'  # 中文注释：指定导出目录
+            self.work_dir = work_dir  # 中文注释：指定导出目录
             self.logger = None  # 中文注释：省略日志器以简化示例
             self.iter = 0  # 中文注释：初始化当前迭代计数供every_n_train_iters引用
             self.epoch = 0  # 中文注释：初始化当前轮次计数供every_n_epochs引用
+            self.rank = rank  # 中文注释：记录当前进程rank以模拟分布式环境
+            self.world_size = world_size  # 中文注释：记录总进程数辅助判定分布式状态
+            self.distributed = distributed  # 中文注释：显式标注是否处于分布式模式
 
-    runner = _DummyRunner()  # 中文注释：实例化伪Runner
+    runner = _DummyRunner(rank=0, world_size=2, distributed=True, work_dir='./work_dirs/unit_test_rank0')  # 中文注释：实例化rank 0的伪Runner模拟主进程
     hook = FusedTeacherExportHook(interval=2, by_epoch=False, filename='subdir/student_rgb_fused.pth')  # 中文注释：设置导出间隔并指定带子目录的文件名
     for idx in range(3):  # 中文注释：模拟三次训练迭代覆盖间隔与末次兜底导出
         runner.iter = idx + 1  # 中文注释：手动递增迭代计数以满足Hook的间隔判断
@@ -106,4 +114,15 @@ if __name__ == '__main__':  # 中文注释：提供最小化自检脚本便于�
     export_file = Path(runner.work_dir) / 'subdir/student_rgb_fused.pth'  # 中文注释：拼接期望生成的嵌套路径文件
     assert export_file.exists()  # 中文注释：确认嵌套目录与权重文件均已正确生成
     assert runner.model.called == 2  # 中文注释：确认常规导出与兜底导出共执行两次且重复调用未增加次数
+    export_file.unlink()  # 中文注释：清理生成的导出文件以避免影响后续测试
+
+    runner_rank1 = _DummyRunner(rank=1, world_size=2, distributed=True, work_dir='./work_dirs/unit_test_rank1')  # 中文注释：实例化rank 1的伪Runner模拟从进程
+    hook_rank1 = FusedTeacherExportHook(interval=1, by_epoch=False, filename='student_rgb_fused_rank1.pth')  # 中文注释：创建新的钩子并设置较短间隔便于触发导出逻辑
+    for idx in range(2):  # 中文注释：模拟两次训练迭代验证从进程不会触发写盘
+        runner_rank1.iter = idx + 1  # 中文注释：递增迭代计数以满足Hook的间隔判断
+        hook_rank1.after_train_iter(runner_rank1, idx)  # 中文注释：调用迭代结束回调
+    hook_rank1.after_train(runner_rank1)  # 中文注释：触发训练结束导出以验证从进程仍不写盘
+    export_file_rank1 = Path(runner_rank1.work_dir) / 'student_rgb_fused_rank1.pth'  # 中文注释：拼接从进程预期的导出文件路径
+    assert not export_file_rank1.exists()  # 中文注释：确认从进程未生成导出文件以符合rank限制
+    assert runner_rank1.model.called == 0  # 中文注释：确认从进程模型未执行导出函数
     print('FusedTeacherExportHook 自检通过')  # 中文注释：输出自检通过提示
