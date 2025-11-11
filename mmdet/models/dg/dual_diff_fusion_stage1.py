@@ -251,7 +251,10 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
 
         if loss_total is None:  # 中文注释：若未累加任何损失则创建零张量占位
             loss_total = student_feats[0].sum() * 0  # 中文注释：使用学生特征创建零值张量保持梯度设备一致
-        losses['loss_total'] = loss_total  # 中文注释：记录保留梯度的总损失条目以供优化器回传
+        if not any('loss' in key for key in losses.keys()):  # 中文注释：若损失字典中不存在任何包含loss字样的键名
+            stu_zero_placeholder = student_feats[0].sum() * 0  # 中文注释：构造零值占位损失以确保仍有梯度回传
+            losses['stu_zero_loss'] = stu_zero_placeholder  # 中文注释：写入遵循stu_前缀的占位损失键保持命名规范一致
+            loss_total = _accumulate(loss_total, stu_zero_placeholder)  # 中文注释：将占位损失累加到总和以维持日志一致性
         losses['total_weighted_log'] = _detach_if_tensor(loss_total)  # 中文注释：记录仅用于监控的总损失日志条目并显式detach防止重复求和
         losses['meta_w_sup'] = student_feats[0].new_tensor(self.w_sup)  # 中文注释：记录学生监督损失权重常数张量并确保与主损失同设备
         losses['meta_w_cross'] = student_feats[0].new_tensor(self.w_cross)  # 中文注释：记录交叉蒸馏损失权重常数张量用于日志监控
@@ -389,10 +392,13 @@ if __name__ == '__main__':  # 中文注释：提供最小化自检脚本方便�
     print('meta_keys_values', {key: float(losses[key]) for key in meta_keys})  # 中文注释：打印权重日志键对应的标量值确保存在且为常数张量
     log_keys = ['stu_total_log', 'cross_total_log']  # 中文注释：列出仅用于日志记录的总损失键
     print('log_keys_requires_grad', {key: (isinstance(losses.get(key), torch.Tensor) and losses[key].requires_grad) for key in log_keys if key in losses})  # 中文注释：确认日志键对应的张量不参与梯度
-    part_keys = [key for key in losses.keys() if ('loss' in key and key != 'loss_total')]  # 中文注释：仅收集真正参与反向传播的损失键
+    part_keys = [key for key in losses.keys() if ('loss' in key)]  # 中文注释：收集所有包含loss字样的损失键以核对求和结果
     part_values = [losses[key] for key in part_keys]  # 中文注释：收集需要参与求和的损失值
     total_from_parts = torch.stack(part_values).sum() if part_values else torch.tensor(0.0, device=dummy_inputs.device)  # 中文注释：对有效损失进行求和
-    print('consistency', torch.allclose(losses['loss_total'], total_from_parts))  # 中文注释：验证总损失等于各项损失之和
+    total_log_tensor = losses['total_weighted_log']  # 中文注释：读取仅用于日志的总损失标量
+    if not isinstance(total_log_tensor, torch.Tensor):  # 中文注释：当日志值不是张量时需要显式转换
+        total_log_tensor = torch.tensor(float(total_log_tensor), device=dummy_inputs.device)  # 中文注释：将标量转换为与输入同设备的张量
+    print('consistency', torch.allclose(total_log_tensor, total_from_parts.detach()))  # 中文注释：验证日志记录的总损失等于各项损失之和
     mismatch_teacher = _ToyMismatchTeacher()  # 中文注释：实例化通道数与学生不同的教师模型
     mismatch_student = _ToyDetector()  # 中文注释：实例化保持通道数量的学生模型
     mismatch_model = DualDiffFusionStage1(mismatch_teacher, mismatch_student, train_cfg=dict(  # 中文注释：构造未冻结教师的模型用于断言测试
