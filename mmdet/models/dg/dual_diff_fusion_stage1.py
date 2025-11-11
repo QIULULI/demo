@@ -114,6 +114,9 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
         def _accumulate(current: Optional[Tensor], value: Tensor) -> Tensor:  # 中文注释：定义内部函数用于累加张量
             return value if current is None else current + value  # 中文注释：当累加器为空时直接返回当前值否则执行加法
 
+        def _detach_if_tensor(value):  # 中文注释：定义辅助函数用于在需要时剥离梯度
+            return value.detach() if isinstance(value, Tensor) else value  # 中文注释：若输入是张量则调用detach否则直接返回原值
+
         stu_rpn_results: Optional[List] = None  # 中文注释：记录学生RPN生成的候选框供后续复用
         if self.w_sup > 0:  # 中文注释：仅当学生监督权重大于零时计算监督损失
             if self.with_rpn and hasattr(self.student_rgb, 'rpn_head'):  # 中文注释：当学生包含RPN头部时计算RPN损失
@@ -145,12 +148,15 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
                     student_feats, batch_data_samples)  # 中文注释：当缺少RPN结果时重新生成候选框
                 roi_losses = self.student_rgb.roi_head.loss(student_feats, roi_inputs, batch_data_samples)  # 中文注释：基于学生特征计算ROI监督损失
                 for key, value in rename_loss_dict('stu_', roi_losses).items():  # 中文注释：为ROI损失添加stu_前缀
-                    weighted = value * self.w_sup  # 中文注释：乘以学生监督权重
-                    losses[key] = weighted  # 中文注释：写入损失字典
-                    loss_total = _accumulate(loss_total, weighted)  # 中文注释：累加到总损失
-                    stu_total = _accumulate(stu_total, weighted)  # 中文注释：累加到学生监督损失总和
+                    if 'loss' in key:  # 中文注释：仅对包含loss字样的键应用权重缩放
+                        weighted = value * self.w_sup  # 中文注释：乘以学生监督权重
+                        losses[key] = weighted  # 中文注释：写入缩放后的损失张量
+                        loss_total = _accumulate(loss_total, weighted)  # 中文注释：累加缩放后的损失到总损失
+                        stu_total = _accumulate(stu_total, weighted)  # 中文注释：累加缩放后的损失到学生监督总和
+                    else:  # 中文注释：对于非损失项保持原值避免被错误缩放
+                        losses[key] = _detach_if_tensor(value)  # 中文注释：若为张量则detach后记录避免梯度传播
         if stu_total is not None:  # 中文注释：若存在学生监督损失则记录汇总指标
-            losses['stu_loss_total'] = stu_total  # 中文注释：在日志中记录学生监督损失总和
+            losses['stu_total_log'] = _detach_if_tensor(stu_total)  # 中文注释：以日志键记录学生监督损失总和并剥离梯度
 
         cross_weight = self.w_cross if self.local_iter >= self.cross_warmup_iters else 0.0  # 中文注释：根据预热迭代数决定交叉蒸馏权重
         cross_rpn_results: Optional[List] = None  # 中文注释：记录教师特征驱动的候选框供复用
@@ -184,12 +190,15 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
                     teacher_feats, batch_data_samples)  # 中文注释：当缺少候选框时重新生成
                 roi_losses = self.student_rgb.roi_head.loss(teacher_feats, roi_inputs, batch_data_samples)  # 中文注释：基于教师特征计算学生ROI损失
                 for key, value in rename_loss_dict('cross_', roi_losses).items():  # 中文注释：为交叉损失添加cross_前缀
-                    weighted = value * cross_weight  # 中文注释：乘以交叉蒸馏权重
-                    losses[key] = weighted  # 中文注释：写入损失字典
-                    loss_total = _accumulate(loss_total, weighted)  # 中文注释：累加到总损失
-                    cross_total = _accumulate(cross_total, weighted)  # 中文注释：累加到交叉蒸馏损失总和
+                    if 'loss' in key:  # 中文注释：仅对包含loss字样的键执行权重缩放
+                        weighted = value * cross_weight  # 中文注释：乘以交叉蒸馏权重
+                        losses[key] = weighted  # 中文注释：写入缩放后的交叉损失
+                        loss_total = _accumulate(loss_total, weighted)  # 中文注释：累加缩放后的交叉损失到总损失
+                        cross_total = _accumulate(cross_total, weighted)  # 中文注释：累加缩放后的交叉损失到交叉总和
+                    else:  # 中文注释：对于非损失项保持原值避免缩放日志
+                        losses[key] = _detach_if_tensor(value)  # 中文注释：若为张量则detach后记录以阻断梯度
         if cross_total is not None:  # 中文注释：若存在交叉蒸馏损失则记录汇总指标
-            losses['cross_loss_total'] = cross_total  # 中文注释：记录交叉蒸馏损失总和
+            losses['cross_total_log'] = _detach_if_tensor(cross_total)  # 中文注释：以日志键记录交叉蒸馏损失总和并剥离梯度
 
         if self.w_feat_kd > 0:  # 中文注释：当特征蒸馏权重大于零时计算特征KD损失
             mse_values: List[Tensor] = []  # 中文注释：创建列表存储各层均方误差
@@ -348,7 +357,9 @@ if __name__ == '__main__':  # 中文注释：提供最小化自检脚本方便�
     print('rpn_keys_present', {key: (key in losses) for key in sorted(required_rpn_keys)})  # 中文注释：打印每个RPN键名是否存在
     meta_keys = ['meta_w_sup', 'meta_w_cross', 'meta_w_feat_kd', 'meta_w_roi_kd', 'meta_cross_weight_effective']  # 中文注释：列出新增的权重日志键名
     print('meta_keys_values', {key: float(losses[key]) for key in meta_keys})  # 中文注释：打印权重日志键对应的标量值确保存在且为常数张量
-    part_keys = [key for key in losses.keys() if key not in ('loss_total', 'stu_loss_total', 'cross_loss_total')]  # 中文注释：过滤掉汇总项避免重复统计
+    log_keys = ['stu_total_log', 'cross_total_log']  # 中文注释：列出仅用于日志记录的总损失键
+    print('log_keys_requires_grad', {key: (isinstance(losses.get(key), torch.Tensor) and losses[key].requires_grad) for key in log_keys if key in losses})  # 中文注释：确认日志键对应的张量不参与梯度
+    part_keys = [key for key in losses.keys() if ('loss' in key and key != 'loss_total')]  # 中文注释：仅收集真正参与反向传播的损失键
     part_values = [losses[key] for key in part_keys]  # 中文注释：收集需要参与求和的损失值
     total_from_parts = torch.stack(part_values).sum() if part_values else torch.tensor(0.0, device=dummy_inputs.device)  # 中文注释：对有效损失进行求和
     print('consistency', torch.allclose(losses['loss_total'], total_from_parts))  # 中文注释：验证总损失等于各项损失之和
