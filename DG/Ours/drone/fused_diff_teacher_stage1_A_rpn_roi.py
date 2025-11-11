@@ -169,7 +169,7 @@ default_hooks = dict(  # 中文注释：重写默认钩子以加入融合教师�
         type='DetVisualizationHook', draw=True, interval=1000, test_out_dir='drone_vis',  # 中文注释：每千次迭代保存可视化结果
     ),  # 中文注释：可视化钩子配置结束
     fused_teacher_export=dict(  # 中文注释：新增定期导出融合教师权重的钩子
-        type='FusedTeacherExportHook', interval=1000, by_epoch=False, filename='student_rgb_fused.pth',  # 中文注释：每千次迭代调用export_fused_teacher
+        type='FusedTeacherExportHook', interval=1000, by_epoch=False, filename='student_rgb_fused.pth',  # 中文注释：每千次迭代调用export_fused_teacher并在work_dir/student_rgb_fused.pth写出最终融合权重
     ),  # 中文注释：融合教师导出钩子配置结束
 )  # 中文注释：默认钩子配置结束
 
@@ -181,6 +181,7 @@ test_cfg = dict(type='TestLoop')  # 中文注释：使用默认测试循环实�
 
 auto_scale_lr = dict(enable=True, base_batch_size=16)  # 中文注释：允许按照总批量自动缩放学习率
 find_unused_parameters = True  # 中文注释：在分布式训练中启用查找未使用参数以避免梯度同步错误
+work_dir = 'work_dirs/DG/Ours/drone/fused_teacher_stage1_A'  # 中文注释：设置工作目录以满足Stage-1融合教师导出规范并确保权重保存路径统一
 
 if __name__ == '__main__':  # 中文注释：提供最小化自检脚本方便快速验证配置可用性
     import torch  # 中文注释：导入PyTorch以构造虚拟输入张量
