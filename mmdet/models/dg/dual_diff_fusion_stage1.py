@@ -61,6 +61,12 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
             return tuple(student_feats)  # 中文注释：转换为元组以便后续统一处理
         return (student_feats,)  # 中文注释：单尺度情况时包装成单元素元组保持接口一致
 
+    def extract_feat(self, batch_inputs: Tensor) -> Tuple[Tensor, ...]:  # 中文注释：实现BaseDetector抽象接口要求的extract_feat方法
+        feats = self.extract_feat_student(batch_inputs)  # 中文注释：直接复用学生分支的特征提取逻辑
+        if isinstance(feats, (list, tuple)):  # 中文注释：当复用结果为列表或元组时确保统一转换
+            return tuple(feats)  # 中文注释：统一转换为元组形式保持返回类型一致
+        return (feats,)  # 中文注释：当复用结果为单个张量时包装成元组满足接口约定
+
     def extract_feat_teacher(self, batch_inputs: Tensor) -> Tuple[Tensor, ...]:  # 中文注释：封装教师分支的特征提取流程
         if self.freeze_teacher:  # 中文注释：若教师被冻结则使用无梯度上下文
             with torch.no_grad():  # 中文注释：关闭梯度避免教师参数更新
@@ -333,6 +339,8 @@ if __name__ == '__main__':  # 中文注释：提供最小化自检脚本方便�
     model = DualDiffFusionStage1(teacher, student, train_cfg=dict(  # 中文注释：构建融合模型并设置权重
         w_sup=2.0, w_cross=3.0, w_feat_kd=4.0, enable_roi_kd=True, w_roi_kd=5.0, cross_warmup_iters=0, freeze_teacher=True))  # 中文注释：设置示例配置确保全部分支生效
     dummy_inputs = torch.randn(1, 3, 4, 4)  # 中文注释：构造随机输入张量
+    feats_via_interface = model.extract_feat(dummy_inputs)  # 中文注释：调用新增的extract_feat接口确保符合框架要求
+    print('extract_feat_len', len(feats_via_interface))  # 中文注释：打印返回的特征层数量验证接口有效
     dummy_samples = [_ToySample()]  # 中文注释：构造单个简化样本列表
     losses = model.loss(dummy_inputs, dummy_samples)  # 中文注释：执行一次损失计算验证流程
     print('loss_keys', sorted(losses.keys()))  # 中文注释：打印损失键名验证命名规则
