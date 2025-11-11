@@ -88,11 +88,26 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
                 proposal_cfg = self._get_proposal_cfg()  # 中文注释：读取RPN候选框配置
                 rpn_losses, stu_rpn_results = self.student_rgb.rpn_head.loss_and_predict(  # 中文注释：基于学生特征计算RPN损失与候选框
                     student_feats, batch_data_samples, proposal_cfg=proposal_cfg)  # 中文注释：传入学生特征与真实标注
-                for key, value in rename_loss_dict('stu_', rpn_losses).items():  # 中文注释：为RPN损失添加stu_前缀
-                    weighted = value * self.w_sup  # 中文注释：将损失乘以学生监督权重
-                    losses[key] = weighted  # 中文注释：写入最终损失字典
-                    loss_total = _accumulate(loss_total, weighted)  # 中文注释：累加到总损失
-                    stu_total = _accumulate(stu_total, weighted)  # 中文注释：累加到学生监督损失总和
+                if 'loss_cls' in rpn_losses:  # 中文注释：判断是否存在标准命名的分类损失
+                    stu_rpn_loss_cls_raw = rpn_losses['loss_cls']  # 中文注释：读取分类损失张量
+                elif 'loss_rpn_cls' in rpn_losses:  # 中文注释：兼容以loss_rpn_cls命名的分类损失
+                    stu_rpn_loss_cls_raw = rpn_losses['loss_rpn_cls']  # 中文注释：读取分类损失张量
+                else:  # 中文注释：缺失分类损失时抛出异常提醒配置问题
+                    raise KeyError('RPN losses must contain loss_cls or loss_rpn_cls for student branch.')  # 中文注释：提示学生分支缺少分类损失
+                if 'loss_bbox' in rpn_losses:  # 中文注释：判断是否存在标准命名的回归损失
+                    stu_rpn_loss_bbox_raw = rpn_losses['loss_bbox']  # 中文注释：读取回归损失张量
+                elif 'loss_rpn_bbox' in rpn_losses:  # 中文注释：兼容以loss_rpn_bbox命名的回归损失
+                    stu_rpn_loss_bbox_raw = rpn_losses['loss_rpn_bbox']  # 中文注释：读取回归损失张量
+                else:  # 中文注释：缺失回归损失时抛出异常提醒配置问题
+                    raise KeyError('RPN losses must contain loss_bbox or loss_rpn_bbox for student branch.')  # 中文注释：提示学生分支缺少回归损失
+                stu_rpn_loss_cls_weighted = stu_rpn_loss_cls_raw * self.w_sup  # 中文注释：将分类损失乘以学生监督权重
+                stu_rpn_loss_bbox_weighted = stu_rpn_loss_bbox_raw * self.w_sup  # 中文注释：将回归损失乘以学生监督权重
+                losses['stu_rpn_loss_cls'] = stu_rpn_loss_cls_weighted  # 中文注释：写入学生RPN分类损失并统一键名
+                losses['stu_rpn_loss_bbox'] = stu_rpn_loss_bbox_weighted  # 中文注释：写入学生RPN回归损失并统一键名
+                loss_total = _accumulate(loss_total, stu_rpn_loss_cls_weighted)  # 中文注释：将学生分类损失累加到总损失
+                loss_total = _accumulate(loss_total, stu_rpn_loss_bbox_weighted)  # 中文注释：将学生回归损失累加到总损失
+                stu_total = _accumulate(stu_total, stu_rpn_loss_cls_weighted)  # 中文注释：将学生分类损失累加到学生监督总和
+                stu_total = _accumulate(stu_total, stu_rpn_loss_bbox_weighted)  # 中文注释：将学生回归损失累加到学生监督总和
             if self.with_roi_head and hasattr(self.student_rgb, 'roi_head'):  # 中文注释：当学生包含ROI头部时计算ROI损失
                 roi_inputs = stu_rpn_results if stu_rpn_results is not None else self._prepare_roi_inputs(  # 中文注释：优先复用学生RPN候选框否则动态生成
                     student_feats, batch_data_samples)  # 中文注释：当缺少RPN结果时重新生成候选框
@@ -112,11 +127,26 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
                 proposal_cfg = self._get_proposal_cfg()  # 中文注释：读取候选框配置
                 rpn_losses, cross_rpn_results = self.student_rgb.rpn_head.loss_and_predict(  # 中文注释：基于教师特征计算学生RPN损失
                     teacher_feats, batch_data_samples, proposal_cfg=proposal_cfg)  # 中文注释：传入教师特征与真实标注
-                for key, value in rename_loss_dict('cross_', rpn_losses).items():  # 中文注释：为交叉损失添加cross_前缀
-                    weighted = value * cross_weight  # 中文注释：乘以交叉蒸馏权重
-                    losses[key] = weighted  # 中文注释：写入损失字典
-                    loss_total = _accumulate(loss_total, weighted)  # 中文注释：累加到总损失
-                    cross_total = _accumulate(cross_total, weighted)  # 中文注释：累加到交叉蒸馏损失总和
+                if 'loss_cls' in rpn_losses:  # 中文注释：判断是否存在标准命名的分类损失
+                    cross_rpn_loss_cls_raw = rpn_losses['loss_cls']  # 中文注释：读取分类损失张量
+                elif 'loss_rpn_cls' in rpn_losses:  # 中文注释：兼容以loss_rpn_cls命名的分类损失
+                    cross_rpn_loss_cls_raw = rpn_losses['loss_rpn_cls']  # 中文注释：读取分类损失张量
+                else:  # 中文注释：缺失分类损失时抛出异常提醒配置问题
+                    raise KeyError('RPN losses must contain loss_cls or loss_rpn_cls for cross branch.')  # 中文注释：提示交叉分支缺少分类损失
+                if 'loss_bbox' in rpn_losses:  # 中文注释：判断是否存在标准命名的回归损失
+                    cross_rpn_loss_bbox_raw = rpn_losses['loss_bbox']  # 中文注释：读取回归损失张量
+                elif 'loss_rpn_bbox' in rpn_losses:  # 中文注释：兼容以loss_rpn_bbox命名的回归损失
+                    cross_rpn_loss_bbox_raw = rpn_losses['loss_rpn_bbox']  # 中文注释：读取回归损失张量
+                else:  # 中文注释：缺失回归损失时抛出异常提醒配置问题
+                    raise KeyError('RPN losses must contain loss_bbox or loss_rpn_bbox for cross branch.')  # 中文注释：提示交叉分支缺少回归损失
+                cross_rpn_loss_cls_weighted = cross_rpn_loss_cls_raw * cross_weight  # 中文注释：将分类损失乘以交叉蒸馏权重
+                cross_rpn_loss_bbox_weighted = cross_rpn_loss_bbox_raw * cross_weight  # 中文注释：将回归损失乘以交叉蒸馏权重
+                losses['cross_rpn_loss_cls'] = cross_rpn_loss_cls_weighted  # 中文注释：写入交叉RPN分类损失并统一键名
+                losses['cross_rpn_loss_bbox'] = cross_rpn_loss_bbox_weighted  # 中文注释：写入交叉RPN回归损失并统一键名
+                loss_total = _accumulate(loss_total, cross_rpn_loss_cls_weighted)  # 中文注释：将交叉分类损失累加到总损失
+                loss_total = _accumulate(loss_total, cross_rpn_loss_bbox_weighted)  # 中文注释：将交叉回归损失累加到总损失
+                cross_total = _accumulate(cross_total, cross_rpn_loss_cls_weighted)  # 中文注释：将交叉分类损失累加到交叉总和
+                cross_total = _accumulate(cross_total, cross_rpn_loss_bbox_weighted)  # 中文注释：将交叉回归损失累加到交叉总和
             if self.with_roi_head and hasattr(self.student_rgb, 'roi_head'):  # 中文注释：当学生包含ROI头部时计算交叉ROI损失
                 roi_inputs = cross_rpn_results if cross_rpn_results is not None else self._prepare_roi_inputs(  # 中文注释：优先复用教师特征驱动的候选框
                     teacher_feats, batch_data_samples)  # 中文注释：当缺少候选框时重新生成
@@ -207,8 +237,9 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
 if __name__ == '__main__':  # 中文注释：提供最小化自检脚本方便快速验证逻辑
     class _ToyRPNHead(torch.nn.Module):  # 中文注释：定义简化版RPN头用于自检
         def loss_and_predict(self, feats, samples, proposal_cfg=None):  # 中文注释：实现最小接口返回固定损失与候选框
-            loss_value = torch.tensor(1.0, device=feats[0].device)  # 中文注释：构造恒定的RPN损失值
-            losses = {'loss_rpn': loss_value}  # 中文注释：封装RPN损失字典
+            loss_cls = torch.tensor(1.0, device=feats[0].device)  # 中文注释：构造恒定的RPN分类损失值
+            loss_bbox = torch.tensor(0.5, device=feats[0].device)  # 中文注释：构造恒定的RPN回归损失值
+            losses = {'loss_cls': loss_cls, 'loss_bbox': loss_bbox}  # 中文注释：封装同时包含分类与回归的RPN损失字典
             proposals = []  # 中文注释：创建候选框列表
             for _ in samples:  # 中文注释：遍历每个样本
                 proposals.append(type('Proposal', (), {'bboxes': torch.zeros((1, 4), device=feats[0].device)})())  # 中文注释：为每个样本创建占位候选框对象
@@ -268,6 +299,8 @@ if __name__ == '__main__':  # 中文注释：提供最小化自检脚本方便�
     dummy_samples = [_ToySample()]  # 中文注释：构造单个简化样本列表
     losses = model.loss(dummy_inputs, dummy_samples)  # 中文注释：执行一次损失计算验证流程
     print('loss_keys', sorted(losses.keys()))  # 中文注释：打印损失键名验证命名规则
+    required_rpn_keys = {'stu_rpn_loss_cls', 'stu_rpn_loss_bbox', 'cross_rpn_loss_cls', 'cross_rpn_loss_bbox'}  # 中文注释：定义必须存在的RPN键名集合
+    print('rpn_keys_present', {key: (key in losses) for key in sorted(required_rpn_keys)})  # 中文注释：打印每个RPN键名是否存在
     part_keys = [key for key in losses.keys() if key not in ('loss_total', 'stu_loss_total', 'cross_loss_total')]  # 中文注释：过滤掉汇总项避免重复统计
     part_values = [losses[key] for key in part_keys]  # 中文注释：收集需要参与求和的损失值
     total_from_parts = torch.stack(part_values).sum() if part_values else torch.tensor(0.0, device=dummy_inputs.device)  # 中文注释：对有效损失进行求和
