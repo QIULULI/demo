@@ -123,6 +123,21 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
         def _detach_if_tensor(value):  # 中文注释：定义辅助函数用于在需要时剥离梯度
             return value.detach() if isinstance(value, Tensor) else value  # 中文注释：若输入是张量则调用detach否则直接返回原值
 
+        reference_tensor = student_feats[0]  # 中文注释：选择学生第一层特征作为构造同设备零张量的参考
+
+        def _aggregate_loss_value(raw_value) -> Tensor:  # 中文注释：定义内部函数将可能为列表的损失聚合成标量张量
+            if isinstance(raw_value, Tensor):  # 中文注释：当输入本身已经是张量时直接返回
+                return raw_value  # 中文注释：无需额外处理直接使用原始张量
+            if isinstance(raw_value, (list, tuple)):  # 中文注释：当输入是列表或元组时需要显式聚合
+                if len(raw_value) == 0:  # 中文注释：针对空列表的情况返回零张量避免求和异常
+                    return reference_tensor.sum() * 0  # 中文注释：使用参考特征构造同设备零张量
+                if all(isinstance(item, Tensor) for item in raw_value):  # 中文注释：当全部元素都是张量时执行堆叠求和
+                    reduced_items = [item if item.dim() == 0 else item.sum() for item in raw_value]  # 中文注释：逐个张量求和以确保每个元素为标量
+                    return torch.stack(reduced_items).sum()  # 中文注释：通过堆叠再求和生成单个标量张量
+                python_sum = sum(raw_value)  # 中文注释：当元素是数值时先用Python内置求和得到标量
+                return reference_tensor.new_tensor(python_sum)  # 中文注释：将标量转换为与参考张量同设备的张量
+            return reference_tensor.new_tensor(float(raw_value))  # 中文注释：兜底处理可转换为浮点的标量情况
+
         stu_rpn_results: Optional[List] = None  # 中文注释：记录学生RPN生成的候选框供后续复用
         roi_kd_proposals: Optional[List] = None  # 中文注释：预先声明ROI蒸馏专用的候选框副本以避免被监督阶段改写
         if self.w_sup > 0:  # 中文注释：仅当学生监督权重大于零时计算监督损失
@@ -142,8 +157,10 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
                     stu_rpn_loss_bbox_raw = rpn_losses['loss_rpn_bbox']  # 中文注释：读取回归损失张量
                 else:  # 中文注释：缺失回归损失时抛出异常提醒配置问题
                     raise KeyError('RPN losses must contain loss_bbox or loss_rpn_bbox for student branch.')  # 中文注释：提示学生分支缺少回归损失
-                stu_rpn_loss_cls_weighted = stu_rpn_loss_cls_raw * self.w_sup  # 中文注释：将分类损失乘以学生监督权重
-                stu_rpn_loss_bbox_weighted = stu_rpn_loss_bbox_raw * self.w_sup  # 中文注释：将回归损失乘以学生监督权重
+                stu_rpn_loss_cls_tensor = _aggregate_loss_value(stu_rpn_loss_cls_raw)  # 中文注释：将学生RPN分类损失聚合为标量张量
+                stu_rpn_loss_bbox_tensor = _aggregate_loss_value(stu_rpn_loss_bbox_raw)  # 中文注释：将学生RPN回归损失聚合为标量张量
+                stu_rpn_loss_cls_weighted = stu_rpn_loss_cls_tensor * self.w_sup  # 中文注释：将聚合后的分类损失乘以学生监督权重
+                stu_rpn_loss_bbox_weighted = stu_rpn_loss_bbox_tensor * self.w_sup  # 中文注释：将聚合后的回归损失乘以学生监督权重
                 losses['stu_rpn_loss_cls'] = stu_rpn_loss_cls_weighted  # 中文注释：写入学生RPN分类损失并统一键名
                 losses['stu_rpn_loss_bbox'] = stu_rpn_loss_bbox_weighted  # 中文注释：写入学生RPN回归损失并统一键名
                 loss_total = _accumulate(loss_total, stu_rpn_loss_cls_weighted)  # 中文注释：将学生分类损失累加到总损失
@@ -187,8 +204,10 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
                     cross_rpn_loss_bbox_raw = rpn_losses['loss_rpn_bbox']  # 中文注释：读取回归损失张量
                 else:  # 中文注释：缺失回归损失时抛出异常提醒配置问题
                     raise KeyError('RPN losses must contain loss_bbox or loss_rpn_bbox for cross branch.')  # 中文注释：提示交叉分支缺少回归损失
-                cross_rpn_loss_cls_weighted = cross_rpn_loss_cls_raw * cross_weight  # 中文注释：将分类损失乘以交叉蒸馏权重
-                cross_rpn_loss_bbox_weighted = cross_rpn_loss_bbox_raw * cross_weight  # 中文注释：将回归损失乘以交叉蒸馏权重
+                cross_rpn_loss_cls_tensor = _aggregate_loss_value(cross_rpn_loss_cls_raw)  # 中文注释：将交叉RPN分类损失聚合为标量张量
+                cross_rpn_loss_bbox_tensor = _aggregate_loss_value(cross_rpn_loss_bbox_raw)  # 中文注释：将交叉RPN回归损失聚合为标量张量
+                cross_rpn_loss_cls_weighted = cross_rpn_loss_cls_tensor * cross_weight  # 中文注释：将聚合后的分类损失乘以交叉蒸馏权重
+                cross_rpn_loss_bbox_weighted = cross_rpn_loss_bbox_tensor * cross_weight  # 中文注释：将聚合后的回归损失乘以交叉蒸馏权重
                 losses['cross_rpn_loss_cls'] = cross_rpn_loss_cls_weighted  # 中文注释：写入交叉RPN分类损失并统一键名
                 losses['cross_rpn_loss_bbox'] = cross_rpn_loss_bbox_weighted  # 中文注释：写入交叉RPN回归损失并统一键名
                 loss_total = _accumulate(loss_total, cross_rpn_loss_cls_weighted)  # 中文注释：将交叉分类损失累加到总损失
