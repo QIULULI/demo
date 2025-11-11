@@ -78,5 +78,5 @@ __all__ = [
     'DetectionTransformer', 'ConditionalDETR', 'DINO', 'DABDETR', 'GLIP',
     'DDQDETR', 'GroundingDINO', 'DomainAdaptationDetector',
     'SemiBaseDiffDetector', 'DiffusionDetector', 'DomainGeneralizationDetector',
-    'Diff2DiffDistiller', 'DualDiffFusionStage1'  # 中文注释: 新增第一阶段扩散融合检测器到导出列表
+    'DualDiffFusionStage1'  # 中文注释: 新增第一阶段扩散融合检测器到导出列表
 ]
