@@ -41,6 +41,7 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
             self.teacher_ir.eval()  # 中文注释：冻结时将教师切换到评估模式以固定归一化统计量
         else:  # 中文注释：当教师需要联合训练时
             self.teacher_ir.train()  # 中文注释：允许教师保持训练模式参与梯度更新
+        self._teacher_grad_check_passed = False  # 中文注释：初始化教师冻结断言缓存标记为未通过以便首次检测
         self.roi_cls_kd_criterion = KnowledgeDistillationKLDivLoss(  # 中文注释：构建ROI分类蒸馏使用的KL散度损失
             class_reduction='mean', reduction='mean', loss_weight=1.0)  # 中文注释：设置类别维度平均与批量平均的默认方式
         self.roi_reg_kd_criterion = L1Loss(reduction='mean', loss_weight=1.0)  # 中文注释：构建ROI回归蒸馏使用的L1损失
@@ -71,6 +72,19 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
         return (teacher_feats,)  # 中文注释：单尺度情况时包装成元组
 
     def loss(self, batch_inputs: Tensor, batch_data_samples: SampleList) -> Dict[str, Tensor]:  # 中文注释：实现整体训练损失计算逻辑
+        if self.freeze_teacher:  # 中文注释：仅当需要冻结教师时才执行断言校验
+            if not getattr(self, '_teacher_grad_check_passed', False):  # 中文注释：通过缓存标记避免重复遍历参数
+                offending_name: Optional[str] = None  # 中文注释：记录第一个未被冻结的参数名称
+                for name, param in self.teacher_ir.named_parameters():  # 中文注释：遍历教师模型所有具名参数检查梯度状态
+                    if param.requires_grad:  # 中文注释：一旦发现仍允许梯度的参数即刻记录
+                        offending_name = name  # 中文注释：保存触发问题的参数名称便于排查
+                        break  # 中文注释：找到问题后提前结束遍历提高效率
+                if offending_name is not None:  # 中文注释：若检测到仍可训练的参数则立即抛出异常
+                    raise AssertionError(  # 中文注释：抛出断言异常提示开发者检查冻结逻辑
+                        '检测到freeze_teacher=True但教师参数仍保留梯度：'  # 中文注释：明确问题发生的场景
+                        f'{offending_name}。请确认train_cfg.freeze_teacher为True，'  # 中文注释：提示检查配置项
+                        '不要对teacher_ir参数调用requires_grad_(True)，并确保优化器未包含教师参数。')  # 中文注释：给出排查优化器与梯度设置的建议
+                self._teacher_grad_check_passed = True  # 中文注释：若所有参数均已冻结则缓存结果避免后续重复检查
         student_feats = self.extract_feat_student(batch_inputs)  # 中文注释：首先提取学生的多尺度特征
         teacher_feats = self.extract_feat_teacher(batch_inputs)  # 中文注释：随后提取教师的多尺度特征
         level_mismatch_msg = 'Student and teacher feature levels must match.'  # 中文注释：预定义层数不匹配的提示语
@@ -208,6 +222,11 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
         if loss_total is None:  # 中文注释：若未累加任何损失则创建零张量占位
             loss_total = student_feats[0].sum() * 0  # 中文注释：使用学生特征创建零值张量保持梯度设备一致
         losses['loss_total'] = loss_total  # 中文注释：记录总损失供日志与反向传播使用
+        losses['meta_w_sup'] = student_feats[0].new_tensor(self.w_sup)  # 中文注释：记录学生监督损失权重常数张量并确保与主损失同设备
+        losses['meta_w_cross'] = student_feats[0].new_tensor(self.w_cross)  # 中文注释：记录交叉蒸馏损失权重常数张量用于日志监控
+        losses['meta_w_feat_kd'] = student_feats[0].new_tensor(self.w_feat_kd)  # 中文注释：记录特征蒸馏损失权重常数张量以便调试
+        losses['meta_w_roi_kd'] = student_feats[0].new_tensor(self.w_roi_kd)  # 中文注释：记录ROI蒸馏损失权重常数张量便于追踪配置
+        losses['meta_cross_weight_effective'] = student_feats[0].new_tensor(cross_weight)  # 中文注释：记录考虑预热后的交叉蒸馏实际权重
         self.local_iter += 1  # 中文注释：自增内部迭代计数以支持交叉蒸馏预热
         return losses  # 中文注释：返回完整的损失字典
 
@@ -319,6 +338,8 @@ if __name__ == '__main__':  # 中文注释：提供最小化自检脚本方便�
     print('loss_keys', sorted(losses.keys()))  # 中文注释：打印损失键名验证命名规则
     required_rpn_keys = {'stu_rpn_loss_cls', 'stu_rpn_loss_bbox', 'cross_rpn_loss_cls', 'cross_rpn_loss_bbox'}  # 中文注释：定义必须存在的RPN键名集合
     print('rpn_keys_present', {key: (key in losses) for key in sorted(required_rpn_keys)})  # 中文注释：打印每个RPN键名是否存在
+    meta_keys = ['meta_w_sup', 'meta_w_cross', 'meta_w_feat_kd', 'meta_w_roi_kd', 'meta_cross_weight_effective']  # 中文注释：列出新增的权重日志键名
+    print('meta_keys_values', {key: float(losses[key]) for key in meta_keys})  # 中文注释：打印权重日志键对应的标量值确保存在且为常数张量
     part_keys = [key for key in losses.keys() if key not in ('loss_total', 'stu_loss_total', 'cross_loss_total')]  # 中文注释：过滤掉汇总项避免重复统计
     part_values = [losses[key] for key in part_keys]  # 中文注释：收集需要参与求和的损失值
     total_from_parts = torch.stack(part_values).sum() if part_values else torch.tensor(0.0, device=dummy_inputs.device)  # 中文注释：对有效损失进行求和
