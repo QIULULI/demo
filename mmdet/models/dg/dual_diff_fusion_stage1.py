@@ -41,6 +41,7 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
             self.teacher_ir.eval()  # 中文注释：冻结时将教师切换到评估模式以固定归一化统计量
         else:  # 中文注释：当教师需要联合训练时
             self.teacher_ir.train()  # 中文注释：允许教师保持训练模式参与梯度更新
+        self._teacher_grad_check_passed = False  # 中文注释：初始化教师冻结断言缓存标记为未通过以便首次检测
         self.roi_cls_kd_criterion = KnowledgeDistillationKLDivLoss(  # 中文注释：构建ROI分类蒸馏使用的KL散度损失
             class_reduction='mean', reduction='mean', loss_weight=1.0)  # 中文注释：设置类别维度平均与批量平均的默认方式
         self.roi_reg_kd_criterion = L1Loss(reduction='mean', loss_weight=1.0)  # 中文注释：构建ROI回归蒸馏使用的L1损失
@@ -71,6 +72,19 @@ class DualDiffFusionStage1(BaseDetector):  # 中文注释：定义第一阶段�
         return (teacher_feats,)  # 中文注释：单尺度情况时包装成元组
 
     def loss(self, batch_inputs: Tensor, batch_data_samples: SampleList) -> Dict[str, Tensor]:  # 中文注释：实现整体训练损失计算逻辑
+        if self.freeze_teacher:  # 中文注释：仅当需要冻结教师时才执行断言校验
+            if not getattr(self, '_teacher_grad_check_passed', False):  # 中文注释：通过缓存标记避免重复遍历参数
+                offending_name: Optional[str] = None  # 中文注释：记录第一个未被冻结的参数名称
+                for name, param in self.teacher_ir.named_parameters():  # 中文注释：遍历教师模型所有具名参数检查梯度状态
+                    if param.requires_grad:  # 中文注释：一旦发现仍允许梯度的参数即刻记录
+                        offending_name = name  # 中文注释：保存触发问题的参数名称便于排查
+                        break  # 中文注释：找到问题后提前结束遍历提高效率
+                if offending_name is not None:  # 中文注释：若检测到仍可训练的参数则立即抛出异常
+                    raise AssertionError(  # 中文注释：抛出断言异常提示开发者检查冻结逻辑
+                        '检测到freeze_teacher=True但教师参数仍保留梯度：'  # 中文注释：明确问题发生的场景
+                        f'{offending_name}。请确认train_cfg.freeze_teacher为True，'  # 中文注释：提示检查配置项
+                        '不要对teacher_ir参数调用requires_grad_(True)，并确保优化器未包含教师参数。')  # 中文注释：给出排查优化器与梯度设置的建议
+                self._teacher_grad_check_passed = True  # 中文注释：若所有参数均已冻结则缓存结果避免后续重复检查
         student_feats = self.extract_feat_student(batch_inputs)  # 中文注释：首先提取学生的多尺度特征
         teacher_feats = self.extract_feat_teacher(batch_inputs)  # 中文注释：随后提取教师的多尺度特征
         assert len(student_feats) == len(teacher_feats), 'Student and teacher feature levels must match.'  # 中文注释：断言两者FPN层数一致
@@ -312,3 +326,16 @@ if __name__ == '__main__':  # 中文注释：提供最小化自检脚本方便�
     part_values = [losses[key] for key in part_keys]  # 中文注释：收集需要参与求和的损失值
     total_from_parts = torch.stack(part_values).sum() if part_values else torch.tensor(0.0, device=dummy_inputs.device)  # 中文注释：对有效损失进行求和
     print('consistency', torch.allclose(losses['loss_total'], total_from_parts))  # 中文注释：验证总损失等于各项损失之和
+    for param in model.teacher_ir.parameters():  # 中文注释：遍历教师参数以准备制造梯度异常
+        param.requires_grad_(True)  # 中文注释：临时开启教师梯度以触发断言
+    model._teacher_grad_check_passed = False  # 中文注释：重置断言缓存标记确保重新执行校验
+    try:  # 中文注释：使用try捕获预期的断言异常
+        model.loss(dummy_inputs, dummy_samples)  # 中文注释：再次执行损失计算此时应触发断言
+    except AssertionError as exc:  # 中文注释：捕获断言异常验证保护逻辑生效
+        print('teacher_grad_check', str(exc))  # 中文注释：打印异常信息辅助人工确认提示内容
+    else:  # 中文注释：若未抛出异常说明断言失效
+        raise RuntimeError('期望在教师梯度开启时触发断言，但未发生。')  # 中文注释：主动抛出错误提醒维护者修复检测逻辑
+    finally:  # 中文注释：无论是否触发异常都需恢复教师梯度状态
+        for param in model.teacher_ir.parameters():  # 中文注释：遍历教师参数恢复冻结
+            param.requires_grad_(False)  # 中文注释：重新禁用梯度保持原始设置
+        model._teacher_grad_check_passed = False  # 中文注释：重置缓存标记以保证后续运行仍会执行检查
