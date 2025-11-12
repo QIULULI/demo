@@ -11,7 +11,7 @@ _base_ = [  # 列出需要继承的基础配置文件
 
 base_cfg = Config.fromfile('/mnt/ssd/lql/Fitness-Generalization-Transferability/DG/_base_/models/faster-rcnn_diff_fpn.py')  # 显式加载基础模型配置文件获取原始结构定义
 base_model_cfg = base_cfg.model  # 提取基础配置中的模型字典以供教师与学生深拷贝复用
-del Config
+del Config, base_cfg # 清理命名空间避免污染
 classes = ('drone',)  # 定义单类别任务仅包含无人机目标
 dataset_type = 'CocoDataset'  # 指定数据集格式遵循COCO标注
 data_root = 'data/'  # 设定数据根目录与项目默认软链接保持一致
@@ -38,7 +38,7 @@ det_data_preprocessor = dict(  # 定义与仿真RGB模型一致的数据预处�
 )  # 预处理器配置结束
 
 teacher_ir = _apply_drone_specialization(deepcopy(base_model_cfg))  # 基于显式读取的基础模型深拷贝并套用无人机特化配置构建冻结教师
-teacher_ir_default_ckpt = '/mnt/ssd/lql/Fitness-Generalization-Transferability/work_dirs/diffusion_detector_drone_ir_clear_day/best_coco_bbox_mAP_50_iter_5000.pth'  # 默认教师权重占位路径可通过 --cfg-options model.teacher_ir.init_cfg.checkpoint=xxx 覆盖
+teacher_ir_default_ckpt = 'work_dirs/diffusion_detector_drone_ir_clear_day/best_coco_bbox_mAP_50_iter_5000_1028.pth'  # 默认教师权重占位路径可通过 --cfg-options model.teacher_ir.init_cfg.checkpoint=xxx 覆盖
 teacher_ir['init_cfg'] = dict(type='Pretrained', checkpoint=teacher_ir_default_ckpt)  # 使用Pretrained初始化教师扩散检测器权重
 teacher_ir['data_preprocessor'] = det_data_preprocessor  # 将教师的数据预处理器与学生保持一致避免分布差异
 
@@ -59,7 +59,7 @@ model = dict(  # 构建DualDiffFusionStage1检测器顶层配置
         w_feat_kd=0.5,  # 依据Stage-1规范将特征蒸馏权重设置为0.5确保稳健对齐
         enable_roi_kd=True,  # 依据Stage-1规范启用ROI级蒸馏以增强局部指导
         w_roi_kd=0.5,  # 依据Stage-1规范将ROI蒸馏损失权重设为0.5方便后续覆写
-        cross_warmup_iters=1000,  # 交叉蒸馏预热迭代默认0表示立即启用
+        cross_warmup_iters=0,  # 交叉蒸馏预热迭代默认0表示立即启用
         freeze_teacher=True,  # 冻结教师权重确保第一阶段仅训练学生
     ),  # 蒸馏配置结束
 )  # 模型总配置结束
@@ -179,7 +179,7 @@ default_hooks = dict(  # 重写默认钩子以加入融合教师导出逻辑
 
 log_processor = dict(type='LogProcessor', window_size=50, by_epoch=False)  # 日志处理器保持与基础设置一致
 
-train_cfg = dict(type='IterBasedTrainLoop', max_iters=5000, val_interval=1000)  # 迭代式训练循环共5000步并每千步验证
+train_cfg = dict(type='IterBasedTrainLoop', max_iters=20000, val_interval=1000)  # 迭代式训练循环共5000步并每千步验证
 val_cfg = dict(type='ValLoop')  # 使用默认验证循环实现
 test_cfg = dict(type='TestLoop')  # 使用默认测试循环实现
 

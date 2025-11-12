@@ -128,9 +128,12 @@ labeled_dataset_ir = dict(  # 定义仿真IR带标注数据集
     data_prefix=dict(img='sim_drone_ir/Town01_Opt/carla_data/'),  # 指向IR图像目录
     filter_cfg=dict(filter_empty_gt=True),  # 过滤无标注图像
     pipeline=sup_pipeline_ir)  # 采用IR监督流水线
-labeled_dataset = dict(  # 组合仿真RGB与IR数据集
-    type='ConcatDataset',
-    datasets=[labeled_dataset_rgb, labeled_dataset_ir])
+# labeled_dataset = dict(  # 组合仿真RGB与IR数据集
+#     type='ConcatDataset',
+#     datasets=[labeled_dataset_rgb, labeled_dataset_ir])
+
+labeled_dataset = labeled_dataset_rgb  # 仅使用仿真RGB数据集进行训练
+
 unlabeled_dataset = dict(  # 定义无标注目标域数据集
     type=dataset_type,  # 使用 COCO 数据集类
     data_root=data_root,  # 指定数据根目录

@@ -5,14 +5,7 @@ default_hooks = dict(
     param_scheduler=dict(type='ParamSchedulerHook'),
     checkpoint=dict(type='CheckpointHook', interval=1000, by_epoch=False,
                     max_keep_ckpts=1, save_best=['teacher/coco/bbox_mAP_50', 'student/coco/bbox_mAP_50']),
-    # checkpoint=dict(
-    #     type='CheckpointHook',
-    #     interval=1000,
-    #     by_epoch=False,
-    #     max_keep_ckpts=1,
-    #     # 域适配阶段的验证指标字典在某些迭代中可能缺少教师侧的键，
-    #     # 仅依据学生模型的 bbox_mAP_50 选择最佳权重以避免 KeyError。
-    #     save_best='student/coco/bbox_mAP_50'),    
+                    
     sampler_seed=dict(type='DistSamplerSeedHook'),
         visualization=dict(
         type='DetVisualizationHook',

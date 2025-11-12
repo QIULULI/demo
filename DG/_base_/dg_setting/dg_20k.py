@@ -34,17 +34,17 @@ log_processor = dict(type='LogProcessor', window_size=50, by_epoch=False)
 log_level = 'INFO'
 load_from = None
 resume = False
-train_cfg = dict(type='IterBasedTrainLoop', max_iters=5000, val_interval=1000) # max_iters=20000
+train_cfg = dict(type='IterBasedTrainLoop', max_iters=20000, val_interval=1000) # max_iters=20000
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 param_scheduler = [
-    dict(type='LinearLR', start_factor=0.001, by_epoch=False, begin=0, end=125), # todo 500 warmup
+    dict(type='LinearLR', start_factor=0.001, by_epoch=False, begin=0, end=500), # todo 500 warmup
     dict(
         type='MultiStepLR',
         begin=0,
-        end=5000,
+        end=20000,
         by_epoch=False,
-        milestones=[4500],#[3000, 4500], #18000
+        milestones=[18000],#[3000, 4500], #18000
         gamma=0.1)
 ]
 
