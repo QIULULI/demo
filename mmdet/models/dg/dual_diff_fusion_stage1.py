@@ -283,8 +283,8 @@ class DualDiffFusionStage1(BaseDetector):  # 定义第一阶段红外-可见光�
         self.local_iter += 1  # 自增内部迭代计数以支持交叉蒸馏预热
         return losses  # 返回完整的损失字典
 
-    def predict(self, batch_inputs: Tensor, batch_data_samples: SampleList, rescale: bool = True) -> SampleList:  # 推理接口直接委托学生模型
-        return self.student_rgb.predict(batch_inputs, batch_data_samples, rescale=rescale)  # 复用学生模型预测逻辑确保部署一致
+    def predict(self, batch_inputs: Tensor, batch_data_samples: SampleList, rescale: bool = True, return_feature: bool = False) -> SampleList:  # 推理接口直接委托学生模型
+        return self.student_rgb.predict(batch_inputs, batch_data_samples, rescale=rescale, return_feature=return_feature)  # 复用学生模型预测逻辑确保部署一致
 
     def _forward(self, batch_inputs: Tensor, batch_data_samples: SampleList) -> Tuple:  # 定义前向推理接口以适配MMEngine导出
         return self.student_rgb._forward(batch_inputs, batch_data_samples)  # 直接复用学生模型的前向实现
