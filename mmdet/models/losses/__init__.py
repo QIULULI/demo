@@ -26,6 +26,7 @@ from .utils import reduce_loss, weight_reduce_loss, weighted_loss
 from .varifocal_loss import VarifocalLoss
 from .kd_loss import KDLoss
 from .cross_kd_loss import KnowledgeDistillationKLDivLoss
+from .ssdc_losses import LossCouple, LossDecouple  # 导入SSDC相关损失类
 
 __all__ = [
     'accuracy', 'Accuracy', 'cross_entropy', 'binary_cross_entropy',
@@ -39,5 +40,7 @@ __all__ = [
     'QualityFocalLoss', 'DistributionFocalLoss', 'VarifocalLoss',
     'SeesawLoss', 'DiceLoss', 'EQLV2Loss',
     'MarginL2Loss', 'MultiPosCrossEntropyLoss', 'L2Loss', 'TripletLoss',
-    'DDQAuxLoss', 'CrossEntropyCustomLoss', 'FocalCustomLoss', 'KDLoss', 'KnowledgeDistillationKLDivLoss'
+    'DDQAuxLoss', 'CrossEntropyCustomLoss', 'FocalCustomLoss', 'KDLoss', 'KnowledgeDistillationKLDivLoss',
+    'LossDecouple',  # SSDC幂等分离损失导出
+    'LossCouple'  # SSDC耦合损失导出
 ]
