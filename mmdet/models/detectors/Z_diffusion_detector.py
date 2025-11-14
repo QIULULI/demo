@@ -10,6 +10,7 @@ from mmdet.models.utils import (rename_loss_dict,
                                 reweight_loss_dict)
 from mmdet.structures.bbox import bbox2roi
 from ..utils import unpack_gt_instances
+from mmdet.models.ssdc import SAIDFilterBank, SSDCouplingNeck  # 导入SS-DC相关模块用于特征解耦与耦合
 
 
 from mmdet.registry import MODELS
@@ -98,8 +99,60 @@ class DiffusionDetector(BaseDetector):
         self.loss_reg_kd = MODELS.build(self.auxiliary_branch_cfg['loss_reg_kd'])
         self.apply_auxiliary_branch = self.auxiliary_branch_cfg['apply_auxiliary_branch']
         
-        self.loss_feature = KDLoss(loss_weight=1.0, loss_type='mse')
-        
+        self.loss_feature = KDLoss(loss_weight=1.0, loss_type='mse')  # 初始化特征蒸馏损失用于辅助训练
+
+        self.enable_ssdc = False  # 初始化标志位默认关闭光谱空间解耦模块
+        self.use_ds_tokens = False  # 初始化是否启用域特异令牌的标志位
+        self.said_filter = None  # 初始化SAID滤波器引用占位以便条件构建
+        self.coupling_neck = None  # 初始化耦合颈部引用占位以便条件构建
+        self.ssdc_feature_cache = {}  # 初始化缓存字典用于保存最近一次的SS-DC特征
+        ssdc_cfg = {}  # 初始化SS-DC配置字典收集不同来源的参数
+        backbone_enable_ssdc = False  # 初始化来自骨干网络配置的开关标志
+        if isinstance(backbone, dict):  # 若骨干配置为字典则读取SS-DC相关配置
+            ssdc_cfg = copy.deepcopy(backbone.get('ssdc_cfg', {}))  # 从骨干配置中提取SS-DC子配置并深拷贝避免原地修改
+            backbone_enable_ssdc = backbone.get('enable_ssdc', False)  # 读取骨干配置中的SS-DC开关默认关闭
+        train_cfg_enable_ssdc = False  # 初始化来自训练配置的开关标志
+        ssdc_cfg_from_train = None  # 初始化训练阶段提供的SS-DC配置占位
+        if train_cfg is not None:  # 当训练配置存在时尝试读取附加配置
+            if hasattr(train_cfg, 'get'):  # 当训练配置实现get方法时优先使用字典式访问
+                train_cfg_enable_ssdc = train_cfg.get('enable_ssdc', False)  # 读取训练配置中的SS-DC开关默认关闭
+                ssdc_cfg_from_train = train_cfg.get('ssdc_cfg', None)  # 读取训练配置中的SS-DC详细参数若未提供则为空
+            else:  # 当训练配置不支持get方法时使用属性访问回退
+                train_cfg_enable_ssdc = getattr(train_cfg, 'enable_ssdc', False)  # 通过属性访问获取SS-DC开关默认False
+                ssdc_cfg_from_train = getattr(train_cfg, 'ssdc_cfg', None)  # 通过属性访问获取SS-DC配置默认None
+        if isinstance(ssdc_cfg_from_train, dict):  # 若训练配置提供了字典形式的SS-DC参数则合并到最终配置中
+            ssdc_cfg.update(copy.deepcopy(ssdc_cfg_from_train))  # 使用深拷贝合并训练阶段覆盖的SS-DC参数
+        enable_flags = (  # 组合多个来源的开关标志
+            backbone_enable_ssdc,  # 来自骨干配置的开关标志
+            train_cfg_enable_ssdc,  # 来自训练配置的开关标志
+            ssdc_cfg.get('enable_ssdc', False),  # 来自SS-DC配置自身的开关标志
+        )
+        self.enable_ssdc = any(enable_flags)  # 只要任一来源开启则启用SS-DC
+        if self.enable_ssdc:  # 当确定启用SS-DC时实例化对应模块
+            said_cfg = copy.deepcopy(ssdc_cfg.get('said_filter', {}))  # 深拷贝SAID滤波器子配置避免副作用
+            if said_cfg and 'type' in said_cfg:  # 若提供了类型字段则通过注册表动态构建
+                self.said_filter = MODELS.build(said_cfg)  # 使用注册表根据配置构建SAID滤波器模块
+            else:  # 若未提供类型字段则直接实例化默认实现
+                self.said_filter = SAIDFilterBank(**said_cfg)  # 以关键字参数构建SAID滤波器模块使用合理默认值
+            coupling_cfg = copy.deepcopy(ssdc_cfg.get('coupling_neck', {}))  # 深拷贝耦合颈部配置以便修改默认参数
+            inferred_channels = None  # 初始化根据现有网络推断的通道数占位
+            if self.with_neck and hasattr(self.neck, 'out_channels'):  # 若存在颈部且暴露输出通道则直接采用
+                inferred_channels = self.neck.out_channels  # 记录从颈部推断得到的通道数
+            elif hasattr(self.backbone, 'out_channels'):  # 若颈部不可用则尝试从骨干网络读取通道数
+                inferred_channels = self.backbone.out_channels  # 使用骨干输出通道作为耦合模块的输入维度
+            has_custom_channels = (  # 初始化标志用于判断配置是否提供自定义输入通道
+                'in_channels' in coupling_cfg  # 检查配置字典是否包含输入通道键
+                and coupling_cfg.get('in_channels') is not None  # 确认提供的输入通道值有效
+            )
+            if not has_custom_channels:  # 当配置未显式提供输入通道时设置默认值
+                default_channels = inferred_channels if inferred_channels is not None else 256  # 优先使用推断通道否则采用常见默认256
+                coupling_cfg['in_channels'] = default_channels  # 将确定的通道数写入耦合配置供构造函数使用
+            if coupling_cfg and 'type' in coupling_cfg:  # 若配置中包含类型字段则通过注册表构建
+                self.coupling_neck = MODELS.build(coupling_cfg)  # 使用注册表构建耦合颈部模块以支持灵活替换
+            else:  # 否则直接实例化默认实现
+                self.coupling_neck = SSDCouplingNeck(**coupling_cfg)  # 以关键字参数构建耦合颈部模块使用合理默认值
+            self.use_ds_tokens = bool(coupling_cfg.get('use_ds_tokens', False))  # 读取配置中是否启用域特异令牌的标志
+
         self.class_maps = backbone['diff_config']['classes']
 
     def _load_from_state_dict(self, state_dict: dict, prefix: str,
@@ -152,6 +205,29 @@ class DiffusionDetector(BaseDetector):
             x = self.backbone(batch_inputs)
         if self.with_neck:
             x = self.neck(x)
+        storage_key = 'ref' if (ref_masks is not None and ref_labels is not None) else 'noref'  # 根据参考信息选择缓存键
+        features = tuple(x) if not isinstance(x, tuple) else x  # 将特征转换为元组以保证后续处理接口稳定
+        if self.enable_ssdc and self.said_filter is not None and self.coupling_neck is not None:  # 启用SS-DC时执行解耦与耦合
+            f_inv_list, f_ds_list = self.said_filter(features)  # 调用SAID滤波器获取域不变与域特异特征列表
+            coupled_feats, ssdc_stats = self.coupling_neck(features, f_inv_list, f_ds_list)  # 将解耦特征送入耦合颈部融合并返回统计量
+            coupled_tuple = tuple(coupled_feats)  # 将融合后的特征转换为元组以符合检测头输入要求
+            self.ssdc_feature_cache[storage_key] = {  # 为当前分支缓存SS-DC相关特征供损失计算
+                'raw': features,  # 缓存原始未耦合的FPN特征
+                'inv': tuple(f_inv_list),  # 缓存域不变特征列表
+                'ds': tuple(f_ds_list),  # 缓存域特异特征列表
+                'coupled': coupled_tuple,  # 缓存耦合后的特征结果
+                'stats': ssdc_stats,  # 缓存耦合过程的统计信息如域特异占比
+            }  # 完成缓存字典的构造
+            x = coupled_tuple  # 将耦合结果作为后续检测模块输入
+        else:  # 当未启用SS-DC或模块未构建时直接返回原始特征
+            self.ssdc_feature_cache[storage_key] = {  # 缓存基础特征以保持接口一致
+                'raw': features,  # 缓存原始FPN特征
+                'inv': None,  # 占位符表明未计算域不变特征
+                'ds': None,  # 占位符表明未计算域特异特征
+                'coupled': features,  # 将原始特征视作耦合结果保持一致性
+                'stats': None,  # 占位符表明无附加统计量
+            }  # 完成基础缓存的构造
+            x = features  # 将原始特征作为输出
         return x
 
     def _forward(self, batch_inputs: Tensor,
