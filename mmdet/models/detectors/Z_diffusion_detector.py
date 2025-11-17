@@ -333,6 +333,7 @@ class DiffusionDetector(BaseDetector):
             tuple: A tuple of features from ``rpn_head`` and ``roi_head``
             forward.
         """
+        self.ssdc_feature_cache.clear()  # 在正式前向推理前清空SS-DC特征缓存以防止跨调用残留影响当前特征流
         results = ()
         x = self.extract_feat(batch_inputs)
 
@@ -647,9 +648,10 @@ class DiffusionDetector(BaseDetector):
                 - bboxes (Tensor): Has a shape (num_instances, 4),
                     the last dimension 4 arrange as (x1, y1, x2, y2).
                 - masks (Tensor): Has a shape (num_instances, H, W).
-        """
+            """
 
         assert self.with_bbox, 'Bbox head must be implemented.'
+        self.ssdc_feature_cache.clear()  # 在推理阶段开始时清空SS-DC缓存避免训练阶段遗留数据干扰预测
         x = self.extract_feat(batch_inputs)
         # If there are no pre-defined proposals, use RPN to get proposals
         if batch_data_samples[0].get('proposals', None) is None:
