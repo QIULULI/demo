@@ -365,6 +365,10 @@ class DiffusionDetector(BaseDetector):
             dict: A dictionary of loss components
         """
 
+        # 在每次计算损失前清空SS-DC特征缓存以避免跨batch残留导致错误配对
+        ###########################################################################
+        self.ssdc_feature_cache.clear()
+
         # Extract feature with mask input
         ###########################################################################
         if self.apply_auxiliary_branch:
@@ -375,6 +379,10 @@ class DiffusionDetector(BaseDetector):
         ###########################################################################
         else:
             x_wo_ref = self.extract_feat(batch_inputs)
+            # 当未启用辅助分支时复制无参考分支的SS-DC缓存为参考分支防止后续读取缺失
+            #######################################################################
+            if 'noref' in self.ssdc_feature_cache:
+                self.ssdc_feature_cache['ref'] = copy.deepcopy(self.ssdc_feature_cache['noref'])
             x_w_ref = x_wo_ref  # 当未启用辅助分支时将参考分支特征指向主分支特征以避免后续引用未定义
 
         losses = dict()
