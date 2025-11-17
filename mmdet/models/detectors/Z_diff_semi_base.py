@@ -439,59 +439,76 @@ class SemiBaseDiffDetector(BaseDetector):
         student_map = student_inv[0]  # 中文注释：学生端同样使用首层
         if teacher_map is None or student_map is None:  # 中文注释：首层缺失则跳过
             return  # 中文注释：保持伪标签
-        # 中文注释：构建ROIAlign所需的ROI列表，格式为(batch_idx, x1, y1, x2, y2)
-        teacher_rois = []  # 中文注释：初始化教师ROI列表
-        for batch_idx, sample in enumerate(teacher_pseudo_samples):  # 中文注释：遍历每个教师样本
-            if hasattr(sample, 'gt_instances') and sample.gt_instances is not None and sample.gt_instances.bboxes.numel() > 0:  # 中文注释：确保伪标签存在
-                boxes = sample.gt_instances.bboxes  # 中文注释：读取教师伪框
-                batch_indices = torch.full((boxes.shape[0], 1), batch_idx, device=boxes.device)  # 中文注释：生成批次索引
-                teacher_rois.append(torch.cat([batch_indices, boxes], dim=1))  # 中文注释：拼接形成ROI描述
-        student_rois = []  # 中文注释：初始化学生ROI列表
-        for batch_idx, sample in enumerate(student_pseudo_samples):  # 中文注释：遍历学生伪标签
-            if hasattr(sample, 'gt_instances') and sample.gt_instances is not None and sample.gt_instances.bboxes.numel() > 0:  # 中文注释：确保伪标签存在
-                boxes = sample.gt_instances.bboxes  # 中文注释：读取学生伪框
-                batch_indices = torch.full((boxes.shape[0], 1), batch_idx, device=boxes.device)  # 中文注释：生成批次索引
-                student_rois.append(torch.cat([batch_indices, boxes], dim=1))  # 中文注释：拼接ROI
-        if not teacher_rois or not student_rois:  # 中文注释：若任一分支无ROI则跳过过滤
-            return  # 中文注释：保持伪标签
-        teacher_rois = torch.cat(teacher_rois, dim=0)  # 中文注释：合并教师所有ROI
-        student_rois = torch.cat(student_rois, dim=0)  # 中文注释：合并学生所有ROI
-        if teacher_rois.shape[0] != student_rois.shape[0]:  # 中文注释：若ROI数量不一致无法逐一对齐
-            min_rois = min(teacher_rois.shape[0], student_rois.shape[0])  # 中文注释：取最小数量保持对应关系
-            teacher_rois = teacher_rois[:min_rois]  # 中文注释：截断教师ROI
-            student_rois = student_rois[:min_rois]  # 中文注释：截断学生ROI
-        teacher_scale = float(teacher_map.shape[-1]) / float(teacher_inputs.shape[-1]) if teacher_inputs.shape[-1] > 0 else 1.0  # 中文注释：根据特征图与输入尺寸计算教师的空间缩放比
-        student_scale = float(student_map.shape[-1]) / float(student_inputs.shape[-1]) if student_inputs.shape[-1] > 0 else 1.0  # 中文注释：根据特征图与输入尺寸计算学生的空间缩放比
-        pooled_teacher = roi_align(teacher_map, teacher_rois, output_size=1, spatial_scale=teacher_scale, aligned=True)  # 中文注释：使用正确缩放在教师特征图上对齐采样
-        pooled_student = roi_align(student_map, student_rois, output_size=1, spatial_scale=student_scale, aligned=True)  # 中文注释：使用对应缩放在学生特征图上对齐采样
-        pooled_teacher = pooled_teacher.flatten(1)  # 中文注释：拉平为(N, C)
-        pooled_student = pooled_student.flatten(1)  # 中文注释：拉平为(N, C)
-        teacher_norm = F.normalize(pooled_teacher, dim=1)  # 中文注释：对教师特征做L2归一化
-        student_norm = F.normalize(pooled_student, dim=1)  # 中文注释：对学生特征做L2归一化
-        cosine_scores = (teacher_norm * student_norm).sum(dim=1)  # 中文注释：计算逐实例余弦相似度
-        keep_mask = cosine_scores >= tau_value  # 中文注释：生成保留掩码
-        if keep_mask.all():  # 中文注释：全部通过阈值则无需修改
-            return  # 中文注释：保持伪标签
-        # 中文注释：按照掩码过滤学生端伪标签实例
-        filtered_samples = []  # 中文注释：准备过滤后的样本列表
-        start_idx = 0  # 中文注释：初始化实例起始指针
-        for sample in student_pseudo_samples:  # 中文注释：逐样本处理
-            if not hasattr(sample, 'gt_instances') or sample.gt_instances is None:  # 中文注释：无伪标签的样本直接加入
-                filtered_samples.append(sample)  # 中文注释：保持原样
-                continue  # 中文注释：处理下一样本
-            num_instance = sample.gt_instances.bboxes.shape[0]  # 中文注释：统计当前样本伪标签数量
-            if num_instance == 0:  # 中文注释：无伪标签直接保留
-                filtered_samples.append(sample)  # 中文注释：追加到结果
-                continue  # 中文注释：处理下一样本
-            end_idx = start_idx + num_instance  # 中文注释：计算当前样本对应的掩码区间
-            sample_mask = keep_mask[start_idx:end_idx]  # 中文注释：提取当前样本的保留掩码
-            start_idx = end_idx  # 中文注释：更新指针
-            if sample_mask.any():  # 中文注释：当存在保留实例时
-                sample.gt_instances = sample.gt_instances[sample_mask]  # 中文注释：根据掩码筛选伪标签
-            else:  # 中文注释：若全部被过滤
-                sample.gt_instances = sample.gt_instances[:0]  # 中文注释：清空实例保持结构
-            filtered_samples.append(sample)  # 中文注释：将更新后的样本加入结果列表
-        student_pseudo_samples[:] = filtered_samples  # 中文注释：就地替换学生伪标签列表
+        if teacher_inputs.shape[-1] > 0:  # 中文注释：当输入宽度大于0时计算教师缩放比
+            teacher_scale = float(teacher_map.shape[-1]) / float(teacher_inputs.shape[-1])  # 中文注释：用特征图宽度除以输入宽度得到缩放系数
+        else:  # 中文注释：输入宽度异常时退回默认缩放比
+            teacher_scale = 1.0  # 中文注释：默认缩放比为1避免除零
+        if student_inputs.shape[-1] > 0:  # 中文注释：当学生输入宽度有效时计算学生缩放比
+            student_scale = float(student_map.shape[-1]) / float(student_inputs.shape[-1])  # 中文注释：用学生特征图宽度除以输入宽度得到缩放
+        else:  # 中文注释：学生输入宽度异常时
+            student_scale = 1.0  # 中文注释：默认缩放比防止除零
+        filtered_samples = []  # 中文注释：准备过滤后的学生伪标签列表
+        for batch_idx in range(len(student_pseudo_samples)):  # 中文注释：逐个batch索引独立处理
+            teacher_sample = (teacher_pseudo_samples[batch_idx]  # 中文注释：当索引合法时取出教师样本
+                              if batch_idx < len(teacher_pseudo_samples)  # 中文注释：确保索引不会越界
+                              else None)  # 中文注释：否则返回空以跳过过滤
+            student_sample = student_pseudo_samples[batch_idx]  # 中文注释：获取当前学生样本
+            if teacher_sample is None:  # 中文注释：若不存在对应的教师样本则直接保留
+                filtered_samples.append(student_sample)  # 中文注释：直接加入结果列表
+                continue  # 中文注释：处理下一个样本
+            if not hasattr(teacher_sample, 'gt_instances') or teacher_sample.gt_instances is None:  # 中文注释：教师缺少伪标签时跳过过滤
+                filtered_samples.append(student_sample)  # 中文注释：直接加入结果
+                continue  # 中文注释：继续后续样本
+            if not hasattr(student_sample, 'gt_instances') or student_sample.gt_instances is None:  # 中文注释：学生缺少伪标签时无需过滤
+                filtered_samples.append(student_sample)  # 中文注释：直接加入结果
+                continue  # 中文注释：继续后续处理
+            teacher_boxes = teacher_sample.gt_instances.bboxes  # 中文注释：读取教师伪框坐标
+            student_boxes = student_sample.gt_instances.bboxes  # 中文注释：读取学生伪框坐标
+            if teacher_boxes.numel() == 0 or student_boxes.numel() == 0:  # 中文注释：若任一侧无框则不做相似度过滤
+                filtered_samples.append(student_sample)  # 中文注释：直接加入结果列表
+                continue  # 中文注释：继续处理下一个样本
+            if teacher_boxes.shape[0] == student_boxes.shape[0]:  # 中文注释：当教师与学生框数量一致时按索引对齐
+                matched_teacher_boxes = teacher_boxes  # 中文注释：直接使用教师框序列
+                matched_student_boxes = student_boxes  # 中文注释：直接使用学生框序列
+                matched_mask = torch.ones(  # 中文注释：创建匹配掩码张量
+                    student_boxes.shape[0], dtype=torch.bool, device=student_boxes.device)  # 中文注释：默认全保留便于后续覆盖
+            else:  # 中文注释：数量不一致时使用IoU进行匹配
+                iou_matrix = bbox_overlaps(teacher_boxes, student_boxes, mode='iou')  # 中文注释：计算教师与学生框的IoU矩阵
+                best_iou, best_teacher_idx = iou_matrix.max(dim=0)  # 中文注释：对每个学生框选择最佳教师框及其IoU
+                matched_mask = best_iou > 0  # 中文注释：仅保留存在重叠的学生框参与过滤
+                if not matched_mask.any():  # 中文注释：若无任何有效匹配则直接跳过过滤
+                    filtered_samples.append(student_sample)  # 中文注释：保持学生伪标签
+                    continue  # 中文注释：进入下一张图像
+                matched_teacher_boxes = teacher_boxes[best_teacher_idx[matched_mask]]  # 中文注释：根据匹配索引提取对应教师框
+                matched_student_boxes = student_boxes[matched_mask]  # 中文注释：提取参与匹配的学生框
+            teacher_batch_index = torch.full(  # 中文注释：构造教师ROI对应的批次索引列
+                (matched_teacher_boxes.shape[0], 1), batch_idx, device=matched_teacher_boxes.device)  # 中文注释：批次索引用于对齐
+            teacher_roi = torch.cat([teacher_batch_index, matched_teacher_boxes], dim=1)  # 中文注释：拼接索引与教师框形成ROI
+            student_batch_index = torch.full(  # 中文注释：构造学生ROI对应的批次索引列
+                (matched_student_boxes.shape[0], 1), batch_idx, device=matched_student_boxes.device)  # 中文注释：批次索引用于对齐
+            student_roi = torch.cat([student_batch_index, matched_student_boxes], dim=1)  # 中文注释：拼接索引与学生框形成ROI
+            pooled_teacher = roi_align(  # 中文注释：在教师特征图上对齐当前样本ROI
+                teacher_map, teacher_roi, output_size=1, spatial_scale=teacher_scale, aligned=True)  # 中文注释：采样得到教师ROI特征
+            pooled_student = roi_align(  # 中文注释：在学生特征图上对齐当前样本ROI
+                student_map, student_roi, output_size=1, spatial_scale=student_scale, aligned=True)  # 中文注释：采样得到学生ROI特征
+            pooled_teacher = pooled_teacher.flatten(1)  # 中文注释：将教师对齐结果展平为(N, C)
+            pooled_student = pooled_student.flatten(1)  # 中文注释：将学生对齐结果展平为(N, C)
+            teacher_norm = F.normalize(pooled_teacher, dim=1)  # 中文注释：教师特征进行L2归一化
+            student_norm = F.normalize(pooled_student, dim=1)  # 中文注释：学生特征进行L2归一化
+            cosine_scores = (teacher_norm * student_norm).sum(dim=1)  # 中文注释：计算匹配框对的余弦相似度
+            sample_keep_mask = torch.ones(  # 中文注释：初始化当前样本的保留掩码默认全部保留
+                student_boxes.shape[0], dtype=torch.bool, device=student_boxes.device)  # 中文注释：使用与学生框相同设备与数据类型
+            if matched_mask.any():  # 中文注释：当存在有效匹配时才更新阈值掩码
+                sample_keep_mask[matched_mask] = cosine_scores >= tau_value  # 中文注释：将匹配到的学生框按相似度阈值过滤
+            if sample_keep_mask.all():  # 中文注释：若所有伪框均被保留则无需修改
+                filtered_samples.append(student_sample)  # 中文注释：直接加入结果
+                continue  # 中文注释：继续处理下一样本
+            if sample_keep_mask.any():  # 中文注释：存在部分保留时应用掩码
+                student_sample.gt_instances = student_sample.gt_instances[sample_keep_mask]  # 中文注释：按掩码筛选学生伪标签实例
+            else:  # 中文注释：当全部被过滤时
+                student_sample.gt_instances = student_sample.gt_instances[:0]  # 中文注释：清空伪标签保持结构完整
+            filtered_samples.append(student_sample)  # 中文注释：将更新后的样本追加到列表
+        student_pseudo_samples[:] = filtered_samples  # 中文注释：用过滤后的结果替换原学生伪标签列表
 
     @torch.no_grad()
     def get_pseudo_instances(
