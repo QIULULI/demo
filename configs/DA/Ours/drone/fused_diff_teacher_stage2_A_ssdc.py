@@ -1,8 +1,9 @@
 # 中文注释：Stage-2 UDA配置，融合扩散教师并启用SS-DC模块
+# 中文注释：引用Stage-1基础配置（扩散引导UDA、20k半监督日程与Sim→Real无人机数据集），相对路径需从当前文件起算
 _base_ = [
-    '../../../DA/_base_/models/diffusion_guided_adaptation_faster_rcnn_r101_fpn.py',  # 中文注释：基础检测与扩散蒸馏结构
-    '../../../DA/_base_/da_setting/semi_20k.py',  # 中文注释：20k迭代的半监督训练调度
-    '../../../DA/_base_/datasets/sim_to_real/semi_drone_rgb_aug.py'  # 中文注释：Sim->Real无人机数据集配置（含增强）
+    '../../../../DA/_base_/models/diffusion_guided_adaptation_faster_rcnn_r101_fpn.py',  # 中文注释：基础检测与扩散蒸馏结构（实际存在的Stage-1模型配置）
+    '../../../../DA/_base_/da_setting/semi_20k.py',  # 中文注释：20k迭代的半监督训练调度（实际存在的Stage-1训练日程）
+    '../../../../DA/_base_/datasets/sim_to_real/semi_drone_rgb_aug.py'  # 中文注释：Sim→Real无人机数据集配置（实际存在的Stage-1数据设置）
 ]
 
 # 中文注释：读取基础模型配置并覆盖关键字段
