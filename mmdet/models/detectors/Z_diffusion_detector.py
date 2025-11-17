@@ -227,7 +227,12 @@ class DiffusionDetector(BaseDetector):
         if self.with_neck:
             x = self.neck(x)
         storage_key = 'ref' if (ref_masks is not None and ref_labels is not None) else 'noref'  # 根据参考信息选择缓存键
-        features = tuple(x) if not isinstance(x, tuple) else x  # 将特征转换为元组以保证后续处理接口稳定
+        if isinstance(x, tuple):  # 当颈部或骨干直接返回元组特征时直接沿用保持结构不变
+            features = x  # 记录元组特征供后续SS-DC与检测头使用
+        elif isinstance(x, list):  # 当返回列表特征时转换为元组以保证接口一致性
+            features = tuple(x)  # 将列表转换为元组避免后续修改影响缓存内容
+        else:  # 当返回单个Tensor时包装为单元素元组以兼容多层特征接口
+            features = (x,)  # 将单层特征封装为元组便于统一处理
         if self.enable_ssdc and self.said_filter is not None and self.coupling_neck is not None:  # 启用SS-DC时执行解耦与耦合
             f_inv_list, f_ds_list = self.said_filter(features)  # 调用SAID滤波器获取域不变与域特异特征列表
             coupled_feats, ssdc_stats = self.coupling_neck(features, f_inv_list, f_ds_list)  # 将解耦特征送入耦合颈部融合并返回统计量
