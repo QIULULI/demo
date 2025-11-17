@@ -375,6 +375,7 @@ class DiffusionDetector(BaseDetector):
         ###########################################################################
         else:
             x_wo_ref = self.extract_feat(batch_inputs)
+            x_w_ref = x_wo_ref  # 当未启用辅助分支时将参考分支特征指向主分支特征以避免后续引用未定义
 
         losses = dict()
 
