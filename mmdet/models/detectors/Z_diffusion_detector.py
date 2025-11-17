@@ -129,12 +129,33 @@ class DiffusionDetector(BaseDetector):
         )
         self.enable_ssdc = any(enable_flags)  # 只要任一来源开启则启用SS-DC
         if self.enable_ssdc:  # 当确定启用SS-DC时实例化对应模块
-            said_cfg = copy.deepcopy(ssdc_cfg.get('said_filter', {}))  # 深拷贝SAID滤波器子配置避免副作用
+            said_cfg_ref = ssdc_cfg.setdefault('said_filter', {})  # 初始化或获取SAID滤波器配置以便写入层级标签
+            coupling_cfg_ref = ssdc_cfg.setdefault('coupling_neck', {})  # 初始化或获取耦合颈部配置以便写入层级标签
+            has_neck = hasattr(self, 'neck')  # 记录是否存在颈部模块以便后续判断
+            neck_level_count = getattr(self.neck, 'num_outs', None) if has_neck else None  # 依据颈部输出层数预估特征层数量
+            num_feature_levels = neck_level_count if isinstance(neck_level_count, int) else None  # 若颈部给出整数层数则直接采用
+            if num_feature_levels is None:  # 当颈部未提供层数时回退到配置推断
+                preset_levels = coupling_cfg_ref.get('levels') or said_cfg_ref.get('levels')  # 优先读取配置中可能存在的层级列表
+                if isinstance(preset_levels, (list, tuple)):  # 若读到合法列表则使用其长度
+                    num_feature_levels = len(preset_levels)  # 使用配置层级长度作为特征层数量
+            if num_feature_levels is None:  # 若仍未确定层数则尝试根据通道序列推断
+                in_channels_cfg = coupling_cfg_ref.get('in_channels')  # 读取耦合颈部输入通道字段
+                if isinstance(in_channels_cfg, (list, tuple)):  # 当输入通道为序列时可借助其长度
+                    num_feature_levels = len(in_channels_cfg)  # 以输入通道序列长度作为特征层数量
+            if num_feature_levels is None:  # 若经过所有推断仍无结果则回退至常见的四层结构
+                num_feature_levels = 4  # 采用默认四层确保后续逻辑能够继续执行
+            start_level = coupling_cfg_ref.get('start_level', said_cfg_ref.get('start_level', 2))  # 读取层级起始索引默认从P2开始
+            level_prefix = coupling_cfg_ref.get('level_prefix', said_cfg_ref.get('level_prefix', 'P'))  # 读取层级前缀默认使用P
+            levels = [f'{level_prefix}{start_level + idx}' for idx in range(num_feature_levels)]  # 根据推断数量依次生成层级名称列表
+            said_cfg_ref['levels'] = levels  # 将统一生成的层级列表写入SAID滤波器配置确保与特征数量匹配
+            coupling_cfg_ref['levels'] = levels  # 将统一生成的层级列表写入耦合颈部配置确保内部模块一致
+            coupling_cfg_ref['num_feature_levels'] = num_feature_levels  # 将推断得到的特征层数写入耦合颈部配置供模块校验
+            said_cfg = copy.deepcopy(said_cfg_ref)  # 深拷贝SAID滤波器子配置避免副作用
             if said_cfg and 'type' in said_cfg:  # 若提供了类型字段则通过注册表动态构建
                 self.said_filter = MODELS.build(said_cfg)  # 使用注册表根据配置构建SAID滤波器模块
             else:  # 若未提供类型字段则直接实例化默认实现
                 self.said_filter = SAIDFilterBank(**said_cfg)  # 以关键字参数构建SAID滤波器模块使用合理默认值
-            coupling_cfg = copy.deepcopy(ssdc_cfg.get('coupling_neck', {}))  # 深拷贝耦合颈部配置以便修改默认参数
+            coupling_cfg = copy.deepcopy(coupling_cfg_ref)  # 深拷贝耦合颈部配置以便修改默认参数
             inferred_channels = None  # 初始化根据现有网络推断的通道数占位
             if self.with_neck and hasattr(self.neck, 'out_channels'):  # 若存在颈部且暴露输出通道则直接采用
                 inferred_channels = self.neck.out_channels  # 记录从颈部推断得到的通道数
