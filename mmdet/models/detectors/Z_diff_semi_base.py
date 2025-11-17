@@ -420,10 +420,12 @@ class SemiBaseDiffDetector(BaseDetector):
         teacher_inv = None  # 中文注释：初始化教师域不变特征占位符
         student_inv = None  # 中文注释：初始化学生域不变特征占位符
         if hasattr(self.teacher, 'extract_feat'):  # 中文注释：确保教师模型支持特征提取
+            getattr(self.teacher, 'ssdc_feature_cache', {}).clear()  # 中文注释：在提取前清空缓存避免跨batch残留影响本次相似度
             _ = self.teacher.extract_feat(teacher_inputs)  # 中文注释：运行一次前向以填充SS-DC缓存
             teacher_cache = getattr(self.teacher, 'ssdc_feature_cache', {}).get('noref', {})  # 中文注释：读取教师缓存
             teacher_inv = teacher_cache.get('inv')  # 中文注释：获取域不变特征
         if hasattr(self.student, 'extract_feat'):  # 中文注释：确保学生模型支持特征提取
+            getattr(self.student, 'ssdc_feature_cache', {}).clear()  # 中文注释：同样清空学生缓存以保证当前迭代使用的特征最新
             _ = self.student.extract_feat(student_inputs)  # 中文注释：运行学生前向以填充缓存但不求梯度
             student_cache = getattr(self.student, 'ssdc_feature_cache', {}).get('noref', {})  # 中文注释：读取学生缓存
             student_inv = student_cache.get('inv')  # 中文注释：获取学生域不变特征
@@ -458,8 +460,10 @@ class SemiBaseDiffDetector(BaseDetector):
             min_rois = min(teacher_rois.shape[0], student_rois.shape[0])  # 中文注释：取最小数量保持对应关系
             teacher_rois = teacher_rois[:min_rois]  # 中文注释：截断教师ROI
             student_rois = student_rois[:min_rois]  # 中文注释：截断学生ROI
-        pooled_teacher = roi_align(teacher_map, teacher_rois, output_size=1, spatial_scale=1.0, aligned=True)  # 中文注释：在教师特征图上对齐采样
-        pooled_student = roi_align(student_map, student_rois, output_size=1, spatial_scale=1.0, aligned=True)  # 中文注释：在学生特征图上对齐采样
+        teacher_scale = float(teacher_map.shape[-1]) / float(teacher_inputs.shape[-1]) if teacher_inputs.shape[-1] > 0 else 1.0  # 中文注释：根据特征图与输入尺寸计算教师的空间缩放比
+        student_scale = float(student_map.shape[-1]) / float(student_inputs.shape[-1]) if student_inputs.shape[-1] > 0 else 1.0  # 中文注释：根据特征图与输入尺寸计算学生的空间缩放比
+        pooled_teacher = roi_align(teacher_map, teacher_rois, output_size=1, spatial_scale=teacher_scale, aligned=True)  # 中文注释：使用正确缩放在教师特征图上对齐采样
+        pooled_student = roi_align(student_map, student_rois, output_size=1, spatial_scale=student_scale, aligned=True)  # 中文注释：使用对应缩放在学生特征图上对齐采样
         pooled_teacher = pooled_teacher.flatten(1)  # 中文注释：拉平为(N, C)
         pooled_student = pooled_student.flatten(1)  # 中文注释：拉平为(N, C)
         teacher_norm = F.normalize(pooled_teacher, dim=1)  # 中文注释：对教师特征做L2归一化
