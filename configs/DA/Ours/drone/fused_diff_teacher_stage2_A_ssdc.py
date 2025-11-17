@@ -7,6 +7,7 @@ _base_ = [
 
 # 中文注释：读取基础模型配置并覆盖关键字段
 detector = _base_.model  # 中文注释：从基础配置中取得模型字典
+classes = ('drone',)  # 中文注释：显式声明类别元组方便下游组件复用
 detector.detector.roi_head.bbox_head.num_classes = 1  # 中文注释：任务为单类无人机检测
 detector.detector.init_cfg = dict(type='Pretrained', checkpoint='work_dirs/DG/Ours/drone/student_rgb_fused.pth')  # 中文注释：加载Stage-1学生权重作为初始化
 detector.detector.enable_ssdc = True  # 中文注释：开启SS-DC模块构建SAID与耦合颈
