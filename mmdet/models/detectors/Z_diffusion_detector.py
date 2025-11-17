@@ -106,6 +106,10 @@ class DiffusionDetector(BaseDetector):
         self.said_filter = None  # 初始化SAID滤波器引用占位以便条件构建
         self.coupling_neck = None  # 初始化耦合颈部引用占位以便条件构建
         self.ssdc_feature_cache = {}  # 初始化缓存字典用于保存最近一次的SS-DC特征
+        self.loss_decouple = None  # 初始化解耦损失模块引用占位符
+        self.loss_decouple_weight = 1.0  # 初始化解耦损失整体权重默认1.0
+        self.loss_couple = None  # 初始化耦合损失模块引用占位符
+        self.loss_couple_weight = 1.0  # 初始化耦合损失整体权重默认1.0
         ssdc_cfg = {}  # 初始化SS-DC配置字典收集不同来源的参数
         backbone_enable_ssdc = False  # 初始化来自骨干网络配置的开关标志
         if isinstance(backbone, dict):  # 若骨干配置为字典则读取SS-DC相关配置
@@ -173,6 +177,14 @@ class DiffusionDetector(BaseDetector):
             else:  # 否则直接实例化默认实现
                 self.coupling_neck = SSDCouplingNeck(**coupling_cfg)  # 以关键字参数构建耦合颈部模块使用合理默认值
             self.use_ds_tokens = bool(coupling_cfg.get('use_ds_tokens', False))  # 读取配置中是否启用域特异令牌的标志
+            loss_decouple_cfg = copy.deepcopy(ssdc_cfg.get('loss_decouple', {}))  # 深拷贝解耦损失配置以避免污染原配置
+            self.loss_decouple_weight = float(loss_decouple_cfg.pop('loss_weight', 1.0))  # 读取解耦损失总权重缺省为1.0
+            loss_decouple_cfg.setdefault('type', 'LossDecouple')  # 若未指定类型则默认使用LossDecouple实现
+            self.loss_decouple = MODELS.build(loss_decouple_cfg)  # 通过注册表构建解耦损失模块实例
+            loss_couple_cfg = copy.deepcopy(ssdc_cfg.get('loss_couple', {}))  # 深拷贝耦合损失配置以避免污染原配置
+            self.loss_couple_weight = float(loss_couple_cfg.pop('loss_weight', 1.0))  # 读取耦合损失总权重缺省为1.0
+            loss_couple_cfg.setdefault('type', 'LossCouple')  # 若未指定类型则默认使用LossCouple实现
+            self.loss_couple = MODELS.build(loss_couple_cfg)  # 通过注册表构建耦合损失模块实例
 
         self.class_maps = backbone['diff_config']['classes']
 
@@ -391,7 +403,7 @@ class DiffusionDetector(BaseDetector):
                 x_wo_ref, x_w_ref, rpn_results_list_ref, batch_data_samples)
             losses.update(roi_losses_kd)
         ##############################################################################################################
-        
+
         # feature kd loss
         ##############################################################################################################
         if self.apply_auxiliary_branch:
@@ -402,7 +414,61 @@ class DiffusionDetector(BaseDetector):
                 feature_loss['pkd_feature_loss'] += layer_loss/len(x_wo_ref)
             losses.update(feature_loss)
         ##############################################################################################################
-        
+
+        # ssdc loss
+        ##############################################################################################################
+        if self.training and self.enable_ssdc:  # 仅在训练阶段且开启SS-DC时计算额外损失
+            cache_noref = self.ssdc_feature_cache.get('noref')  # 读取无参考分支的SS-DC缓存
+            cache_ref = self.ssdc_feature_cache.get('ref')  # 读取有参考分支的SS-DC缓存
+            if cache_noref is not None and cache_ref is not None:  # 确保两个分支缓存均存在
+                ssdc_loss_dict = {}  # 初始化SS-DC损失累积字典
+                if (self.loss_decouple is not None  # 确认解耦损失模块已构建
+                        and cache_noref['inv'] is not None  # 确认无参考分支解耦域不变特征可用
+                        and cache_noref['ds'] is not None):  # 确认无参考分支解耦域特异特征可用
+                    decouple_noref = self.loss_decouple(  # 调用解耦损失模块计算无参考分支损失
+                        cache_noref['raw'],  # 传入无参考分支原始特征供能量约束
+                        cache_noref['inv'],  # 传入无参考分支域不变特征用于幂等与正交约束
+                        cache_noref['ds'],  # 传入无参考分支域特异特征用于正交与能量约束
+                        self.said_filter)  # 传入SAID模块用于幂等性重计算
+                    decouple_noref = rename_loss_dict(  # 重命名无参考解耦损失键避免冲突
+                        'ssdc_decouple_noref_',  # 传入无参考解耦损失前缀
+                        decouple_noref)  # 传入原始无参考解耦损失字典
+                    decouple_noref = reweight_loss_dict(  # 根据配置调整无参考解耦损失权重
+                        decouple_noref,  # 传入已重命名的无参考解耦损失字典
+                        self.loss_decouple_weight)  # 传入无参考解耦损失总缩放系数
+                    ssdc_loss_dict.update(decouple_noref)  # 合并无参考解耦损失
+                if (self.loss_decouple is not None  # 确认解耦损失模块已构建
+                        and cache_ref['inv'] is not None  # 确认有参考分支解耦域不变特征可用
+                        and cache_ref['ds'] is not None):  # 确认有参考分支解耦域特异特征可用
+                    decouple_ref = self.loss_decouple(  # 调用解耦损失模块计算有参考分支损失
+                        cache_ref['raw'],  # 传入有参考分支原始特征供能量约束
+                        cache_ref['inv'],  # 传入有参考分支域不变特征用于幂等与正交约束
+                        cache_ref['ds'],  # 传入有参考分支域特异特征用于正交与能量约束
+                        self.said_filter)  # 传入SAID模块用于幂等性重计算
+                    decouple_ref = rename_loss_dict(  # 重命名有参考解耦损失键避免冲突
+                        'ssdc_decouple_ref_',  # 传入有参考解耦损失前缀
+                        decouple_ref)  # 传入原始有参考解耦损失字典
+                    decouple_ref = reweight_loss_dict(  # 根据配置调整有参考解耦损失权重
+                        decouple_ref,  # 传入已重命名的有参考解耦损失字典
+                        self.loss_decouple_weight)  # 传入有参考解耦损失总缩放系数
+                    ssdc_loss_dict.update(decouple_ref)  # 合并有参考解耦损失
+                if (self.loss_couple is not None  # 确认耦合损失模块已构建
+                        and cache_noref['coupled'] is not None  # 确认无参考分支耦合特征可用
+                        and cache_ref['inv'] is not None):  # 确认有参考分支域不变特征可用
+                    couple_loss = self.loss_couple(  # 调用耦合损失模块计算跨分支对齐损失
+                        cache_noref['coupled'],  # 传入无参考分支耦合后特征用于对齐监督
+                        cache_ref['inv'],  # 传入有参考分支域不变特征作为教师信号
+                        cache_noref.get('stats', {}))  # 传入无参考分支统计信息以约束域特异比例
+                    couple_loss = rename_loss_dict(  # 重命名耦合损失键避免冲突
+                        'ssdc_couple_',  # 传入耦合损失前缀
+                        couple_loss)  # 传入原始耦合损失字典
+                    couple_loss = reweight_loss_dict(  # 根据配置调整耦合损失权重
+                        couple_loss,  # 传入已重命名的耦合损失字典
+                        self.loss_couple_weight)  # 传入耦合损失总缩放系数
+                    ssdc_loss_dict.update(couple_loss)  # 合并耦合损失
+                losses.update(ssdc_loss_dict)  # 将SS-DC相关损失写入总损失字典
+        ##############################################################################################################
+
         if not return_feature:
             return losses
         else:
