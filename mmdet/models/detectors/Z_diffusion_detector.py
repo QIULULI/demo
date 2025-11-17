@@ -1,7 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
 import warnings
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Optional, Any
 
 import torch
 from torch import Tensor
@@ -136,6 +136,7 @@ class DiffusionDetector(BaseDetector):
             ssdc_cfg.get('enable_ssdc', False),  # 来自SS-DC配置自身的开关标志
         )
         self.enable_ssdc = any(enable_flags)  # 只要任一来源开启则启用SS-DC
+        self.ssdc_cfg = copy.deepcopy(ssdc_cfg)  # 中文注释：缓存SS-DC配置便于特征提取阶段读取调度参数
         if self.enable_ssdc:  # 当确定启用SS-DC时实例化对应模块
             said_cfg_ref = ssdc_cfg.setdefault('said_filter', {})  # 初始化或获取SAID滤波器配置以便写入层级标签
             coupling_cfg_ref = ssdc_cfg.setdefault('coupling_neck', {})  # 初始化或获取耦合颈部配置以便写入层级标签
@@ -255,7 +256,7 @@ class DiffusionDetector(BaseDetector):
         """bool: whether the detector has a RoI head"""
         return hasattr(self, 'roi_head') and self.roi_head is not None
 
-    def extract_feat(self, batch_inputs: Tensor, ref_masks=None, ref_labels=None) -> Tuple[Tensor]:
+    def extract_feat(self, batch_inputs: Tensor, ref_masks=None, ref_labels=None, current_iter: Optional[int] = None, ssdc_cfg: Optional[dict] = None) -> Tuple[Tensor]:
         """Extract features.
 
         Args:
@@ -271,6 +272,46 @@ class DiffusionDetector(BaseDetector):
             x = self.backbone(batch_inputs)
         if self.with_neck:
             x = self.neck(x)
+        bypass_ssdc = False  # 中文注释：初始化SS-DC绕过标志避免无条件耦合
+        effective_ssdc_cfg = copy.deepcopy(ssdc_cfg) if ssdc_cfg is not None else copy.deepcopy(getattr(self, 'ssdc_cfg', {}))  # 中文注释：合并外部传入与内部缓存的SS-DC配置
+        burn_in_iters = int(effective_ssdc_cfg.get('burn_in_iters', 0) or 0)  # 中文注释：读取烧入阶段迭代阈值用于早期禁用耦合
+
+        def _resolve_couple_weight(weight_cfg):  # 中文注释：解析耦合权重调度或常量
+            if isinstance(weight_cfg, (int, float)):  # 中文注释：简单数值直接返回
+                return float(weight_cfg)  # 中文注释：转为浮点保证后续比较
+            if isinstance(weight_cfg, dict):  # 中文注释：处理字典形式的调度配置
+                schedule_cfg = weight_cfg.get('schedule')  # 中文注释：尝试读取插值日程
+                if schedule_cfg is not None and current_iter is not None:  # 中文注释：仅在提供当前迭代时执行插值
+                    interp_points = []  # 中文注释：初始化插值节点列表
+                    for entry in schedule_cfg:  # 中文注释：遍历所有日程节点
+                        if isinstance(entry, (list, tuple)) and len(entry) >= 2:  # 中文注释：校验节点格式
+                            try:  # 中文注释：捕获潜在类型转换异常
+                                node_iter = int(entry[0])  # 中文注释：解析节点迭代编号
+                                node_value = float(entry[1])  # 中文注释：解析节点对应的权重
+                                interp_points.append((node_iter, node_value))  # 中文注释：记录有效节点
+                            except Exception:  # 中文注释：若解析失败则跳过当前节点
+                                continue  # 中文注释：继续处理其他节点
+                    if interp_points:  # 中文注释：存在有效节点时执行线性插值
+                        interp_points = sorted(interp_points, key=lambda item: item[0])  # 中文注释：按迭代排序节点
+                        if current_iter <= interp_points[0][0]:  # 中文注释：当前迭代早于首节点
+                            return float(interp_points[0][1])  # 中文注释：直接返回首节点权重
+                        for (iter_a, val_a), (iter_b, val_b) in zip(interp_points[:-1], interp_points[1:]):  # 中文注释：遍历相邻节点
+                            if iter_a <= current_iter <= iter_b:  # 中文注释：定位当前迭代所在区间
+                                ratio = (current_iter - iter_a) / max(float(iter_b - iter_a), 1.0)  # 中文注释：计算线性插值比例
+                                return float(val_a + ratio * (val_b - val_a))  # 中文注释：返回插值结果
+                        return float(interp_points[-1][1])  # 中文注释：超过尾节点则使用最后一个权重
+                if isinstance(weight_cfg.get('value', None), (int, float)):  # 中文注释：若未提供日程但有默认值
+                    return float(weight_cfg['value'])  # 中文注释：直接返回默认权重
+            try:  # 中文注释：尝试将其他格式转换为浮点
+                return float(weight_cfg)  # 中文注释：转换成功则返回对应权重
+            except Exception:  # 中文注释：解析失败时使用1.0作为安全默认值
+                return 1.0  # 中文注释：防止因异常导致耦合权重缺失
+
+        couple_weight = _resolve_couple_weight(effective_ssdc_cfg.get('w_couple', 1.0))  # 中文注释：计算当前迭代下的耦合权重
+        if current_iter is not None and burn_in_iters > 0 and current_iter < burn_in_iters:  # 中文注释：烧入阶段禁用SS-DC避免干扰监督学习
+            bypass_ssdc = True  # 中文注释：设置绕过标志
+        if couple_weight <= 0:  # 中文注释：耦合权重为0时直接跳过解耦与耦合
+            bypass_ssdc = True  # 中文注释：避免无意义的额外前向
         storage_key = 'ref' if (ref_masks is not None and ref_labels is not None) else 'noref'  # 根据参考信息选择缓存键
         if isinstance(x, tuple):  # 当颈部或骨干直接返回元组特征时直接沿用保持结构不变
             features = x  # 记录元组特征供后续SS-DC与检测头使用
@@ -279,7 +320,7 @@ class DiffusionDetector(BaseDetector):
         else:  # 当返回单个Tensor时包装为单元素元组以兼容多层特征接口
             features = (x,)  # 将单层特征封装为元组便于统一处理
         feature_count = len(features)  # 记录当前实际特征层级数量便于与配置对齐
-        if self.enable_ssdc and self.said_filter is not None and self.coupling_neck is not None:  # 当启用SS-DC模块时执行层级数量校验
+        if self.enable_ssdc and self.said_filter is not None and self.coupling_neck is not None and not bypass_ssdc:  # 当启用SS-DC且未绕过时执行层级数量校验
             expected_levels = self._ssdc_num_feature_levels  # 读取初始化阶段推断的预期层级数
             if expected_levels is None and hasattr(self.coupling_neck, 'num_feature_levels'):  # 当预期值缺失时尝试从耦合颈部读取声明
                 coupling_levels = getattr(self.coupling_neck, 'num_feature_levels')  # 获取耦合颈部声明的层级数量
@@ -295,7 +336,7 @@ class DiffusionDetector(BaseDetector):
                 raise RuntimeError(
                     f'检测到SS-DC模块收到的特征层数为{feature_count}，但配置/推断期望{expected_levels}层，请检查backbone/neck输出或ssdc配置的levels/num_feature_levels设置。'
                 )  # 抛出运行时异常以避免隐式形状错误
-        if self.enable_ssdc and self.said_filter is not None and self.coupling_neck is not None:  # 启用SS-DC时执行解耦与耦合
+        if self.enable_ssdc and self.said_filter is not None and self.coupling_neck is not None and not bypass_ssdc:  # 启用SS-DC且未绕过时执行解耦与耦合
             f_inv_list, f_ds_list = self.said_filter(features)  # 调用SAID滤波器获取域不变与域特异特征列表
             if not isinstance(f_inv_list, (list, tuple)) or not isinstance(f_ds_list, (list, tuple)):  # 校验SAID输出类型必须为列表或元组避免后续索引错误
                 raise TypeError('SAIDFilterBank需要返回列表/元组形式的inv与ds特征，请检查实现。')  # 抛出类型异常提示检查实现
@@ -315,11 +356,11 @@ class DiffusionDetector(BaseDetector):
                 'stats': ssdc_stats,  # 缓存耦合过程的统计信息如域特异占比
             }  # 完成缓存字典的构造
             x = coupled_tuple  # 将耦合结果作为后续检测模块输入
-        else:  # 当未启用SS-DC或模块未构建时直接返回原始特征
+        else:  # 当未启用SS-DC或模块未构建或被绕过时直接返回原始特征
             self.ssdc_feature_cache[storage_key] = {  # 缓存基础特征以保持接口一致
                 'raw': features,  # 缓存原始FPN特征
-                'inv': None,  # 占位符表明未计算域不变特征
-                'ds': None,  # 占位符表明未计算域特异特征
+                'inv': None if bypass_ssdc else None,  # 中文注释：绕过时显式置空域不变特征占位
+                'ds': None if bypass_ssdc else None,  # 中文注释：绕过时显式置空域特异特征占位
                 'coupled': features,  # 将原始特征视作耦合结果保持一致性
                 'stats': None,  # 占位符表明无附加统计量
             }  # 完成基础缓存的构造
