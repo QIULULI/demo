@@ -132,12 +132,12 @@ class DomainAdaptationDetector(BaseDetector):
                 warmup_weight = self._get_distill_warmup_weight(current_iter)  # 中文注释：根据迭代进度获取预热权重
                 semi_loss, diff_feature = self.model.loss_diff_adaptation(
                     multi_batch_inputs, multi_batch_data_samples, ssdc_cfg=self.ssdc_cfg, current_iter=current_iter)  # 中文注释：获取跨模型损失与教师特征并传入SS-DC配置用于伪标签过滤
+                ssdc_losses = self._compute_ssdc_loss(current_iter)  # 中文注释：先读取SS-DC缓存对应的额外损失，确保使用loss_diff_adaptation最新写入的前向缓存
                 feature_loss = self.loss_feature(
-                    multi_batch_inputs['unsup_teacher'], diff_feature)  # 中文注释：计算特征蒸馏损失
-                ssdc_losses = self._compute_ssdc_loss(current_iter)  # 中文注释：基于缓存特征计算SS-DC附加损失
+                    multi_batch_inputs['unsup_teacher'], diff_feature)  # 中文注释：在读取SS-DC损失后再计算特征蒸馏，避免额外前向刷新ssdc_feature_cache造成缓存漂移
                 losses.update(**semi_loss)  # 中文注释：合并跨模型损失项
-                losses.update(**feature_loss)  # 中文注释：合并特征蒸馏损失项
-                losses.update(**ssdc_losses)  # 中文注释：合并SS-DC附加损失项
+                losses.update(**ssdc_losses)  # 中文注释：提前合并SS-DC损失以保留与缓存读取顺序一致的日志
+                losses.update(**feature_loss)  # 中文注释：最后合并特征蒸馏损失，保持接口输出结构不变
                 if warmup_weight < 1.0:  # 中文注释：仅在预热阶段对蒸馏损失执行线性缩放
                     warmup_targets = dict()  # 中文注释：准备收集需要缩放的蒸馏损失条目
                     for key, value in semi_loss.items():  # 中文注释：遍历跨模型损失字典
