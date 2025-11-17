@@ -2,6 +2,7 @@
 import copy
 from typing import Any, Dict, Tuple  # 中文注释：引入Any用于处理动态结构的特征信息
 import torch
+import torch.nn.functional as F  # 中文注释：引入函数式接口用于计算一致性与MSE损失
 from torch import Tensor
 
 from mmdet.models.utils import (rename_loss_dict,
@@ -51,6 +52,7 @@ class DomainAdaptationDetector(BaseDetector):
         self.model = MODELS.build(detector)
         self.detector_name = detector.get('type')
         self.train_cfg = train_cfg  # 中文注释：缓存训练配置方便后续读取蒸馏调度参数
+        self.ssdc_cfg = self.train_cfg.get('ssdc_cfg', {})  # 中文注释：读取SS-DC相关的训练配置便于后续动态调度
         detector_cfg = self.train_cfg.detector_cfg  # 中文注释：提取检测器子配置以便访问蒸馏相关阈值
         self.warmup_start_iters = self.train_cfg.get(  # 中文注释：读取蒸馏预热起始迭代默认0保持兼容
             'warmup_start_iters', detector_cfg.get('warmup_start_iters', 0))
@@ -129,11 +131,13 @@ class DomainAdaptationDetector(BaseDetector):
             else:  # 中文注释：当满足蒸馏开放条件时执行跨模型与特征蒸馏分支
                 warmup_weight = self._get_distill_warmup_weight(current_iter)  # 中文注释：根据迭代进度获取预热权重
                 semi_loss, diff_feature = self.model.loss_diff_adaptation(
-                    multi_batch_inputs, multi_batch_data_samples)  # 中文注释：获取跨模型损失与教师特征
+                    multi_batch_inputs, multi_batch_data_samples, ssdc_cfg=self.ssdc_cfg, current_iter=current_iter)  # 中文注释：获取跨模型损失与教师特征并传入SS-DC配置用于伪标签过滤
                 feature_loss = self.loss_feature(
                     multi_batch_inputs['unsup_teacher'], diff_feature)  # 中文注释：计算特征蒸馏损失
+                ssdc_losses = self._compute_ssdc_loss(current_iter)  # 中文注释：基于缓存特征计算SS-DC附加损失
                 losses.update(**semi_loss)  # 中文注释：合并跨模型损失项
                 losses.update(**feature_loss)  # 中文注释：合并特征蒸馏损失项
+                losses.update(**ssdc_losses)  # 中文注释：合并SS-DC附加损失项
                 if warmup_weight < 1.0:  # 中文注释：仅在预热阶段对蒸馏损失执行线性缩放
                     warmup_targets = dict()  # 中文注释：准备收集需要缩放的蒸馏损失条目
                     for key, value in semi_loss.items():  # 中文注释：遍历跨模型损失字典
@@ -393,6 +397,76 @@ class DomainAdaptationDetector(BaseDetector):
                     logger.info(f"cross_reg_consistency_loss={feature_loss['cross_reg_consistency_loss'].item():.6f}")  # 中文注释：记录回归一致性损失的标量数值便于观测
         losses.update(feature_loss)  # 中文注释：将所有特征相关损失合并到最终输出
         return losses  # 中文注释：返回损失字典供训练流程使用
+
+    @staticmethod
+    def _interp_schedule(schedule_cfg: Any, current_iter: int, default: float = 0.0) -> float:
+        """中文注释：线性插值读取迭代调度的权重/阈值。"""
+        if schedule_cfg is None:  # 中文注释：当未提供调度配置时直接返回默认值
+            return default  # 中文注释：保持兼容的零值
+        if isinstance(schedule_cfg, (int, float)):  # 中文注释：当提供常数时直接返回
+            return float(schedule_cfg)  # 中文注释：转换为浮点便于统一计算
+        if not isinstance(schedule_cfg, (list, tuple)) or not schedule_cfg:  # 中文注释：当结构非法或为空时返回默认
+            return default  # 中文注释：避免异常
+        sorted_points = sorted(list(schedule_cfg), key=lambda item: item[0])  # 中文注释：按迭代索引对调度点排序
+        if current_iter <= sorted_points[0][0]:  # 中文注释：当当前迭代早于首个调度点时
+            return float(sorted_points[0][1])  # 中文注释：直接返回起始权重
+        if current_iter >= sorted_points[-1][0]:  # 中文注释：当当前迭代晚于最后调度点时
+            return float(sorted_points[-1][1])  # 中文注释：返回末尾权重
+        for (iter_a, val_a), (iter_b, val_b) in zip(sorted_points[:-1], sorted_points[1:]):  # 中文注释：遍历相邻调度区间
+            if iter_a <= current_iter <= iter_b:  # 中文注释：定位当前迭代所在区间
+                ratio = (current_iter - iter_a) / max(float(iter_b - iter_a), 1.0)  # 中文注释：计算线性插值系数避免除零
+                return float(val_a + ratio * (val_b - val_a))  # 中文注释：返回插值结果
+        return default  # 中文注释：兜底返回默认值避免逻辑遗漏
+
+    def _compute_ssdc_loss(self, current_iter: int) -> dict:
+        """中文注释：汇总学生与教师SS-DC模块产生的额外损失。"""
+        losses = dict()  # 中文注释：初始化损失容器
+        if not self.ssdc_cfg:  # 中文注释：若未配置SS-DC则直接返回空字典
+            return losses  # 中文注释：保持兼容
+        if current_iter < self.burn_up_iters:  # 中文注释：在烧入阶段不引入SS-DC损失避免干扰基础学习
+            return losses  # 中文注释：直接退出
+        student_detector = getattr(self.model, 'student', None)  # 中文注释：获取学生检测器引用
+        teacher_detector = getattr(self.model, 'teacher', None)  # 中文注释：获取教师检测器引用
+        if student_detector is None or not hasattr(student_detector, 'ssdc_feature_cache'):  # 中文注释：若学生不支持SS-DC则退出
+            return losses  # 中文注释：返回空损失
+        student_cache = student_detector.ssdc_feature_cache.get('noref', None)  # 中文注释：读取学生的无参考分支缓存
+        teacher_cache = None  # 中文注释：初始化教师缓存占位符
+        if teacher_detector is not None and hasattr(teacher_detector, 'ssdc_feature_cache'):  # 中文注释：若教师具备缓存则读取
+            teacher_cache = teacher_detector.ssdc_feature_cache.get('noref', None)  # 中文注释：读取教师无参考分支缓存
+        w_decouple = self._interp_schedule(self.ssdc_cfg.get('w_decouple', 0.0), current_iter, 0.0)  # 中文注释：插值获得解耦损失权重
+        w_couple = self._interp_schedule(self.ssdc_cfg.get('w_couple', 0.0), current_iter, 0.0)  # 中文注释：插值获得耦合损失权重
+        w_di = self._interp_schedule(self.ssdc_cfg.get('w_di_consistency', 0.0), current_iter, 0.0)  # 中文注释：获取域不变一致性权重
+        if w_decouple > 0 and student_cache is not None and student_cache.get('inv') is not None and getattr(student_detector, 'loss_decouple', None) is not None:  # 中文注释：仅在权重与缓存合法时计算学生解耦损失
+            student_decouple = student_detector.loss_decouple(student_cache.get('raw'), student_cache.get('inv'), student_cache.get('ds'), getattr(student_detector, 'said_filter', None))  # 中文注释：调用学生解耦损失
+            student_decouple = rename_loss_dict('ssdc_student_decouple_', student_decouple)  # 中文注释：为日志加上前缀区分来源
+            student_decouple = reweight_loss_dict(student_decouple, w_decouple)  # 中文注释：按调度权重缩放损失
+            losses.update(student_decouple)  # 中文注释：合并学生解耦损失
+        if w_decouple > 0 and teacher_cache is not None and teacher_cache.get('inv') is not None and getattr(teacher_detector, 'loss_decouple', None) is not None:  # 中文注释：当教师具备解耦特征时计算教师解耦损失
+            with torch.no_grad():  # 中文注释：教师分支不反向传播仅用于稳定分解
+                teacher_decouple = teacher_detector.loss_decouple(teacher_cache.get('raw'), teacher_cache.get('inv'), teacher_cache.get('ds'), getattr(teacher_detector, 'said_filter', None))  # 中文注释：调用教师解耦损失
+            teacher_decouple = rename_loss_dict('ssdc_teacher_decouple_', teacher_decouple)  # 中文注释：添加教师前缀便于区分
+            teacher_decouple = reweight_loss_dict(teacher_decouple, w_decouple)  # 中文注释：应用相同调度权重
+            losses.update(teacher_decouple)  # 中文注释：合并教师解耦损失
+        if w_couple > 0 and student_cache is not None and teacher_cache is not None:  # 中文注释：当耦合权重大于0且缓存可用时计算耦合损失
+            student_coupled = student_cache.get('coupled')  # 中文注释：读取学生耦合后特征
+            teacher_inv = teacher_cache.get('inv')  # 中文注释：读取教师域不变特征作为对齐目标
+            if student_coupled is not None and teacher_inv is not None and getattr(student_detector, 'loss_couple', None) is not None:  # 中文注释：确保必要组件存在
+                couple_loss = student_detector.loss_couple(student_coupled, teacher_inv, student_cache.get('stats', {}))  # 中文注释：计算耦合特征对齐损失
+                couple_loss = rename_loss_dict('ssdc_couple_', couple_loss)  # 中文注释：添加日志前缀
+                couple_loss = reweight_loss_dict(couple_loss, w_couple)  # 中文注释：应用耦合调度权重
+                losses.update(couple_loss)  # 中文注释：合并耦合损失
+        if w_di > 0 and student_cache is not None and teacher_cache is not None and student_cache.get('inv') is not None and teacher_cache.get('inv') is not None:  # 中文注释：当域不变特征齐全时计算一致性
+            student_inv = student_cache.get('inv')  # 中文注释：获取学生域不变特征序列
+            teacher_inv = teacher_cache.get('inv')  # 中文注释：获取教师域不变特征序列
+            if isinstance(student_inv, (list, tuple)) and isinstance(teacher_inv, (list, tuple)):
+                valid_pairs = [(s, t) for s, t in zip(student_inv, teacher_inv) if torch.is_tensor(s) and torch.is_tensor(t)]  # 中文注释：筛选双方均为张量的层级
+                if valid_pairs:  # 中文注释：存在有效层级才计算
+                    mse_total = 0.0  # 中文注释：初始化MSE累积值
+                    for stu_feat, tea_feat in valid_pairs:  # 中文注释：遍历每个层级
+                        mse_total = mse_total + F.mse_loss(stu_feat, tea_feat.detach())  # 中文注释：计算每层MSE并累加，教师分支停止梯度
+                    mse_total = mse_total / float(len(valid_pairs))  # 中文注释：对层级数量取均值保持尺度稳定
+                    losses['ssdc_di_consistency_loss'] = mse_total * w_di  # 中文注释：记录域不变一致性损失并按权重缩放
+        return losses  # 中文注释：返回SS-DC综合损失
 
     def loss_cross_feature(self, cross_teacher_info: Any) -> dict:
         """中文注释：计算交叉教师提供的分类与回归一致性损失。"""
