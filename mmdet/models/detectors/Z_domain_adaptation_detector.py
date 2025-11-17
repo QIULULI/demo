@@ -430,9 +430,13 @@ class DomainAdaptationDetector(BaseDetector):
         if student_detector is None or not hasattr(student_detector, 'ssdc_feature_cache'):  # 中文注释：若学生不支持SS-DC则退出
             return losses  # 中文注释：返回空损失
         student_cache = student_detector.ssdc_feature_cache.get('noref', None)  # 中文注释：读取学生的无参考分支缓存
+        if student_cache is None:  # 中文注释：若无参考缓存缺失则尝试回退到参考分支
+            student_cache = student_detector.ssdc_feature_cache.get('ref', None)  # 中文注释：使用参考分支缓存避免空指针
         teacher_cache = None  # 中文注释：初始化教师缓存占位符
         if teacher_detector is not None and hasattr(teacher_detector, 'ssdc_feature_cache'):  # 中文注释：若教师具备缓存则读取
-            teacher_cache = teacher_detector.ssdc_feature_cache.get('noref', None)  # 中文注释：读取教师无参考分支缓存
+            teacher_cache = teacher_detector.ssdc_feature_cache.get('noref', None)  # 中文注释：优先读取教师无参考分支缓存
+            if teacher_cache is None:  # 中文注释：当教师无参考缓存为空时回退到参考分支
+                teacher_cache = teacher_detector.ssdc_feature_cache.get('ref', None)  # 中文注释：尝试使用参考分支的缓存特征
         w_decouple = self._interp_schedule(self.ssdc_cfg.get('w_decouple', 0.0), current_iter, 0.0)  # 中文注释：插值获得解耦损失权重
         w_couple = self._interp_schedule(self.ssdc_cfg.get('w_couple', 0.0), current_iter, 0.0)  # 中文注释：插值获得耦合损失权重
         w_di = self._interp_schedule(self.ssdc_cfg.get('w_di_consistency', 0.0), current_iter, 0.0)  # 中文注释：获取域不变一致性权重
