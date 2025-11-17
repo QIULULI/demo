@@ -66,7 +66,8 @@ class LossCouple(nn.Module):  # 定义耦合损失模块
                 stats: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:  # 计算耦合损失并返回字典
         align_losses: List[torch.Tensor] = []  # 初始化特征对齐损失列表
         for fused, teacher_inv in zip(fused_feats, teacher_inv_feats):  # 遍历对应层级
-            align_losses.append(F.mse_loss(fused, teacher_inv))  # 计算耦合后特征与域不变特征之间的MSE
+            teacher_safe = teacher_inv.detach()  # 分离教师域不变特征的计算图防止梯度回流教师分支
+            align_losses.append(F.mse_loss(fused, teacher_safe))  # 计算耦合后特征与域不变特征之间的MSE
         loss_align = self.align_weight * torch.stack(align_losses).mean()  # 聚合对齐损失并施加权重
         if 'ds_ratios' in stats:  # 若统计信息包含域特异占比
             ds_ratio = stats['ds_ratios']  # 取出域特异占比张量
