@@ -4,7 +4,9 @@ from typing import Dict
 from typing import Any, List, Optional, Union, Tuple
 import torch  # 中文注释：导入PyTorch基础库用于张量运算
 import torch.nn as nn  # 中文注释：导入神经网络模块以便构建模型与操作层
+import torch.nn.functional as F  # 中文注释：导入函数式接口以便进行归一化等运算
 from torch import Tensor  # 中文注释：从PyTorch中显式导入Tensor类型便于类型标注
+from torchvision.ops import roi_align  # 中文注释：导入ROIAlign函数以便在特征图上对齐采样
 
 from mmdet.models.utils import (filter_gt_instances, rename_loss_dict, reweight_loss_dict)
 from mmdet.registry import MODELS
@@ -299,7 +301,9 @@ class SemiBaseDiffDetector(BaseDetector):
         return losses
     
     def loss_diff_adaptation(self, multi_batch_inputs: Dict[str, Tensor],
-                             multi_batch_data_samples: Dict[str, SampleList]) -> dict:
+                             multi_batch_data_samples: Dict[str, SampleList],
+                             ssdc_cfg: Optional[dict] = None,
+                             current_iter: Optional[int] = None) -> dict:
         """Calculate losses from multi-branch inputs and data samples.
 
         Args:
@@ -314,12 +318,14 @@ class SemiBaseDiffDetector(BaseDetector):
         """
         losses = dict()
         losses.update(**self.loss_by_gt_instances(
-            multi_batch_inputs['sup'], multi_batch_data_samples['sup']))
+            multi_batch_inputs['sup'], multi_batch_data_samples['sup']))  # 中文注释：先计算有监督分支损失
         origin_pseudo_data_samples, batch_info, diff_feature = self.get_pseudo_instances_diff(
             multi_batch_inputs['unsup_teacher'], multi_batch_data_samples['unsup_teacher'])  # 中文注释：获取伪标签、批次信息以及原始的特征打包结果
         parsed_diff_feature = self._parse_diff_feature(diff_feature, batch_info)  # 中文注释：对返回的特征结构进行标准化解析并在必要时补充批次信息
         multi_batch_data_samples['unsup_student'] = self.project_pseudo_instances(
-            origin_pseudo_data_samples, multi_batch_data_samples['unsup_student'])
+            origin_pseudo_data_samples, multi_batch_data_samples['unsup_student'])  # 中文注释：将伪标签投影到学生视角
+        if ssdc_cfg is not None:  # 中文注释：当提供SS-DC配置时尝试执行域不变相似度门控
+            self._apply_di_gate(origin_pseudo_data_samples, multi_batch_data_samples['unsup_student'], multi_batch_inputs['unsup_teacher'], multi_batch_inputs['unsup_student'], ssdc_cfg, current_iter)  # 中文注释：根据域不变相似度过滤低可信度伪标签
 
         losses.update(**self.loss_by_pseudo_instances(multi_batch_inputs['unsup_student'],
                                                       multi_batch_data_samples['unsup_student'], batch_info))  # 中文注释：计算学生分支伪标签损失并合并
@@ -376,6 +382,112 @@ class SemiBaseDiffDetector(BaseDetector):
             'unsup_weight', 1.) if pseudo_instances_num > 0 else 0.
         return rename_loss_dict('unsup_',
                                 reweight_loss_dict(losses, unsup_weight))
+
+    @staticmethod
+    def _interp_schedule_value(schedule_cfg: Any, current_iter: Optional[int], default: float = 0.0) -> float:
+        """中文注释：根据迭代步线性插值获取调度值。"""
+        if current_iter is None:  # 中文注释：当未提供当前迭代时直接返回默认
+            return float(schedule_cfg if isinstance(schedule_cfg, (int, float)) else default)  # 中文注释：兼容常数与默认
+        if isinstance(schedule_cfg, (int, float)):  # 中文注释：常量调度直接返回
+            return float(schedule_cfg)  # 中文注释：转换为浮点
+        if not isinstance(schedule_cfg, (list, tuple)) or not schedule_cfg:  # 中文注释：非法配置返回默认
+            return default  # 中文注释：保持稳健
+        sorted_points = sorted(list(schedule_cfg), key=lambda item: item[0])  # 中文注释：按迭代索引排序调度节点
+        if current_iter <= sorted_points[0][0]:  # 中文注释：早于首节点
+            return float(sorted_points[0][1])  # 中文注释：返回起始值
+        if current_iter >= sorted_points[-1][0]:  # 中文注释：晚于末节点
+            return float(sorted_points[-1][1])  # 中文注释：返回结束值
+        for (iter_a, val_a), (iter_b, val_b) in zip(sorted_points[:-1], sorted_points[1:]):  # 中文注释：遍历区间
+            if iter_a <= current_iter <= iter_b:  # 中文注释：找到所在区间
+                ratio = (current_iter - iter_a) / max(float(iter_b - iter_a), 1.0)  # 中文注释：线性比例防止除零
+                return float(val_a + ratio * (val_b - val_a))  # 中文注释：返回插值结果
+        return default  # 中文注释：兜底返回默认值
+
+    @torch.no_grad()
+    def _apply_di_gate(self, teacher_pseudo_samples: SampleList,
+                       student_pseudo_samples: SampleList,
+                       teacher_inputs: Tensor,
+                       student_inputs: Tensor,
+                       ssdc_cfg: dict,
+                       current_iter: Optional[int]) -> None:
+        """中文注释：依据域不变特征相似度过滤低置信度伪标签。"""
+        tau_schedule = ssdc_cfg.get('consistency_gate', None)  # 中文注释：读取相似度阈值调度
+        if tau_schedule is None:  # 中文注释：未配置阈值则直接返回
+            return  # 中文注释：保持原始伪标签
+        tau_value = self._interp_schedule_value(tau_schedule, current_iter, 0.0)  # 中文注释：计算当前迭代的阈值
+        if tau_value <= 0:  # 中文注释：阈值无效时跳过过滤
+            return  # 中文注释：保持伪标签完整
+        teacher_inv = None  # 中文注释：初始化教师域不变特征占位符
+        student_inv = None  # 中文注释：初始化学生域不变特征占位符
+        if hasattr(self.teacher, 'extract_feat'):  # 中文注释：确保教师模型支持特征提取
+            _ = self.teacher.extract_feat(teacher_inputs)  # 中文注释：运行一次前向以填充SS-DC缓存
+            teacher_cache = getattr(self.teacher, 'ssdc_feature_cache', {}).get('noref', {})  # 中文注释：读取教师缓存
+            teacher_inv = teacher_cache.get('inv')  # 中文注释：获取域不变特征
+        if hasattr(self.student, 'extract_feat'):  # 中文注释：确保学生模型支持特征提取
+            _ = self.student.extract_feat(student_inputs)  # 中文注释：运行学生前向以填充缓存但不求梯度
+            student_cache = getattr(self.student, 'ssdc_feature_cache', {}).get('noref', {})  # 中文注释：读取学生缓存
+            student_inv = student_cache.get('inv')  # 中文注释：获取学生域不变特征
+        if teacher_inv is None or student_inv is None:  # 中文注释：任一特征缺失则无法过滤
+            return  # 中文注释：保持伪标签
+        if not isinstance(teacher_inv, (list, tuple)) or not isinstance(student_inv, (list, tuple)):  # 中文注释：要求特征序列
+            return  # 中文注释：结构不匹配时跳过
+        if len(teacher_inv) == 0 or len(student_inv) == 0:  # 中文注释：空特征直接返回
+            return  # 中文注释：无有效特征
+        teacher_map = teacher_inv[0]  # 中文注释：使用首层域不变特征进行区域对齐
+        student_map = student_inv[0]  # 中文注释：学生端同样使用首层
+        if teacher_map is None or student_map is None:  # 中文注释：首层缺失则跳过
+            return  # 中文注释：保持伪标签
+        # 中文注释：构建ROIAlign所需的ROI列表，格式为(batch_idx, x1, y1, x2, y2)
+        teacher_rois = []  # 中文注释：初始化教师ROI列表
+        for batch_idx, sample in enumerate(teacher_pseudo_samples):  # 中文注释：遍历每个教师样本
+            if hasattr(sample, 'gt_instances') and sample.gt_instances is not None and sample.gt_instances.bboxes.numel() > 0:  # 中文注释：确保伪标签存在
+                boxes = sample.gt_instances.bboxes  # 中文注释：读取教师伪框
+                batch_indices = torch.full((boxes.shape[0], 1), batch_idx, device=boxes.device)  # 中文注释：生成批次索引
+                teacher_rois.append(torch.cat([batch_indices, boxes], dim=1))  # 中文注释：拼接形成ROI描述
+        student_rois = []  # 中文注释：初始化学生ROI列表
+        for batch_idx, sample in enumerate(student_pseudo_samples):  # 中文注释：遍历学生伪标签
+            if hasattr(sample, 'gt_instances') and sample.gt_instances is not None and sample.gt_instances.bboxes.numel() > 0:  # 中文注释：确保伪标签存在
+                boxes = sample.gt_instances.bboxes  # 中文注释：读取学生伪框
+                batch_indices = torch.full((boxes.shape[0], 1), batch_idx, device=boxes.device)  # 中文注释：生成批次索引
+                student_rois.append(torch.cat([batch_indices, boxes], dim=1))  # 中文注释：拼接ROI
+        if not teacher_rois or not student_rois:  # 中文注释：若任一分支无ROI则跳过过滤
+            return  # 中文注释：保持伪标签
+        teacher_rois = torch.cat(teacher_rois, dim=0)  # 中文注释：合并教师所有ROI
+        student_rois = torch.cat(student_rois, dim=0)  # 中文注释：合并学生所有ROI
+        if teacher_rois.shape[0] != student_rois.shape[0]:  # 中文注释：若ROI数量不一致无法逐一对齐
+            min_rois = min(teacher_rois.shape[0], student_rois.shape[0])  # 中文注释：取最小数量保持对应关系
+            teacher_rois = teacher_rois[:min_rois]  # 中文注释：截断教师ROI
+            student_rois = student_rois[:min_rois]  # 中文注释：截断学生ROI
+        pooled_teacher = roi_align(teacher_map, teacher_rois, output_size=1, spatial_scale=1.0, aligned=True)  # 中文注释：在教师特征图上对齐采样
+        pooled_student = roi_align(student_map, student_rois, output_size=1, spatial_scale=1.0, aligned=True)  # 中文注释：在学生特征图上对齐采样
+        pooled_teacher = pooled_teacher.flatten(1)  # 中文注释：拉平为(N, C)
+        pooled_student = pooled_student.flatten(1)  # 中文注释：拉平为(N, C)
+        teacher_norm = F.normalize(pooled_teacher, dim=1)  # 中文注释：对教师特征做L2归一化
+        student_norm = F.normalize(pooled_student, dim=1)  # 中文注释：对学生特征做L2归一化
+        cosine_scores = (teacher_norm * student_norm).sum(dim=1)  # 中文注释：计算逐实例余弦相似度
+        keep_mask = cosine_scores >= tau_value  # 中文注释：生成保留掩码
+        if keep_mask.all():  # 中文注释：全部通过阈值则无需修改
+            return  # 中文注释：保持伪标签
+        # 中文注释：按照掩码过滤学生端伪标签实例
+        filtered_samples = []  # 中文注释：准备过滤后的样本列表
+        start_idx = 0  # 中文注释：初始化实例起始指针
+        for sample in student_pseudo_samples:  # 中文注释：逐样本处理
+            if not hasattr(sample, 'gt_instances') or sample.gt_instances is None:  # 中文注释：无伪标签的样本直接加入
+                filtered_samples.append(sample)  # 中文注释：保持原样
+                continue  # 中文注释：处理下一样本
+            num_instance = sample.gt_instances.bboxes.shape[0]  # 中文注释：统计当前样本伪标签数量
+            if num_instance == 0:  # 中文注释：无伪标签直接保留
+                filtered_samples.append(sample)  # 中文注释：追加到结果
+                continue  # 中文注释：处理下一样本
+            end_idx = start_idx + num_instance  # 中文注释：计算当前样本对应的掩码区间
+            sample_mask = keep_mask[start_idx:end_idx]  # 中文注释：提取当前样本的保留掩码
+            start_idx = end_idx  # 中文注释：更新指针
+            if sample_mask.any():  # 中文注释：当存在保留实例时
+                sample.gt_instances = sample.gt_instances[sample_mask]  # 中文注释：根据掩码筛选伪标签
+            else:  # 中文注释：若全部被过滤
+                sample.gt_instances = sample.gt_instances[:0]  # 中文注释：清空实例保持结构
+            filtered_samples.append(sample)  # 中文注释：将更新后的样本加入结果列表
+        student_pseudo_samples[:] = filtered_samples  # 中文注释：就地替换学生伪标签列表
 
     @torch.no_grad()
     def get_pseudo_instances(
