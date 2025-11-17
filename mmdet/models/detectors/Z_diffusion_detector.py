@@ -297,7 +297,15 @@ class DiffusionDetector(BaseDetector):
                 )  # 抛出运行时异常以避免隐式形状错误
         if self.enable_ssdc and self.said_filter is not None and self.coupling_neck is not None:  # 启用SS-DC时执行解耦与耦合
             f_inv_list, f_ds_list = self.said_filter(features)  # 调用SAID滤波器获取域不变与域特异特征列表
+            if not isinstance(f_inv_list, (list, tuple)) or not isinstance(f_ds_list, (list, tuple)):  # 校验SAID输出类型必须为列表或元组避免后续索引错误
+                raise TypeError('SAIDFilterBank需要返回列表/元组形式的inv与ds特征，请检查实现。')  # 抛出类型异常提示检查实现
+            if len(f_inv_list) != feature_count or len(f_ds_list) != feature_count:  # 校验SAID输出层数与输入特征层数一致以避免错配
+                raise RuntimeError(f'SAIDFilterBank输出层数(inv:{len(f_inv_list)}, ds:{len(f_ds_list)})与输入特征层数{feature_count}不匹配，请核对levels配置。')  # 抛出运行时异常提醒调整配置
             coupled_feats, ssdc_stats = self.coupling_neck(features, f_inv_list, f_ds_list)  # 将解耦特征送入耦合颈部融合并返回统计量
+            if not isinstance(coupled_feats, (list, tuple)):  # 校验耦合颈部输出类型必须为列表或元组保持接口一致
+                raise TypeError('SSDCouplingNeck需要返回列表/元组形式的耦合特征，请检查实现。')  # 抛出类型异常提示实现问题
+            if len(coupled_feats) != feature_count:  # 校验耦合后特征层数与输入保持一致避免后续检测头维度错位
+                raise RuntimeError(f'SSDCouplingNeck输出层数{len(coupled_feats)}与输入特征层数{feature_count}不一致，请检查num_feature_levels配置。')  # 抛出异常提醒调整配置
             coupled_tuple = tuple(coupled_feats)  # 将融合后的特征转换为元组以符合检测头输入要求
             self.ssdc_feature_cache[storage_key] = {  # 为当前分支缓存SS-DC相关特征供损失计算
                 'raw': features,  # 缓存原始未耦合的FPN特征
