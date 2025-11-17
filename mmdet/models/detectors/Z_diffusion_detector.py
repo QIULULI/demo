@@ -110,6 +110,10 @@ class DiffusionDetector(BaseDetector):
         self.loss_decouple_weight = 1.0  # 初始化解耦损失整体权重默认1.0
         self.loss_couple = None  # 初始化耦合损失模块引用占位符
         self.loss_couple_weight = 1.0  # 初始化耦合损失整体权重默认1.0
+        self._ssdc_num_feature_levels = None  # 初始化特征层级数量占位便于运行时校验
+        self._ssdc_level_names = None  # 初始化特征层级名称列表占位符用于配置同步
+        self._ssdc_start_level = None  # 初始化特征层级起始索引占位符用于动态生成
+        self._ssdc_level_prefix = None  # 初始化特征层级前缀占位符用于统一命名
         ssdc_cfg = {}  # 初始化SS-DC配置字典收集不同来源的参数
         backbone_enable_ssdc = False  # 初始化来自骨干网络配置的开关标志
         if isinstance(backbone, dict):  # 若骨干配置为字典则读取SS-DC相关配置
@@ -135,25 +139,10 @@ class DiffusionDetector(BaseDetector):
         if self.enable_ssdc:  # 当确定启用SS-DC时实例化对应模块
             said_cfg_ref = ssdc_cfg.setdefault('said_filter', {})  # 初始化或获取SAID滤波器配置以便写入层级标签
             coupling_cfg_ref = ssdc_cfg.setdefault('coupling_neck', {})  # 初始化或获取耦合颈部配置以便写入层级标签
-            has_neck = hasattr(self, 'neck')  # 记录是否存在颈部模块以便后续判断
-            neck_level_count = getattr(self.neck, 'num_outs', None) if has_neck else None  # 依据颈部输出层数预估特征层数量
-            num_feature_levels = neck_level_count if isinstance(neck_level_count, int) else None  # 若颈部给出整数层数则直接采用
-            if num_feature_levels is None:  # 当颈部未提供层数时回退到配置推断
-                preset_levels = coupling_cfg_ref.get('levels') or said_cfg_ref.get('levels')  # 优先读取配置中可能存在的层级列表
-                if isinstance(preset_levels, (list, tuple)):  # 若读到合法列表则使用其长度
-                    num_feature_levels = len(preset_levels)  # 使用配置层级长度作为特征层数量
-            if num_feature_levels is None:  # 若仍未确定层数则尝试根据通道序列推断
-                in_channels_cfg = coupling_cfg_ref.get('in_channels')  # 读取耦合颈部输入通道字段
-                if isinstance(in_channels_cfg, (list, tuple)):  # 当输入通道为序列时可借助其长度
-                    num_feature_levels = len(in_channels_cfg)  # 以输入通道序列长度作为特征层数量
-            if num_feature_levels is None:  # 若经过所有推断仍无结果则回退至常见的四层结构
-                num_feature_levels = 4  # 采用默认四层确保后续逻辑能够继续执行
-            start_level = coupling_cfg_ref.get('start_level', said_cfg_ref.get('start_level', 2))  # 读取层级起始索引默认从P2开始
-            level_prefix = coupling_cfg_ref.get('level_prefix', said_cfg_ref.get('level_prefix', 'P'))  # 读取层级前缀默认使用P
-            levels = [f'{level_prefix}{start_level + idx}' for idx in range(num_feature_levels)]  # 根据推断数量依次生成层级名称列表
-            said_cfg_ref['levels'] = levels  # 将统一生成的层级列表写入SAID滤波器配置确保与特征数量匹配
-            coupling_cfg_ref['levels'] = levels  # 将统一生成的层级列表写入耦合颈部配置确保内部模块一致
+            num_feature_levels, level_names = self._infer_num_feature_levels(said_cfg_ref, coupling_cfg_ref)  # 调用内部方法优先基于实网结构推断层级数量与名称
             coupling_cfg_ref['num_feature_levels'] = num_feature_levels  # 将推断得到的特征层数写入耦合颈部配置供模块校验
+            coupling_cfg_ref['levels'] = level_names  # 将统一生成的层级列表写入耦合颈部配置确保内部模块一致
+            said_cfg_ref['levels'] = level_names  # 将统一生成的层级列表写入SAID滤波器配置确保与特征数量匹配
             said_cfg = copy.deepcopy(said_cfg_ref)  # 深拷贝SAID滤波器子配置避免副作用
             if said_cfg and 'type' in said_cfg:  # 若提供了类型字段则通过注册表动态构建
                 self.said_filter = MODELS.build(said_cfg)  # 使用注册表根据配置构建SAID滤波器模块
@@ -187,6 +176,50 @@ class DiffusionDetector(BaseDetector):
             self.loss_couple = MODELS.build(loss_couple_cfg)  # 通过注册表构建耦合损失模块实例
 
         self.class_maps = backbone['diff_config']['classes']
+
+    def _infer_num_feature_levels(self, said_cfg_ref, coupling_cfg_ref):
+        """基于已构建的骨干和颈部模块推断特征层级数量并生成层级名称列表。"""
+        self._ssdc_start_level = coupling_cfg_ref.get('start_level', said_cfg_ref.get('start_level', 2))  # 读取层级起始索引若无则使用默认值2
+        self._ssdc_level_prefix = coupling_cfg_ref.get('level_prefix', said_cfg_ref.get('level_prefix', 'P'))  # 读取层级命名前缀若无则默认P
+        num_feature_levels = None  # 初始化特征层级数量占位符优先依据实际模块属性推断
+        if hasattr(self, 'neck'):  # 当模型包含颈部模块时优先从颈部读取层级信息
+            neck_num_outs = getattr(self.neck, 'num_outs', None)  # 读取颈部声明的输出层数
+            if isinstance(neck_num_outs, int) and neck_num_outs > 0:  # 当颈部明确提供正整数层数时直接采用
+                num_feature_levels = neck_num_outs  # 使用颈部声明的层数作为特征层级数量
+            if num_feature_levels is None:  # 当颈部未声明层数时尝试根据输出通道列表长度推断
+                neck_out_channels = getattr(self.neck, 'out_channels', None)  # 读取颈部输出通道配置
+                if isinstance(neck_out_channels, (list, tuple)):  # 当输出通道为序列时可利用其长度作为层级数量
+                    num_feature_levels = len(neck_out_channels)  # 使用颈部输出通道数量作为特征层级数量
+        if num_feature_levels is None and hasattr(self.backbone, 'num_outs'):  # 当颈部推断失败且骨干声明输出层数时使用骨干信息
+            backbone_num_outs = getattr(self.backbone, 'num_outs')  # 读取骨干网络声明的输出层级数量
+            if isinstance(backbone_num_outs, int) and backbone_num_outs > 0:  # 当骨干提供合法层数时采用该值
+                num_feature_levels = backbone_num_outs  # 使用骨干声明的输出层数
+        if num_feature_levels is None and hasattr(self.backbone, 'out_channels'):  # 当仍未确定时检查骨干输出通道列表
+            backbone_out_channels = getattr(self.backbone, 'out_channels')  # 读取骨干输出通道配置
+            if isinstance(backbone_out_channels, (list, tuple)):  # 当骨干输出通道为序列时可利用其长度推断层级
+                num_feature_levels = len(backbone_out_channels)  # 使用骨干输出通道数量作为特征层级数量
+        if num_feature_levels is None:  # 当模块属性均无法提供信息时回退到配置字段
+            preset_levels = coupling_cfg_ref.get('levels') or said_cfg_ref.get('levels')  # 尝试读取SAID或耦合配置中已有的层级列表
+            if isinstance(preset_levels, (list, tuple)):  # 当配置提供合法列表时使用其长度
+                num_feature_levels = len(preset_levels)  # 根据配置层级列表长度确定特征层级数量
+        if num_feature_levels is None:  # 当仍无法获取层级数量时根据输入通道配置推断
+            in_channels_cfg = coupling_cfg_ref.get('in_channels')  # 读取耦合颈部输入通道字段
+            if isinstance(in_channels_cfg, (list, tuple)):  # 当输入通道为序列时利用其长度
+                num_feature_levels = len(in_channels_cfg)  # 使用输入通道序列长度作为特征层级数量
+        if num_feature_levels is None and hasattr(self.backbone, 'out_indices'):  # 若仍未知则根据骨干输出索引长度进行估计
+            backbone_out_indices = getattr(self.backbone, 'out_indices')  # 读取骨干输出索引配置
+            if isinstance(backbone_out_indices, (list, tuple)):  # 当输出索引为序列时可利用其长度
+                num_feature_levels = len(backbone_out_indices)  # 使用输出索引长度作为特征层级数量
+        if num_feature_levels is None:  # 若经过所有推断仍无结果则使用配置中显式给定的数值
+            cfg_num_levels = coupling_cfg_ref.get('num_feature_levels')  # 读取耦合颈部配置中的层级数量字段
+            if isinstance(cfg_num_levels, int) and cfg_num_levels > 0:  # 当配置中提供合法正整数时采用
+                num_feature_levels = cfg_num_levels  # 使用配置显式给定的层级数量
+        if num_feature_levels is None:  # 最后兜底使用安全默认值避免运行时崩溃
+            num_feature_levels = 4  # 设置默认四层输出与常见FPN结构保持一致
+        level_names = [f'{self._ssdc_level_prefix}{self._ssdc_start_level + idx}' for idx in range(num_feature_levels)]  # 根据推断数量生成层级名称列表
+        self._ssdc_num_feature_levels = num_feature_levels  # 将最终确定的层级数量缓存在实例属性中便于后续校验
+        self._ssdc_level_names = level_names  # 将生成的层级名称缓存在实例属性中便于复用
+        return num_feature_levels, level_names  # 返回层级数量与名称列表供初始化流程写回配置
 
     def _load_from_state_dict(self, state_dict: dict, prefix: str,
                               local_metadata: dict, strict: bool,
@@ -245,6 +278,23 @@ class DiffusionDetector(BaseDetector):
             features = tuple(x)  # 将列表转换为元组避免后续修改影响缓存内容
         else:  # 当返回单个Tensor时包装为单元素元组以兼容多层特征接口
             features = (x,)  # 将单层特征封装为元组便于统一处理
+        feature_count = len(features)  # 记录当前实际特征层级数量便于与配置对齐
+        if self.enable_ssdc and self.said_filter is not None and self.coupling_neck is not None:  # 当启用SS-DC模块时执行层级数量校验
+            expected_levels = self._ssdc_num_feature_levels  # 读取初始化阶段推断的预期层级数
+            if expected_levels is None and hasattr(self.coupling_neck, 'num_feature_levels'):  # 当预期值缺失时尝试从耦合颈部读取声明
+                coupling_levels = getattr(self.coupling_neck, 'num_feature_levels')  # 获取耦合颈部声明的层级数量
+                if isinstance(coupling_levels, int) and coupling_levels > 0:  # 当耦合颈部提供合法值时使用
+                    expected_levels = coupling_levels  # 使用耦合颈部层级数量作为预期
+            if expected_levels is None:  # 若仍未获得预期层级数量则以实际输出为准并同步缓存
+                expected_levels = feature_count  # 将当前输出层级数量视为预期值
+                self._ssdc_num_feature_levels = feature_count  # 将预期值缓存以便后续复用
+                level_prefix = self._ssdc_level_prefix if self._ssdc_level_prefix is not None else 'P'  # 读取或回退层级命名前缀
+                start_level = self._ssdc_start_level if self._ssdc_start_level is not None else 2  # 读取或回退层级起始索引
+                self._ssdc_level_names = [f'{level_prefix}{start_level + idx}' for idx in range(feature_count)]  # 根据真实层级数量生成层级名称列表
+            if feature_count != expected_levels:  # 当实际层级数量与预期不一致时立即报错提示配置问题
+                raise RuntimeError(
+                    f'检测到SS-DC模块收到的特征层数为{feature_count}，但配置/推断期望{expected_levels}层，请检查backbone/neck输出或ssdc配置的levels/num_feature_levels设置。'
+                )  # 抛出运行时异常以避免隐式形状错误
         if self.enable_ssdc and self.said_filter is not None and self.coupling_neck is not None:  # 启用SS-DC时执行解耦与耦合
             f_inv_list, f_ds_list = self.said_filter(features)  # 调用SAID滤波器获取域不变与域特异特征列表
             coupled_feats, ssdc_stats = self.coupling_neck(features, f_inv_list, f_ds_list)  # 将解耦特征送入耦合颈部融合并返回统计量
