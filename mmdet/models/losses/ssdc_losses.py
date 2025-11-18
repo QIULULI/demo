@@ -25,11 +25,14 @@ class LossDecouple(nn.Module):  # 定义光谱分离损失模块
                 feats: Sequence[torch.Tensor],
                 inv_feats: Sequence[torch.Tensor],
                 ds_feats: Sequence[torch.Tensor],
-                said_module: nn.Module) -> Dict[str, torch.Tensor]:  # 计算分离损失并返回字典
+                said_module: nn.Module,
+                require_grad: bool = None) -> Dict[str, torch.Tensor]:  # 计算分离损失并返回字典，require_grad控制是否开启梯度
         idem_losses: List[torch.Tensor] = []  # 初始化幂等性损失列表
         orth_losses: List[torch.Tensor] = []  # 初始化正交性损失列表
         energy_losses: List[torch.Tensor] = []  # 初始化能量守恒损失列表
-        with torch.enable_grad():  # 确保允许梯度用于两次通过
+        grad_flag = torch.is_grad_enabled() if require_grad is None else require_grad  # 根据外部状态或显式开关确定是否需要梯度
+        grad_context = torch.enable_grad() if grad_flag else torch.no_grad()  # 需要梯度则开启，否则使用no_grad防止建立计算图
+        with grad_context:  # 根据上下文控制梯度开关以匹配调用方需求
             idem_inv_feats, _ = said_module(inv_feats)  # 再次对低频特征应用SAID获取幂等性参考
         for feat, inv, ds, idem_inv in zip(feats, inv_feats, ds_feats, idem_inv_feats):  # 遍历层级计算各项损失
             idem_losses.append(F.mse_loss(idem_inv, inv))  # 计算幂等性损失鼓励重复应用不改变输出

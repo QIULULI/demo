@@ -441,13 +441,30 @@ class DomainAdaptationDetector(BaseDetector):
         w_couple = self._interp_schedule(self.ssdc_cfg.get('w_couple', 0.0), current_iter, 0.0)  # 中文注释：插值获得耦合损失权重
         w_di = self._interp_schedule(self.ssdc_cfg.get('w_di_consistency', 0.0), current_iter, 0.0)  # 中文注释：获取域不变一致性权重
         if w_decouple > 0 and student_cache is not None and student_cache.get('inv') is not None and getattr(student_detector, 'loss_decouple', None) is not None:  # 中文注释：仅在权重与缓存合法时计算学生解耦损失
-            student_decouple = student_detector.loss_decouple(student_cache.get('raw'), student_cache.get('inv'), student_cache.get('ds'), getattr(student_detector, 'said_filter', None))  # 中文注释：调用学生解耦损失
+            student_decouple = student_detector.loss_decouple(  # 中文注释：调用学生解耦损失并显式保持梯度
+                student_cache.get('raw'),  # 中文注释：传入学生原始特征序列
+                student_cache.get('inv'),  # 中文注释：传入学生域不变特征序列
+                student_cache.get('ds'),  # 中文注释：传入学生域特异特征序列
+                getattr(student_detector, 'said_filter', None),  # 中文注释：传入学生SAID模块实例
+                require_grad=True)  # 中文注释：显式开启梯度以支持学生反向
             student_decouple = rename_loss_dict('ssdc_student_decouple_', student_decouple)  # 中文注释：为日志加上前缀区分来源
             student_decouple = reweight_loss_dict(student_decouple, w_decouple)  # 中文注释：按调度权重缩放损失
             losses.update(student_decouple)  # 中文注释：合并学生解耦损失
         if w_decouple > 0 and teacher_cache is not None and teacher_cache.get('inv') is not None and getattr(teacher_detector, 'loss_decouple', None) is not None:  # 中文注释：当教师具备解耦特征时计算教师解耦损失
+            def _detach_feature_block(block):  # 中文注释：定义辅助函数用于安全地detach不同结构的特征块
+                if isinstance(block, (list, tuple)):  # 中文注释：若为序列则逐个元素处理
+                    return [item.detach() if torch.is_tensor(item) else item for item in block]  # 中文注释：张量执行detach防止梯度累积，其他类型原样返回
+                if torch.is_tensor(block):  # 中文注释：单个张量直接detach
+                    return block.detach()  # 中文注释：切断计算图避免无效梯度
+                return block  # 中文注释：非张量直接返回保持兼容
+
             with torch.no_grad():  # 中文注释：教师分支不反向传播仅用于稳定分解
-                teacher_decouple = teacher_detector.loss_decouple(teacher_cache.get('raw'), teacher_cache.get('inv'), teacher_cache.get('ds'), getattr(teacher_detector, 'said_filter', None))  # 中文注释：调用教师解耦损失
+                teacher_decouple = teacher_detector.loss_decouple(  # 中文注释：调用教师解耦损失并显式禁止梯度
+                    _detach_feature_block(teacher_cache.get('raw')),  # 中文注释：传入已detach的教师原始特征
+                    _detach_feature_block(teacher_cache.get('inv')),  # 中文注释：传入已detach的教师域不变特征
+                    _detach_feature_block(teacher_cache.get('ds')),  # 中文注释：传入已detach的教师域特异特征
+                    getattr(teacher_detector, 'said_filter', None),  # 中文注释：传入教师SAID模块实例
+                    require_grad=False)  # 中文注释：显式禁止梯度构建
             teacher_decouple = rename_loss_dict('ssdc_teacher_decouple_', teacher_decouple)  # 中文注释：添加教师前缀便于区分
             teacher_decouple = reweight_loss_dict(teacher_decouple, w_decouple)  # 中文注释：应用相同调度权重
             losses.update(teacher_decouple)  # 中文注释：合并教师解耦损失
