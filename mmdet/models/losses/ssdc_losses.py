@@ -32,19 +32,22 @@ class LossDecouple(nn.Module):  # 定义光谱分离损失模块
         energy_losses: List[torch.Tensor] = []  # 初始化能量守恒损失列表
         grad_flag = torch.is_grad_enabled() if require_grad is None else require_grad  # 根据外部状态或显式开关确定是否需要梯度
         grad_context = torch.enable_grad() if grad_flag else torch.no_grad()  # 需要梯度则开启，否则使用no_grad防止建立计算图
-        with grad_context:  # 根据上下文控制梯度开关以匹配调用方需求
-            idem_inv_feats, _ = said_module(inv_feats)  # 再次对低频特征应用SAID获取幂等性参考
-        for feat, inv, ds, idem_inv in zip(feats, inv_feats, ds_feats, idem_inv_feats):  # 遍历层级计算各项损失
-            idem_losses.append(F.mse_loss(idem_inv, inv))  # 计算幂等性损失鼓励重复应用不改变输出
-            inv_flat = F.normalize(inv.view(inv.size(0), -1), dim=1, eps=self.eps)  # 将低频特征展平并L2归一化并使用eps稳定
-            ds_flat = F.normalize(ds.view(ds.size(0), -1), dim=1, eps=self.eps)  # 将高频特征展平并L2归一化并使用eps稳定
-            cosine = (inv_flat * ds_flat).sum(dim=1)  # 计算两者余弦相似度
-            orth_losses.append((cosine.square()).mean())  # 将余弦平方作为正交性惩罚
-            energy_total = feat.square().sum(dim=(1, 2, 3))  # 计算原始特征能量
-            energy_inv = inv.square().sum(dim=(1, 2, 3))  # 计算低频特征能量
-            energy_ds = ds.square().sum(dim=(1, 2, 3))  # 计算高频特征能量
-            energy_residual = energy_inv + energy_ds - energy_total  # 计算能量残差
-            energy_losses.append((energy_residual.square()).mean())  # 使用平方误差约束能量守恒
+        feats_safe = [feat if grad_flag else feat.detach() for feat in feats]  # 梯度需求存在时保留原始特征，否则先detach避免构建新计算图
+        inv_safe = [inv if grad_flag else inv.detach() for inv in inv_feats]  # 对域不变特征做同样处理，防止教师路径建立梯度链
+        ds_safe = [ds if grad_flag else ds.detach() for ds in ds_feats]  # 对域特异特征做同样处理，确保无梯度模式下独立运算
+        with grad_context:  # 根据上下文控制梯度开关以匹配调用方需求，并将完整损失计算包含其中
+            idem_inv_feats, _ = said_module(inv_safe)  # 再次对低频特征应用SAID获取幂等性参考
+            for feat, inv, ds, idem_inv in zip(feats_safe, inv_safe, ds_safe, idem_inv_feats):  # 遍历层级计算各项损失
+                idem_losses.append(F.mse_loss(idem_inv, inv))  # 计算幂等性损失鼓励重复应用不改变输出
+                inv_flat = F.normalize(inv.view(inv.size(0), -1), dim=1, eps=self.eps)  # 将低频特征展平并L2归一化并使用eps稳定
+                ds_flat = F.normalize(ds.view(ds.size(0), -1), dim=1, eps=self.eps)  # 将高频特征展平并L2归一化并使用eps稳定
+                cosine = (inv_flat * ds_flat).sum(dim=1)  # 计算两者余弦相似度
+                orth_losses.append((cosine.square()).mean())  # 将余弦平方作为正交性惩罚
+                energy_total = feat.square().sum(dim=(1, 2, 3))  # 计算原始特征能量
+                energy_inv = inv.square().sum(dim=(1, 2, 3))  # 计算低频特征能量
+                energy_ds = ds.square().sum(dim=(1, 2, 3))  # 计算高频特征能量
+                energy_residual = energy_inv + energy_ds - energy_total  # 计算能量残差
+                energy_losses.append((energy_residual.square()).mean())  # 使用平方误差约束能量守恒
         loss_idem = self.idem_weight * torch.stack(idem_losses).mean()  # 聚合幂等性损失并施加权重
         loss_orth = self.orth_weight * torch.stack(orth_losses).mean()  # 聚合正交性损失并施加权重
         loss_energy = self.energy_weight * torch.stack(energy_losses).mean()  # 聚合能量损失并施加权重
