@@ -38,3 +38,17 @@ def test_loss_decouple_teacher_path_no_grad():  # 中文注释：测试教师路
         assert value.requires_grad is False  # 中文注释：确认输出张量不跟踪梯度
     assert inv[0].grad is None  # 中文注释：确认调用后域不变特征未产生梯度信息
     assert ds[0].grad is None  # 中文注释：确认调用后域特异特征未产生梯度信息
+
+
+def test_loss_decouple_teacher_path_with_detached_inputs():  # 中文注释：测试教师路径在传入已detach特征时仍保持无梯度
+    said = DummySaid()  # 中文注释：实例化模拟SAID模块
+    raw, inv, ds = _build_feature_triplet(requires_grad=True)  # 中文注释：创建需要梯度的特征序列以模拟上游网络输出
+    raw_detached = [feature.detach() for feature in raw]  # 中文注释：显式detach原始特征以模拟教师缓存输出
+    inv_detached = [feature.detach() for feature in inv]  # 中文注释：显式detach域不变特征确保无梯度
+    ds_detached = [feature.detach() for feature in ds]  # 中文注释：显式detach域特异特征确保无梯度
+    loss_module = LossDecouple()  # 中文注释：实例化待测损失模块
+    outputs = loss_module(raw_detached, inv_detached, ds_detached, said, require_grad=False)  # 中文注释：使用无梯度输入并显式禁用梯度计算
+    total = sum(outputs.values())  # 中文注释：聚合损失用于检查requires_grad传播状态
+    assert total.requires_grad is False  # 中文注释：确认聚合后的损失张量也不跟踪梯度
+    for value in outputs.values():  # 中文注释：遍历各损失分量
+        assert value.requires_grad is False  # 中文注释：确认每个单独损失均无梯度需求
