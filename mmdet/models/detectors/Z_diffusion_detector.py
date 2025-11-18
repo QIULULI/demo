@@ -110,6 +110,10 @@ class DiffusionDetector(BaseDetector):
         self.loss_decouple_weight = 1.0  # 初始化解耦损失整体权重默认1.0
         self.loss_couple = None  # 初始化耦合损失模块引用占位符
         self.loss_couple_weight = 1.0  # 初始化耦合损失整体权重默认1.0
+        self.ssdc_skip_local_loss = False  # 初始化是否跳过本地SS-DC损失的开关默认False保持向后兼容
+        self.ssdc_w_decouple_cfg = 1.0  # 初始化解耦损失的调度或常量配置默认1.0与旧逻辑一致
+        self.ssdc_w_couple_cfg = 1.0  # 初始化耦合损失的调度或常量配置默认1.0与旧逻辑一致
+        self._ssdc_last_iter = None  # 初始化最近一次前向使用的迭代索引用于权重调度
         self._ssdc_num_feature_levels = None  # 初始化特征层级数量占位便于运行时校验
         self._ssdc_level_names = None  # 初始化特征层级名称列表占位符用于配置同步
         self._ssdc_start_level = None  # 初始化特征层级起始索引占位符用于动态生成
@@ -140,6 +144,9 @@ class DiffusionDetector(BaseDetector):
         if self.enable_ssdc:  # 当确定启用SS-DC时实例化对应模块
             said_cfg_ref = ssdc_cfg.setdefault('said_filter', {})  # 初始化或获取SAID滤波器配置以便写入层级标签
             coupling_cfg_ref = ssdc_cfg.setdefault('coupling_neck', {})  # 初始化或获取耦合颈部配置以便写入层级标签
+            self.ssdc_skip_local_loss = bool(ssdc_cfg.get('skip_local_loss', False))  # 读取是否跳过本地SS-DC损失的配置默认False保持旧版累加逻辑
+            self.ssdc_w_decouple_cfg = copy.deepcopy(ssdc_cfg.get('w_decouple', 1.0))  # 缓存解耦损失权重的调度或常量默认1.0保持向后兼容
+            self.ssdc_w_couple_cfg = copy.deepcopy(ssdc_cfg.get('w_couple', 1.0))  # 缓存耦合损失权重的调度或常量默认1.0保持向后兼容
             num_feature_levels, level_names = self._infer_num_feature_levels(said_cfg_ref, coupling_cfg_ref)  # 调用内部方法优先基于实网结构推断层级数量与名称
             coupling_cfg_ref['num_feature_levels'] = num_feature_levels  # 将推断得到的特征层数写入耦合颈部配置供模块校验
             coupling_cfg_ref['levels'] = level_names  # 将统一生成的层级列表写入耦合颈部配置确保内部模块一致
@@ -256,6 +263,45 @@ class DiffusionDetector(BaseDetector):
         """bool: whether the detector has a RoI head"""
         return hasattr(self, 'roi_head') and self.roi_head is not None
 
+    @staticmethod
+    def _interp_schedule(schedule_cfg: Any, current_iter: Optional[int], default: float = 1.0) -> float:
+        """中文注释：解析常量或分段线性调度的权重。"""
+        if schedule_cfg is None:  # 中文注释：未提供配置时返回默认值保持兼容
+            return float(default)  # 中文注释：保证输出浮点避免类型不一致
+        if isinstance(schedule_cfg, (int, float)):  # 中文注释：当配置为简单数值时直接返回
+            return float(schedule_cfg)  # 中文注释：显式转换为浮点
+        if isinstance(schedule_cfg, dict):  # 中文注释：当配置为字典时尝试解析value或内部schedule
+            if 'schedule' in schedule_cfg:  # 中文注释：存在schedule字段时递归处理内部列表
+                return DiffusionDetector._interp_schedule(schedule_cfg.get('schedule'), current_iter, schedule_cfg.get('value', default))  # 中文注释：递归计算线性插值
+            if 'value' in schedule_cfg:  # 中文注释：仅包含value字段时直接取值
+                try:  # 中文注释：捕获类型转换异常
+                    return float(schedule_cfg['value'])  # 中文注释：返回转换后的浮点数
+                except Exception:  # 中文注释：若转换失败则回退默认
+                    return float(default)  # 中文注释：确保函数稳定返回
+        if not isinstance(schedule_cfg, (list, tuple)) or len(schedule_cfg) == 0:  # 中文注释：非列表或空列表时返回默认
+            return float(default)  # 中文注释：保持兼容
+        interp_points = []  # 中文注释：初始化插值节点容器
+        for node in schedule_cfg:  # 中文注释：遍历调度节点
+            if isinstance(node, (list, tuple)) and len(node) >= 2:  # 中文注释：校验节点格式
+                try:  # 中文注释：尝试解析迭代与权重
+                    interp_points.append((int(node[0]), float(node[1])))  # 中文注释：记录合法的调度节点
+                except Exception:  # 中文注释：非法节点跳过
+                    continue  # 中文注释：继续检查下一个节点
+        if not interp_points:  # 中文注释：无有效节点时返回默认
+            return float(default)  # 中文注释：避免空列表导致错误
+        interp_points = sorted(interp_points, key=lambda item: item[0])  # 中文注释：按迭代数排序节点
+        if current_iter is None:  # 中文注释：无迭代信息时使用首节点值
+            return float(interp_points[0][1])  # 中文注释：返回首节点权重
+        if current_iter <= interp_points[0][0]:  # 中文注释：迭代早于首节点
+            return float(interp_points[0][1])  # 中文注释：返回起始权重
+        if current_iter >= interp_points[-1][0]:  # 中文注释：迭代晚于末尾节点
+            return float(interp_points[-1][1])  # 中文注释：返回末尾权重
+        for (iter_a, val_a), (iter_b, val_b) in zip(interp_points[:-1], interp_points[1:]):  # 中文注释：遍历相邻节点区间
+            if iter_a <= current_iter <= iter_b:  # 中文注释：定位当前迭代所在区间
+                ratio = (current_iter - iter_a) / max(float(iter_b - iter_a), 1.0)  # 中文注释：计算线性插值比例避免除零
+                return float(val_a + ratio * (val_b - val_a))  # 中文注释：返回插值后的权重
+        return float(default)  # 中文注释：兜底返回默认值防止遗漏
+
     def extract_feat(self, batch_inputs: Tensor, ref_masks=None, ref_labels=None, current_iter: Optional[int] = None, ssdc_cfg: Optional[dict] = None) -> Tuple[Tensor]:
         """Extract features.
 
@@ -266,6 +312,7 @@ class DiffusionDetector(BaseDetector):
             tuple[Tensor]: Multi-level features that may have
             different resolutions.
         """
+        self._ssdc_last_iter = current_iter  # 中文注释：记录当前前向使用的迭代索引用于后续损失调度
         if ref_masks != None and ref_labels != None:
             x = self.backbone(batch_inputs, ref_masks, ref_labels)
         else:
@@ -276,38 +323,7 @@ class DiffusionDetector(BaseDetector):
         effective_ssdc_cfg = copy.deepcopy(ssdc_cfg) if ssdc_cfg is not None else copy.deepcopy(getattr(self, 'ssdc_cfg', {}))  # 中文注释：合并外部传入与内部缓存的SS-DC配置
         burn_in_iters = int(effective_ssdc_cfg.get('burn_in_iters', 0) or 0)  # 中文注释：读取烧入阶段迭代阈值用于早期禁用耦合
 
-        def _resolve_couple_weight(weight_cfg):  # 中文注释：解析耦合权重调度或常量
-            if isinstance(weight_cfg, (int, float)):  # 中文注释：简单数值直接返回
-                return float(weight_cfg)  # 中文注释：转为浮点保证后续比较
-            if isinstance(weight_cfg, dict):  # 中文注释：处理字典形式的调度配置
-                schedule_cfg = weight_cfg.get('schedule')  # 中文注释：尝试读取插值日程
-                if schedule_cfg is not None and current_iter is not None:  # 中文注释：仅在提供当前迭代时执行插值
-                    interp_points = []  # 中文注释：初始化插值节点列表
-                    for entry in schedule_cfg:  # 中文注释：遍历所有日程节点
-                        if isinstance(entry, (list, tuple)) and len(entry) >= 2:  # 中文注释：校验节点格式
-                            try:  # 中文注释：捕获潜在类型转换异常
-                                node_iter = int(entry[0])  # 中文注释：解析节点迭代编号
-                                node_value = float(entry[1])  # 中文注释：解析节点对应的权重
-                                interp_points.append((node_iter, node_value))  # 中文注释：记录有效节点
-                            except Exception:  # 中文注释：若解析失败则跳过当前节点
-                                continue  # 中文注释：继续处理其他节点
-                    if interp_points:  # 中文注释：存在有效节点时执行线性插值
-                        interp_points = sorted(interp_points, key=lambda item: item[0])  # 中文注释：按迭代排序节点
-                        if current_iter <= interp_points[0][0]:  # 中文注释：当前迭代早于首节点
-                            return float(interp_points[0][1])  # 中文注释：直接返回首节点权重
-                        for (iter_a, val_a), (iter_b, val_b) in zip(interp_points[:-1], interp_points[1:]):  # 中文注释：遍历相邻节点
-                            if iter_a <= current_iter <= iter_b:  # 中文注释：定位当前迭代所在区间
-                                ratio = (current_iter - iter_a) / max(float(iter_b - iter_a), 1.0)  # 中文注释：计算线性插值比例
-                                return float(val_a + ratio * (val_b - val_a))  # 中文注释：返回插值结果
-                        return float(interp_points[-1][1])  # 中文注释：超过尾节点则使用最后一个权重
-                if isinstance(weight_cfg.get('value', None), (int, float)):  # 中文注释：若未提供日程但有默认值
-                    return float(weight_cfg['value'])  # 中文注释：直接返回默认权重
-            try:  # 中文注释：尝试将其他格式转换为浮点
-                return float(weight_cfg)  # 中文注释：转换成功则返回对应权重
-            except Exception:  # 中文注释：解析失败时使用1.0作为安全默认值
-                return 1.0  # 中文注释：防止因异常导致耦合权重缺失
-
-        couple_weight = _resolve_couple_weight(effective_ssdc_cfg.get('w_couple', 1.0))  # 中文注释：计算当前迭代下的耦合权重
+        couple_weight = self._interp_schedule(effective_ssdc_cfg.get('w_couple', 1.0), current_iter, 1.0)  # 中文注释：计算当前迭代下的耦合权重支持常量与调度
         if current_iter is not None and burn_in_iters > 0 and current_iter < burn_in_iters:  # 中文注释：烧入阶段禁用SS-DC避免干扰监督学习
             bypass_ssdc = True  # 中文注释：设置绕过标志
         if couple_weight <= 0:  # 中文注释：耦合权重为0时直接跳过解耦与耦合
@@ -526,14 +542,20 @@ class DiffusionDetector(BaseDetector):
 
         # ssdc loss
         ##############################################################################################################
-        if self.training and self.enable_ssdc:  # 仅在训练阶段且开启SS-DC时计算额外损失
+        if self.training and self.enable_ssdc and not self.ssdc_skip_local_loss:  # 仅在训练阶段且开启SS-DC且未跳过时计算额外损失
             cache_noref = self.ssdc_feature_cache.get('noref')  # 读取无参考分支的SS-DC缓存
             cache_ref = self.ssdc_feature_cache.get('ref')  # 读取有参考分支的SS-DC缓存
             if cache_noref is not None and cache_ref is not None:  # 确保两个分支缓存均存在
                 ssdc_loss_dict = {}  # 初始化SS-DC损失累积字典
+                current_iter = self._ssdc_last_iter if self._ssdc_last_iter is not None else 0  # 中文注释：获取最近一次前向的迭代索引用于调度
+                decouple_schedule = self._interp_schedule(self.ssdc_w_decouple_cfg, current_iter, 1.0)  # 中文注释：解析当前迭代下解耦损失的调度权重
+                couple_schedule = self._interp_schedule(self.ssdc_w_couple_cfg, current_iter, 1.0)  # 中文注释：解析当前迭代下耦合损失的调度权重
+                effective_decouple_weight = self.loss_decouple_weight * decouple_schedule  # 中文注释：组合基础与调度系数得到解耦总权重
+                effective_couple_weight = self.loss_couple_weight * couple_schedule  # 中文注释：组合基础与调度系数得到耦合总权重
                 if (self.loss_decouple is not None  # 确认解耦损失模块已构建
                         and cache_noref['inv'] is not None  # 确认无参考分支解耦域不变特征可用
-                        and cache_noref['ds'] is not None):  # 确认无参考分支解耦域特异特征可用
+                        and cache_noref['ds'] is not None  # 确认无参考分支解耦域特异特征可用
+                        and effective_decouple_weight > 0):  # 中文注释：仅当解耦权重大于0时执行计算
                     decouple_noref = self.loss_decouple(  # 调用解耦损失模块计算无参考分支损失
                         cache_noref['raw'],  # 传入无参考分支原始特征供能量约束
                         cache_noref['inv'],  # 传入无参考分支域不变特征用于幂等与正交约束
@@ -544,11 +566,12 @@ class DiffusionDetector(BaseDetector):
                         decouple_noref)  # 传入原始无参考解耦损失字典
                     decouple_noref = reweight_loss_dict(  # 根据配置调整无参考解耦损失权重
                         decouple_noref,  # 传入已重命名的无参考解耦损失字典
-                        self.loss_decouple_weight)  # 传入无参考解耦损失总缩放系数
+                        effective_decouple_weight)  # 传入无参考解耦损失总缩放系数
                     ssdc_loss_dict.update(decouple_noref)  # 合并无参考解耦损失
                 if (self.loss_decouple is not None  # 确认解耦损失模块已构建
                         and cache_ref['inv'] is not None  # 确认有参考分支解耦域不变特征可用
-                        and cache_ref['ds'] is not None):  # 确认有参考分支解耦域特异特征可用
+                        and cache_ref['ds'] is not None  # 确认有参考分支解耦域特异特征可用
+                        and effective_decouple_weight > 0):  # 中文注释：仅当解耦权重大于0时才计算有参考分支损失
                     decouple_ref = self.loss_decouple(  # 调用解耦损失模块计算有参考分支损失
                         cache_ref['raw'],  # 传入有参考分支原始特征供能量约束
                         cache_ref['inv'],  # 传入有参考分支域不变特征用于幂等与正交约束
@@ -559,11 +582,12 @@ class DiffusionDetector(BaseDetector):
                         decouple_ref)  # 传入原始有参考解耦损失字典
                     decouple_ref = reweight_loss_dict(  # 根据配置调整有参考解耦损失权重
                         decouple_ref,  # 传入已重命名的有参考解耦损失字典
-                        self.loss_decouple_weight)  # 传入有参考解耦损失总缩放系数
+                        effective_decouple_weight)  # 传入有参考解耦损失总缩放系数
                     ssdc_loss_dict.update(decouple_ref)  # 合并有参考解耦损失
                 if (self.loss_couple is not None  # 确认耦合损失模块已构建
                         and cache_noref['coupled'] is not None  # 确认无参考分支耦合特征可用
-                        and cache_ref['inv'] is not None):  # 确认有参考分支域不变特征可用
+                        and cache_ref['inv'] is not None  # 确认有参考分支域不变特征可用
+                        and effective_couple_weight > 0):  # 中文注释：仅当耦合权重大于0时计算耦合损失
                     couple_loss = self.loss_couple(  # 调用耦合损失模块计算跨分支对齐损失
                         cache_noref['coupled'],  # 传入无参考分支耦合后特征用于对齐监督
                         cache_ref['inv'],  # 传入有参考分支域不变特征作为教师信号
@@ -573,7 +597,7 @@ class DiffusionDetector(BaseDetector):
                         couple_loss)  # 传入原始耦合损失字典
                     couple_loss = reweight_loss_dict(  # 根据配置调整耦合损失权重
                         couple_loss,  # 传入已重命名的耦合损失字典
-                        self.loss_couple_weight)  # 传入耦合损失总缩放系数
+                        effective_couple_weight)  # 传入耦合损失总缩放系数
                     ssdc_loss_dict.update(couple_loss)  # 合并耦合损失
                 losses.update(ssdc_loss_dict)  # 将SS-DC相关损失写入总损失字典
         ##############################################################################################################

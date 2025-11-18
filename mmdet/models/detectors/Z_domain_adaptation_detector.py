@@ -53,6 +53,9 @@ class DomainAdaptationDetector(BaseDetector):
         self.detector_name = detector.get('type')
         self.train_cfg = train_cfg  # 中文注释：缓存训练配置方便后续读取蒸馏调度参数
         self.ssdc_cfg = self.train_cfg.get('ssdc_cfg', {})  # 中文注释：读取SS-DC相关的训练配置便于后续动态调度
+        self.ssdc_compute_in_wrapper = bool(self.ssdc_cfg.get('compute_in_wrapper', True))  # 中文注释：控制SS-DC损失是否仅由包装器统一计算默认开启避免重复
+        self.ssdc_skip_student_loss = bool(self.ssdc_cfg.get('skip_student_ssdc_loss', self.ssdc_compute_in_wrapper))  # 中文注释：当包装器统一计算时默认跳过学生内部损失
+        self.ssdc_cfg.setdefault('skip_local_loss', self.ssdc_skip_student_loss)  # 中文注释：向学生侧传递跳过开关保持配置一致
         detector_cfg = self.train_cfg.detector_cfg  # 中文注释：提取检测器子配置以便访问蒸馏相关阈值
         self.warmup_start_iters = self.train_cfg.get(  # 中文注释：读取蒸馏预热起始迭代默认0保持兼容
             'warmup_start_iters', detector_cfg.get('warmup_start_iters', 0))
@@ -132,7 +135,7 @@ class DomainAdaptationDetector(BaseDetector):
                 warmup_weight = self._get_distill_warmup_weight(current_iter)  # 中文注释：根据迭代进度获取预热权重
                 semi_loss, diff_feature = self.model.loss_diff_adaptation(
                     multi_batch_inputs, multi_batch_data_samples, ssdc_cfg=self.ssdc_cfg, current_iter=current_iter)  # 中文注释：获取跨模型损失与教师特征并传入SS-DC配置用于伪标签过滤
-                ssdc_losses = self._compute_ssdc_loss(current_iter)  # 中文注释：先读取SS-DC缓存对应的额外损失，确保使用loss_diff_adaptation最新写入的前向缓存
+                ssdc_losses = self._compute_ssdc_loss(current_iter) if self.ssdc_compute_in_wrapper else {}  # 中文注释：根据配置决定是否在包装器内汇总SS-DC损失
                 feature_loss = self.loss_feature(
                     multi_batch_inputs['unsup_teacher'], diff_feature)  # 中文注释：在读取SS-DC损失后再计算特征蒸馏，避免额外前向刷新ssdc_feature_cache造成缓存漂移
                 losses.update(**semi_loss)  # 中文注释：合并跨模型损失项
