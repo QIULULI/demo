@@ -111,6 +111,7 @@ class DiffusionDetector(BaseDetector):
         self.loss_couple = None  # 初始化耦合损失模块引用占位符
         self.loss_couple_weight = 1.0  # 初始化耦合损失整体权重默认1.0
         self.ssdc_skip_local_loss = False  # 初始化是否跳过本地SS-DC损失的开关默认False保持向后兼容
+        self.ssdc_burn_in_iters = 0  # 初始化SS-DC烧入迭代计数默认0保持兼容
         self.ssdc_w_decouple_cfg = 1.0  # 初始化解耦损失的调度或常量配置默认1.0与旧逻辑一致
         self.ssdc_w_couple_cfg = 1.0  # 初始化耦合损失的调度或常量配置默认1.0与旧逻辑一致
         self._ssdc_last_iter = None  # 初始化最近一次前向使用的迭代索引用于权重调度
@@ -145,8 +146,11 @@ class DiffusionDetector(BaseDetector):
             said_cfg_ref = ssdc_cfg.setdefault('said_filter', {})  # 初始化或获取SAID滤波器配置以便写入层级标签
             coupling_cfg_ref = ssdc_cfg.setdefault('coupling_neck', {})  # 初始化或获取耦合颈部配置以便写入层级标签
             self.ssdc_skip_local_loss = bool(ssdc_cfg.get('skip_local_loss', False))  # 读取是否跳过本地SS-DC损失的配置默认False保持旧版累加逻辑
-            self.ssdc_w_decouple_cfg = copy.deepcopy(ssdc_cfg.get('w_decouple', 1.0))  # 缓存解耦损失权重的调度或常量默认1.0保持向后兼容
-            self.ssdc_w_couple_cfg = copy.deepcopy(ssdc_cfg.get('w_couple', 1.0))  # 缓存耦合损失权重的调度或常量默认1.0保持向后兼容
+            self.ssdc_burn_in_iters = int(ssdc_cfg.get('burn_in_iters', 0) or 0)  # 解析烧入迭代数若未配置则回退为0保持兼容
+            self.ssdc_w_decouple_cfg = self._prepare_ssdc_weight(ssdc_cfg.get('w_decouple', None), self.loss_decouple_weight)  # 解析解耦权重支持常量或调度未提供时使用loss_weight
+            self.ssdc_w_couple_cfg = self._prepare_ssdc_weight(ssdc_cfg.get('w_couple', None), self.loss_couple_weight)  # 解析耦合权重支持常量或调度未提供时使用loss_weight
+            self.ssdc_cfg['w_decouple'] = self.ssdc_w_decouple_cfg  # 中文注释：回写规范化后的解耦权重配置以便后续调用保持一致
+            self.ssdc_cfg['w_couple'] = self.ssdc_w_couple_cfg  # 中文注释：回写规范化后的耦合权重配置以便特征阶段使用同一来源
             num_feature_levels, level_names = self._infer_num_feature_levels(said_cfg_ref, coupling_cfg_ref)  # 调用内部方法优先基于实网结构推断层级数量与名称
             coupling_cfg_ref['num_feature_levels'] = num_feature_levels  # 将推断得到的特征层数写入耦合颈部配置供模块校验
             coupling_cfg_ref['levels'] = level_names  # 将统一生成的层级列表写入耦合颈部配置确保内部模块一致
@@ -262,6 +266,17 @@ class DiffusionDetector(BaseDetector):
     def with_roi_head(self) -> bool:
         """bool: whether the detector has a RoI head"""
         return hasattr(self, 'roi_head') and self.roi_head is not None
+
+    @staticmethod
+    def _prepare_ssdc_weight(raw_weight: Any, default_weight: float) -> Any:
+        """中文注释：将SS-DC权重配置规范化为常量或可插值序列。"""
+        if raw_weight is None:  # 中文注释：当未提供权重配置时直接使用loss_weight保证兼容
+            return float(default_weight)  # 中文注释：返回基础权重的浮点数
+        if isinstance(raw_weight, (int, float)):  # 中文注释：若配置为数值则转换为浮点后返回
+            return float(raw_weight)  # 中文注释：确保后续插值输入类型统一
+        if isinstance(raw_weight, (list, tuple)):  # 中文注释：若配置为列表或元组视为调度表
+            return copy.deepcopy(raw_weight)  # 中文注释：深拷贝调度表避免外部修改
+        return copy.deepcopy(raw_weight)  # 中文注释：对字典等复杂类型保持深拷贝以便后续插值
 
     @staticmethod
     def _interp_schedule(schedule_cfg: Any, current_iter: Optional[int], default: float = 1.0) -> float:
@@ -548,10 +563,13 @@ class DiffusionDetector(BaseDetector):
             if cache_noref is not None and cache_ref is not None:  # 确保两个分支缓存均存在
                 ssdc_loss_dict = {}  # 初始化SS-DC损失累积字典
                 current_iter = self._ssdc_last_iter if self._ssdc_last_iter is not None else 0  # 中文注释：获取最近一次前向的迭代索引用于调度
-                decouple_schedule = self._interp_schedule(self.ssdc_w_decouple_cfg, current_iter, 1.0)  # 中文注释：解析当前迭代下解耦损失的调度权重
-                couple_schedule = self._interp_schedule(self.ssdc_w_couple_cfg, current_iter, 1.0)  # 中文注释：解析当前迭代下耦合损失的调度权重
-                effective_decouple_weight = self.loss_decouple_weight * decouple_schedule  # 中文注释：组合基础与调度系数得到解耦总权重
-                effective_couple_weight = self.loss_couple_weight * couple_schedule  # 中文注释：组合基础与调度系数得到耦合总权重
+                burn_in_iters = getattr(self, 'ssdc_burn_in_iters', 0)  # 中文注释：读取配置的烧入迭代数未设置则回退为0
+                in_burn_in = burn_in_iters > 0 and current_iter < burn_in_iters  # 中文注释：判断当前迭代是否处于烧入阶段
+                effective_decouple_weight = self._interp_schedule(self.ssdc_w_decouple_cfg, current_iter, self.loss_decouple_weight)  # 中文注释：解析当前迭代下解耦损失的有效权重
+                effective_couple_weight = self._interp_schedule(self.ssdc_w_couple_cfg, current_iter, self.loss_couple_weight)  # 中文注释：解析当前迭代下耦合损失的有效权重
+                if in_burn_in:  # 中文注释：在烧入阶段直接屏蔽两项损失确保稳定
+                    effective_decouple_weight = 0.0  # 中文注释：烧入期解耦损失权重设为0
+                    effective_couple_weight = 0.0  # 中文注释：烧入期耦合损失权重设为0
                 if (self.loss_decouple is not None  # 确认解耦损失模块已构建
                         and cache_noref['inv'] is not None  # 确认无参考分支解耦域不变特征可用
                         and cache_noref['ds'] is not None  # 确认无参考分支解耦域特异特征可用
@@ -744,3 +762,14 @@ class DiffusionDetector(BaseDetector):
             return batch_data_samples
         else:
             return batch_data_samples, x
+
+# 自检示例：
+# >>> import torch  # 中文注释：导入PyTorch用于构造假输入
+# >>> from mmengine import Config  # 中文注释：导入配置解析工具以复用训练配置
+# >>> from mmdet.utils import register_all_modules  # 中文注释：导入注册函数确保组件可被构建
+# >>> from mmdet.registry import MODELS  # 中文注释：导入注册表用于实例化模型
+# >>> register_all_modules()  # 中文注释：注册检测相关模块保证构造时能找到组件
+# >>> cfg = Config.fromfile('configs/your_diffusion_cfg.py')  # 中文注释：加载实际训练使用的扩散检测器配置文件
+# >>> model = MODELS.build(cfg.model)  # 中文注释：根据完整配置构建扩散检测器实例
+# >>> dummy_img = torch.randn(1, 3, 224, 224)  # 中文注释：创建假输入张量模拟单张图片
+# >>> _ = model.forward(dummy_img, data_samples=None, mode='tensor')  # 中文注释：执行一次张量前向验证接口兼容
