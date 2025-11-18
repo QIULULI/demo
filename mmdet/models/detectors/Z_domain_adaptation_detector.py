@@ -451,7 +451,8 @@ class DomainAdaptationDetector(BaseDetector):
             student_coupled = student_cache.get('coupled')  # 中文注释：读取学生耦合后特征
             teacher_inv = teacher_cache.get('inv')  # 中文注释：读取教师域不变特征作为对齐目标
             if student_coupled is not None and teacher_inv is not None and getattr(student_detector, 'loss_couple', None) is not None:  # 中文注释：确保必要组件存在
-                couple_loss = student_detector.loss_couple(student_coupled, teacher_inv, student_cache.get('stats', {}))  # 中文注释：计算耦合特征对齐损失
+                detached_teacher_inv = [feat.detach() if torch.is_tensor(feat) else feat for feat in teacher_inv]  # 中文注释：对教师域不变特征执行detach防止反向传播至EMA教师
+                couple_loss = student_detector.loss_couple(student_coupled, detached_teacher_inv, student_cache.get('stats', {}))  # 中文注释：计算耦合特征对齐损失
                 couple_loss = rename_loss_dict('ssdc_couple_', couple_loss)  # 中文注释：添加日志前缀
                 couple_loss = reweight_loss_dict(couple_loss, w_couple)  # 中文注释：应用耦合调度权重
                 losses.update(couple_loss)  # 中文注释：合并耦合损失
