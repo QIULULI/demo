@@ -57,6 +57,7 @@ class DomainAdaptationDetector(BaseDetector):
         self.ssdc_skip_student_loss = bool(self.ssdc_cfg.get('skip_student_ssdc_loss', self.ssdc_compute_in_wrapper))  # 中文注释：当包装器统一计算时默认跳过学生内部损失
         self.ssdc_cfg.setdefault('skip_local_loss', self.ssdc_skip_student_loss)  # 中文注释：向学生侧传递跳过开关保持配置一致
         self._propagate_ssdc_skip_flags()  # 中文注释：在模型构建后立即下发跳过本地SS-DC损失的控制位避免重复累加
+        self._cached_main_teacher_inv = None  # 中文注释：缓存扩散教师提供的域不变特征以便在SS-DC阶段复用
         detector_cfg = self.train_cfg.detector_cfg  # 中文注释：提取检测器子配置以便访问蒸馏相关阈值
         self.warmup_start_iters = self.train_cfg.get(  # 中文注释：读取蒸馏预热起始迭代默认0保持兼容
             'warmup_start_iters', detector_cfg.get('warmup_start_iters', 0))
@@ -161,6 +162,7 @@ class DomainAdaptationDetector(BaseDetector):
                 warmup_weight = self._get_distill_warmup_weight(current_iter)  # 中文注释：根据迭代进度获取预热权重
                 semi_loss, diff_feature = self.model.loss_diff_adaptation(
                     multi_batch_inputs, multi_batch_data_samples, ssdc_cfg=self.ssdc_cfg, current_iter=current_iter)  # 中文注释：获取跨模型损失与教师特征并传入SS-DC配置用于伪标签过滤
+                self._update_ssdc_teacher_override(diff_feature)  # 中文注释：尝试从扩散教师返回包中提取域不变特征供SS-DC损失阶段直接复用
                 ssdc_losses = self._compute_ssdc_loss(current_iter) if self.ssdc_compute_in_wrapper else {}  # 中文注释：根据配置决定是否在包装器内汇总SS-DC损失
                 feature_loss = self.loss_feature(
                     multi_batch_inputs['unsup_teacher'], diff_feature, current_iter=current_iter)  # 中文注释：在读取SS-DC损失后再计算特征蒸馏并同步当前迭代索引，避免额外前向刷新ssdc_feature_cache造成缓存漂移
@@ -466,6 +468,7 @@ class DomainAdaptationDetector(BaseDetector):
             teacher_cache = teacher_detector.ssdc_feature_cache.get('noref', None)  # 中文注释：优先读取教师无参考分支缓存
             if teacher_cache is None:  # 中文注释：当教师无参考缓存为空时回退到参考分支
                 teacher_cache = teacher_detector.ssdc_feature_cache.get('ref', None)  # 中文注释：尝试使用参考分支的缓存特征
+        teacher_cache_override = self._build_teacher_cache_override()  # 中文注释：若扩散教师已提供域不变特征则构造伪教师缓存供耦合与一致性损失复用
         w_decouple = self._interp_schedule(self.ssdc_cfg.get('w_decouple', 0.0), current_iter, 0.0)  # 中文注释：插值获得解耦损失权重
         w_couple = self._interp_schedule(self.ssdc_cfg.get('w_couple', 0.0), current_iter, 0.0)  # 中文注释：插值获得耦合损失权重
         w_di = self._interp_schedule(self.ssdc_cfg.get('w_di_consistency', 0.0), current_iter, 0.0)  # 中文注释：获取域不变一致性权重
@@ -497,18 +500,24 @@ class DomainAdaptationDetector(BaseDetector):
             teacher_decouple = rename_loss_dict('ssdc_teacher_decouple_', teacher_decouple)  # 中文注释：添加教师前缀便于区分
             teacher_decouple = reweight_loss_dict(teacher_decouple, w_decouple)  # 中文注释：应用相同调度权重
             losses.update(teacher_decouple)  # 中文注释：合并教师解耦损失
-        if w_couple > 0 and student_cache is not None and teacher_cache is not None:  # 中文注释：当耦合权重大于0且缓存可用时计算耦合损失
+        if w_couple > 0 and student_cache is not None and (teacher_cache is not None or teacher_cache_override is not None):  # 中文注释：当耦合权重大于0且任意教师缓存可用时计算耦合损失
             student_coupled = student_cache.get('coupled')  # 中文注释：读取学生耦合后特征
-            teacher_inv = teacher_cache.get('inv')  # 中文注释：读取教师域不变特征作为对齐目标
+            teacher_inv = teacher_cache.get('inv') if teacher_cache is not None else None  # 中文注释：优先使用EMA教师缓存中的域不变特征
+            if teacher_inv is None and teacher_cache_override is not None:  # 中文注释：若EMA教师未提供域不变特征则回退到扩散教师缓存
+                teacher_inv = teacher_cache_override.get('inv')  # 中文注释：直接使用扩散教师返回的域不变特征
             if student_coupled is not None and teacher_inv is not None and getattr(student_detector, 'loss_couple', None) is not None:  # 中文注释：确保必要组件存在
                 # detached_teacher_inv = [feat.detach() if torch.is_tensor(feat) else feat for feat in teacher_inv]  # 中文注释：对教师域不变特征执行detach防止反向传播至EMA教师
                 couple_loss = student_detector.loss_couple(student_coupled, teacher_inv, student_cache.get('stats', {}))  # 中文注释：计算耦合特征对齐损失
                 couple_loss = rename_loss_dict('ssdc_couple_', couple_loss)  # 中文注释：添加日志前缀
                 couple_loss = reweight_loss_dict(couple_loss, w_couple)  # 中文注释：应用耦合调度权重
                 losses.update(couple_loss)  # 中文注释：合并耦合损失
-        if w_di > 0 and student_cache is not None and teacher_cache is not None and student_cache.get('inv') is not None and teacher_cache.get('inv') is not None:  # 中文注释：当域不变特征齐全时计算一致性
+        if w_di > 0 and student_cache is not None and (teacher_cache is not None or teacher_cache_override is not None) and student_cache.get('inv') is not None:  # 中文注释：当域不变特征齐全时计算一致性
             student_inv = student_cache.get('inv')  # 中文注释：获取学生域不变特征序列
-            teacher_inv = teacher_cache.get('inv')  # 中文注释：获取教师域不变特征序列
+            teacher_inv = teacher_cache.get('inv') if teacher_cache is not None else None  # 中文注释：优先读取EMA教师缓存中的域不变特征序列
+            if teacher_inv is None and teacher_cache_override is not None:  # 中文注释：当EMA教师缺少域不变特征时使用扩散教师提供的伪缓存
+                teacher_inv = teacher_cache_override.get('inv')  # 中文注释：取出扩散教师提供的域不变特征序列
+            if teacher_inv is None:  # 中文注释：若仍然缺失域不变特征则无法执行一致性损失
+                return losses  # 中文注释：直接返回当前累计的SS-DC损失
             if isinstance(student_inv, (list, tuple)) and isinstance(teacher_inv, (list, tuple)):
                 valid_pairs = [(s, t) for s, t in zip(student_inv, teacher_inv) if torch.is_tensor(s) and torch.is_tensor(t)]  # 中文注释：筛选双方均为张量的层级
                 if valid_pairs:  # 中文注释：存在有效层级才计算
@@ -518,6 +527,45 @@ class DomainAdaptationDetector(BaseDetector):
                     mse_total = mse_total / float(len(valid_pairs))  # 中文注释：对层级数量取均值保持尺度稳定
                     losses['ssdc_di_consistency_loss'] = mse_total * w_di  # 中文注释：记录域不变一致性损失并按权重缩放
         return losses  # 中文注释：返回SS-DC综合损失
+
+    def _update_ssdc_teacher_override(self, diff_feature: Any) -> None:
+        """中文注释：从扩散教师输出中提取域不变特征并缓存供SS-DC损失复用。"""
+        candidate_inv = None  # 中文注释：初始化候选域不变特征占位符
+        if isinstance(diff_feature, dict):  # 中文注释：仅在扩散教师返回字典时尝试读取域不变特征
+            candidate_inv = diff_feature.get('main_teacher_inv')  # 中文注释：主教师域不变特征存放在main_teacher_inv键下
+        if candidate_inv is None and isinstance(self.ssdc_cfg, dict):  # 中文注释：若扩散教师未返回则回退到SS-DC配置查找
+            candidate_inv = self.ssdc_cfg.get('main_teacher_inv')  # 中文注释：允许外部组件通过配置直接写入域不变特征
+        self._cached_main_teacher_inv = self._sanitize_teacher_inv(candidate_inv)  # 中文注释：对候选特征执行detach并缓存
+
+    @staticmethod
+    def _sanitize_teacher_inv(candidate_inv: Any) -> Optional[Tuple[Tensor, ...]]:
+        """中文注释：将任意结构的域不变特征转换为detach后的张量元组。"""
+        if candidate_inv is None:  # 中文注释：当缺失候选特征时直接返回None
+            return None  # 中文注释：无需进一步处理
+        if isinstance(candidate_inv, dict):  # 中文注释：兼容以字典形式传递的域不变特征
+            candidate_inv = candidate_inv.get('inv', candidate_inv.get('main_teacher_inv'))  # 中文注释：优先读取inv字段否则回退main_teacher_inv
+        if torch.is_tensor(candidate_inv):  # 中文注释：当输入为单个张量时
+            return (candidate_inv.detach(),)  # 中文注释：detach后封装为元组返回
+        if isinstance(candidate_inv, (list, tuple)):  # 中文注释：当输入为序列时
+            sanitized = []  # 中文注释：初始化处理结果列表
+            for entry in candidate_inv:  # 中文注释：遍历每个尺度特征
+                if torch.is_tensor(entry):  # 中文注释：仅处理真实张量
+                    sanitized.append(entry.detach())  # 中文注释：detach以断开扩散教师计算图
+            if not sanitized:  # 中文注释：若序列中不存在有效张量
+                return None  # 中文注释：直接返回None
+            return tuple(sanitized)  # 中文注释：将处理后的张量列表转换为元组
+        return None  # 中文注释：对无法解析的结构返回None
+
+    def _build_teacher_cache_override(self) -> Optional[Dict[str, Any]]:
+        """中文注释：将缓存的域不变特征封装为伪教师缓存供耦合/一致性损失调用。"""
+        teacher_inv = getattr(self, '_cached_main_teacher_inv', None)  # 中文注释：读取上一次扩散教师返回的域不变特征
+        if teacher_inv is None and isinstance(self.ssdc_cfg, dict):  # 中文注释：若缓存为空则尝试从配置读取
+            teacher_inv = self._sanitize_teacher_inv(self.ssdc_cfg.get('main_teacher_inv'))  # 中文注释：对配置中的特征执行标准化
+            if teacher_inv is not None:  # 中文注释：当从配置成功提取时同步写入缓存
+                self._cached_main_teacher_inv = teacher_inv  # 中文注释：保留以避免重复解析
+        if teacher_inv is None:  # 中文注释：若最终仍无域不变特征则返回None
+            return None  # 中文注释：外层逻辑将回退到EMA教师缓存
+        return {'inv': teacher_inv, 'raw': None, 'ds': None}  # 中文注释：构造仅包含域不变特征的伪教师缓存以符合LossCouple接口需求
 
     def loss_cross_feature(self, cross_teacher_info: Any) -> dict:
         """中文注释：计算交叉教师提供的分类与回归一致性损失。"""
