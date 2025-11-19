@@ -13,6 +13,8 @@ detector.detector.roi_head.bbox_head.num_classes = 1  # 中文注释：任务为
 detector.detector.init_cfg = dict(type='Pretrained', checkpoint='work_dirs/DG/Ours/drone/student_rgb_fused.pth')  # 中文注释：加载Stage-1学生权重作为初始化
 detector.detector.enable_ssdc = True  # 中文注释：开启SS-DC模块构建SAID与耦合颈
 detector.detector.use_ds_tokens = True  # 中文注释：启用域特异token以支撑解耦
+detector.detector.backbone.setdefault('ssdc_cfg', dict())  # 中文注释：确保骨干网络具备SS-DC子配置容器方便写入跳过开关
+detector.detector.backbone.ssdc_cfg['skip_local_loss'] = True  # 中文注释：显式要求学生模型在本地损失阶段跳过SS-DC计算
 
 # 中文注释：包装DomainAdaptationDetector并指定训练超参
 model = dict(
