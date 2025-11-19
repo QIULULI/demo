@@ -425,6 +425,20 @@ class SemiBaseDiffDetector(BaseDetector):
                 return float(val_a + ratio * (val_b - val_a))  # 中文注释：返回插值结果
         return default  # 中文注释：兜底返回默认值
 
+    @staticmethod
+    def _as_homography_tensor(matrix: Any, device: torch.device, dtype: torch.dtype) -> Tensor:
+        """中文注释：将多种格式的单应性矩阵安全地转换为指定设备与精度的张量。"""
+        if matrix is None:  # 中文注释：当未提供矩阵时默认使用单位矩阵代表无几何变换
+            return torch.eye(3, device=device, dtype=dtype)  # 中文注释：单位矩阵表示原图坐标与目标坐标一致
+        if torch.is_tensor(matrix):  # 中文注释：若输入已为张量则直接转换设备与精度
+            return matrix.to(device=device, dtype=dtype)  # 中文注释：返回调整后的单应性矩阵
+        return torch.as_tensor(matrix, device=device, dtype=dtype)  # 中文注释：将numpy或列表转换为张量格式
+
+    @staticmethod
+    def _project_with_homography(boxes: Tensor, homography: Tensor, target_shape: Optional[Tuple[int, int]]) -> Tensor:
+        """中文注释：使用提供的单应性矩阵将边界框投影到目标坐标系。"""
+        return bbox_project(boxes, homography, target_shape)  # 中文注释：直接调用bbox_project完成坐标变换并可选裁剪
+
     @torch.no_grad()
     def _apply_di_gate(self, teacher_pseudo_samples: SampleList,
                        student_pseudo_samples: SampleList,
@@ -462,6 +476,8 @@ class SemiBaseDiffDetector(BaseDetector):
         student_map = student_inv[0]  # 中文注释：学生端同样使用首层
         if teacher_map is None or student_map is None:  # 中文注释：首层缺失则跳过
             return  # 中文注释：保持伪标签
+        teacher_input_hw = (int(teacher_inputs.shape[-2]), int(teacher_inputs.shape[-1]))  # 中文注释：记录教师输入的高宽便于投影兜底
+        student_input_hw = (int(student_inputs.shape[-2]), int(student_inputs.shape[-1]))  # 中文注释：记录学生输入的高宽信息
         if teacher_inputs.shape[-1] > 0:  # 中文注释：当输入宽度大于0时计算教师缩放比
             teacher_scale = float(teacher_map.shape[-1]) / float(teacher_inputs.shape[-1])  # 中文注释：用特征图宽度除以输入宽度得到缩放系数
         else:  # 中文注释：输入宽度异常时退回默认缩放比
@@ -490,26 +506,60 @@ class SemiBaseDiffDetector(BaseDetector):
             if teacher_boxes.numel() == 0 or student_boxes.numel() == 0:  # 中文注释：若任一侧无框则不做相似度过滤
                 filtered_samples.append(student_sample)  # 中文注释：直接加入结果列表
                 continue  # 中文注释：继续处理下一个样本
-            if teacher_boxes.shape[0] == student_boxes.shape[0]:  # 中文注释：当教师与学生框数量一致时按索引对齐
-                matched_teacher_boxes = teacher_boxes  # 中文注释：直接使用教师框序列
-                matched_student_boxes = student_boxes  # 中文注释：直接使用学生框序列
+            teacher_origin_boxes = getattr(teacher_sample.gt_instances, 'origin_bboxes', teacher_boxes).to(  # 中文注释：优先读取显式缓存的原图坐标
+                device=teacher_map.device, dtype=teacher_map.dtype)  # 中文注释：对齐到教师特征所在设备与精度
+            teacher_view_boxes = getattr(teacher_sample.gt_instances, 'teacher_view_bboxes', None)  # 中文注释：尝试读取教师特征视角下的边界框
+            if teacher_view_boxes is None:  # 中文注释：当缓存缺失时根据单应性矩阵重新映射
+                teacher_homography = self._as_homography_tensor(  # 中文注释：转换单应性矩阵为张量
+                    getattr(teacher_sample, 'homography_matrix', None), teacher_map.device, teacher_map.dtype)
+                teacher_target_shape = getattr(teacher_sample, 'img_shape', teacher_input_hw)  # 中文注释：确定教师输入空间大小
+                teacher_view_boxes = self._project_with_homography(  # 中文注释：将原图框映射到教师视角
+                    teacher_origin_boxes, teacher_homography, teacher_target_shape)
+            else:
+                teacher_view_boxes = teacher_view_boxes.to(device=teacher_map.device, dtype=teacher_map.dtype)  # 中文注释：确保缓存框与特征同设备精度
+            student_view_boxes = getattr(student_sample.gt_instances, 'student_view_bboxes', None)  # 中文注释：尝试读取学生视角下的边界框
+            student_homography = self._as_homography_tensor(  # 中文注释：转换学生单应性矩阵
+                getattr(student_sample, 'homography_matrix', None), student_map.device, student_map.dtype)
+            student_target_shape = getattr(student_sample, 'img_shape', student_input_hw)  # 中文注释：确定学生输入空间尺寸
+            if student_view_boxes is None:  # 中文注释：若未缓存学生视角框则从原图框推回
+                origin_boxes_hint = getattr(student_sample.gt_instances, 'origin_bboxes', None)  # 中文注释：仅在存在原图坐标缓存时才执行投影
+                if origin_boxes_hint is not None:  # 中文注释：确认原图坐标可用
+                    origin_boxes_hint = origin_boxes_hint.to(device=student_map.device, dtype=student_map.dtype)  # 中文注释：对齐设备与精度
+                    student_view_boxes = self._project_with_homography(  # 中文注释：根据学生单应性矩阵映射到学生视角
+                        origin_boxes_hint, student_homography, student_target_shape)
+                else:
+                    student_view_boxes = student_boxes.to(device=student_map.device, dtype=student_map.dtype)  # 中文注释：若无法回推则默认当前框已在学生视角
+            else:
+                student_view_boxes = student_view_boxes.to(device=student_map.device, dtype=student_map.dtype)  # 中文注释：将缓存框迁移到学生特征设备
+            student_inverse_h = student_homography.inverse()  # 中文注释：求逆矩阵以便将学生框投影回原图
+            student_origin_shape = getattr(student_sample, 'ori_shape', student_target_shape)  # 中文注释：确定原图尺寸用于裁剪
+            student_origin_boxes = self._project_with_homography(  # 中文注释：得到学生框在原图坐标下的表示
+                student_view_boxes, student_inverse_h, student_origin_shape)
+            student_origin_boxes = student_origin_boxes.to(device=teacher_origin_boxes.device, dtype=teacher_origin_boxes.dtype)  # 中文注释：对齐设备与精度以便IoU计算
+            if teacher_origin_boxes.shape[0] == student_origin_boxes.shape[0]:  # 中文注释：当教师与学生框数量一致时按索引对齐
+                matched_teacher_boxes = teacher_origin_boxes  # 中文注释：直接使用原图坐标的教师框
+                matched_teacher_view = teacher_view_boxes  # 中文注释：同步记录教师特征坐标下的框
+                matched_student_boxes = student_origin_boxes  # 中文注释：直接使用原图坐标的学生框
+                matched_student_view = student_view_boxes  # 中文注释：同步学生特征坐标下的框
                 matched_mask = torch.ones(  # 中文注释：创建匹配掩码张量
-                    student_boxes.shape[0], dtype=torch.bool, device=student_boxes.device)  # 中文注释：默认全保留便于后续覆盖
+                    student_origin_boxes.shape[0], dtype=torch.bool, device=student_origin_boxes.device)  # 中文注释：默认全保留便于后续覆盖
             else:  # 中文注释：数量不一致时使用IoU进行匹配
-                iou_matrix = bbox_overlaps(teacher_boxes, student_boxes, mode='iou')  # 中文注释：计算教师与学生框的IoU矩阵
+                iou_matrix = bbox_overlaps(teacher_origin_boxes, student_origin_boxes, mode='iou')  # 中文注释：计算教师与学生框的IoU矩阵
                 best_iou, best_teacher_idx = iou_matrix.max(dim=0)  # 中文注释：对每个学生框选择最佳教师框及其IoU
                 matched_mask = best_iou > 0  # 中文注释：仅保留存在重叠的学生框参与过滤
                 if not matched_mask.any():  # 中文注释：若无任何有效匹配则直接跳过过滤
                     filtered_samples.append(student_sample)  # 中文注释：保持学生伪标签
                     continue  # 中文注释：进入下一张图像
-                matched_teacher_boxes = teacher_boxes[best_teacher_idx[matched_mask]]  # 中文注释：根据匹配索引提取对应教师框
-                matched_student_boxes = student_boxes[matched_mask]  # 中文注释：提取参与匹配的学生框
+                matched_teacher_boxes = teacher_origin_boxes[best_teacher_idx[matched_mask]]  # 中文注释：根据匹配索引提取对应教师框
+                matched_teacher_view = teacher_view_boxes[best_teacher_idx[matched_mask]]  # 中文注释：同步抽取教师特征坐标下的框
+                matched_student_boxes = student_origin_boxes[matched_mask]  # 中文注释：提取参与匹配的学生框
+                matched_student_view = student_view_boxes[matched_mask]  # 中文注释：同步抽取学生特征坐标下的框
             teacher_batch_index = torch.full(  # 中文注释：构造教师ROI对应的批次索引列
-                (matched_teacher_boxes.shape[0], 1), batch_idx, device=matched_teacher_boxes.device)  # 中文注释：批次索引用于对齐
-            teacher_roi = torch.cat([teacher_batch_index, matched_teacher_boxes], dim=1)  # 中文注释：拼接索引与教师框形成ROI
+                (matched_teacher_view.shape[0], 1), batch_idx, device=matched_teacher_view.device, dtype=matched_teacher_view.dtype)  # 中文注释：批次索引用于对齐
+            teacher_roi = torch.cat([teacher_batch_index, matched_teacher_view], dim=1)  # 中文注释：拼接索引与教师框形成ROI
             student_batch_index = torch.full(  # 中文注释：构造学生ROI对应的批次索引列
-                (matched_student_boxes.shape[0], 1), batch_idx, device=matched_student_boxes.device)  # 中文注释：批次索引用于对齐
-            student_roi = torch.cat([student_batch_index, matched_student_boxes], dim=1)  # 中文注释：拼接索引与学生框形成ROI
+                (matched_student_view.shape[0], 1), batch_idx, device=matched_student_view.device, dtype=matched_student_view.dtype)  # 中文注释：批次索引用于对齐
+            student_roi = torch.cat([student_batch_index, matched_student_view], dim=1)  # 中文注释：拼接索引与学生框形成ROI
             pooled_teacher = roi_align(  # 中文注释：在教师特征图上对齐当前样本ROI
                 teacher_map, teacher_roi, output_size=1, spatial_scale=teacher_scale, aligned=True)  # 中文注释：采样得到教师ROI特征
             pooled_student = roi_align(  # 中文注释：在学生特征图上对齐当前样本ROI
@@ -562,10 +612,16 @@ class SemiBaseDiffDetector(BaseDetector):
             batch_info = {}  # 初始化批处理信息占位符
             for data_samples, results in zip(batch_data_samples, results_list):  # 遍历样本与预测结果
                 data_samples.gt_instances = results.pred_instances  # 写入伪实例以供后续训练
-                data_samples.gt_instances.bboxes = bbox_project(  # 将预测框映射回原图坐标系
-                    data_samples.gt_instances.bboxes,
-                    torch.from_numpy(data_samples.homography_matrix).inverse().to(
-                        self.data_preprocessor.device), data_samples.ori_shape)
+                teacher_view_boxes = data_samples.gt_instances.bboxes.detach().clone()  # 中文注释：缓存教师视角下的边界框以便后续对齐
+                teacher_view_boxes = teacher_view_boxes.to(device=self.data_preprocessor.device)  # 中文注释：将教师视角框迁移到预处理器所在设备
+                data_samples.gt_instances.teacher_view_bboxes = teacher_view_boxes.clone()  # 中文注释：显式区分教师特征坐标系下的边界框
+                homography_tensor = self._as_homography_tensor(  # 中文注释：将单应性矩阵转换为张量方便求逆
+                    data_samples.homography_matrix, self.data_preprocessor.device, teacher_view_boxes.dtype)
+                inverse_homography = homography_tensor.inverse()  # 中文注释：求逆得到从教师视角映射回原图的矩阵
+                projected_boxes = self._project_with_homography(  # 中文注释：利用逆矩阵将教师框映射回原图坐标
+                    teacher_view_boxes, inverse_homography, data_samples.ori_shape)
+                data_samples.gt_instances.bboxes = projected_boxes  # 中文注释：更新原图坐标下的伪标签
+                data_samples.gt_instances.origin_bboxes = projected_boxes.detach().clone()  # 中文注释：缓存原图坐标供后续再映射
             if isinstance(diff_feature, (list, tuple)):  # 若返回的是按层排列的特征序列
                 primary_features = list(diff_feature)  # 转换为列表以便后续统一封装
             else:  # 若返回单一张量
@@ -631,11 +687,17 @@ class SemiBaseDiffDetector(BaseDetector):
             for local_idx, sample_idx in enumerate(sample_indices):  # 遍历组内样本
                 origin_sample = batch_data_samples[sample_idx]  # 获取原始数据样本
                 origin_sample.gt_instances = primary_results[local_idx].pred_instances  # 写入伪标签实例
+                teacher_view_boxes = origin_sample.gt_instances.bboxes.detach().clone()  # 中文注释：缓存教师视角坐标的边界框
+                teacher_view_boxes = teacher_view_boxes.to(device=self.data_preprocessor.device)  # 中文注释：将教师视角框迁移至预处理器设备
+                origin_sample.gt_instances.teacher_view_bboxes = teacher_view_boxes.clone()  # 中文注释：记录教师特征坐标系下的框
                 sensor_tag_list[sample_idx] = sensor_tag  # 中文注释：记录当前样本的传感器标签供后续蒸馏使用
-                origin_sample.gt_instances.bboxes = bbox_project(  # 逆映射预测框到原图空间
-                    origin_sample.gt_instances.bboxes,
-                    torch.from_numpy(origin_sample.homography_matrix).inverse().to(
-                        self.data_preprocessor.device), origin_sample.ori_shape)
+                homography_tensor = self._as_homography_tensor(  # 中文注释：转换单应性矩阵为张量形式
+                    origin_sample.homography_matrix, self.data_preprocessor.device, teacher_view_boxes.dtype)
+                inverse_homography = homography_tensor.inverse()  # 中文注释：求逆以从教师视角回到原图坐标
+                projected_boxes = self._project_with_homography(  # 中文注释：将教师视角框映射到原图
+                    teacher_view_boxes, inverse_homography, origin_sample.ori_shape)
+                origin_sample.gt_instances.bboxes = projected_boxes  # 中文注释：覆盖为原图坐标的伪标签
+                origin_sample.gt_instances.origin_bboxes = projected_boxes.detach().clone()  # 中文注释：缓存原图坐标副本以便后续再投影
                 if isinstance(primary_feature, (list, tuple)) and primary_feature and all(torch.is_tensor(level_feat) for level_feat in primary_feature):  # 中文注释：当主教师以多尺度张量列表返回时按样本提取每个尺度
                     primary_feature_list[sample_idx] = [level_feat[local_idx] for level_feat in primary_feature]  # 中文注释：逐尺度切片并构成当前样本的特征列表
                 elif torch.is_tensor(primary_feature):  # 中文注释：当主教师特征为单个张量时直接按样本索引切片
@@ -867,10 +929,12 @@ class SemiBaseDiffDetector(BaseDetector):
                                                   batch_data_samples):
             data_samples.gt_instances = copy.deepcopy(
                 pseudo_instances.gt_instances)
-            data_samples.gt_instances.bboxes = bbox_project(
+            projected_student_boxes = bbox_project(  # 中文注释：将原图伪框根据学生单应性矩阵投影到学生视角
                 data_samples.gt_instances.bboxes,
                 torch.tensor(data_samples.homography_matrix).to(
                     self.data_preprocessor.device), data_samples.img_shape)
+            data_samples.gt_instances.bboxes = projected_student_boxes  # 中文注释：更新学生视角下的伪框坐标
+            data_samples.gt_instances.student_view_bboxes = projected_student_boxes.detach().clone()  # 中文注释：缓存学生输入坐标系下的伪框以便ROI对齐
         wh_thr = self.semi_train_cfg.get('min_pseudo_bbox_wh', (1e-2, 1e-2))
         return filter_gt_instances(batch_data_samples, wh_thr=wh_thr)
 
