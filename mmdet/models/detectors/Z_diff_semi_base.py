@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
+import inspect  # 中文注释：引入inspect以便在运行时检测学生loss是否支持current_iter参数
 from typing import Dict
 from typing import Any, List, Optional, Union, Tuple
 import torch  # 中文注释：导入PyTorch基础库用于张量运算
@@ -318,7 +319,7 @@ class SemiBaseDiffDetector(BaseDetector):
         """
         losses = dict()
         losses.update(**self.loss_by_gt_instances(
-            multi_batch_inputs['sup'], multi_batch_data_samples['sup']))  # 中文注释：先计算有监督分支损失
+            multi_batch_inputs['sup'], multi_batch_data_samples['sup'], current_iter=current_iter))  # 中文注释：先计算有监督分支损失并透传迭代索引驱动调度
         origin_pseudo_data_samples, batch_info, diff_feature = self.get_pseudo_instances_diff(
             multi_batch_inputs['unsup_teacher'], multi_batch_data_samples['unsup_teacher'])  # 中文注释：获取伪标签、批次信息以及原始的特征打包结果
         parsed_diff_feature = self._parse_diff_feature(diff_feature, batch_info)  # 中文注释：对返回的特征结构进行标准化解析并在必要时补充批次信息
@@ -329,11 +330,12 @@ class SemiBaseDiffDetector(BaseDetector):
             self._apply_di_gate(origin_pseudo_data_samples, multi_batch_data_samples['unsup_student'], multi_batch_inputs['unsup_teacher'], multi_batch_inputs['unsup_student'], ssdc_cfg, current_iter, teacher_inv_override=teacher_inv_override)  # 中文注释：根据域不变相似度过滤低可信度伪标签
 
         losses.update(**self.loss_by_pseudo_instances(multi_batch_inputs['unsup_student'],
-                                                      multi_batch_data_samples['unsup_student'], batch_info))  # 中文注释：计算学生分支伪标签损失并合并
+                                                      multi_batch_data_samples['unsup_student'], batch_info, current_iter=current_iter))  # 中文注释：计算学生分支伪标签损失并合并且同步传递迭代信息
         return losses, parsed_diff_feature  # 中文注释：返回损失字典与解析后的特征包
 
     def loss_by_gt_instances(self, batch_inputs: Tensor,
-                             batch_data_samples: SampleList) -> dict:
+                             batch_data_samples: SampleList,
+                             current_iter: Optional[int] = None) -> dict:
         """Calculate losses from a batch of inputs and ground-truth data
         samples.
 
@@ -348,14 +350,15 @@ class SemiBaseDiffDetector(BaseDetector):
             dict: A dictionary of loss components
         """
 
-        losses = self.student.loss(batch_inputs, batch_data_samples)
+        losses = self._call_student_loss(batch_inputs, batch_data_samples, current_iter=current_iter)  # 中文注释：通过统一入口调用学生loss并在支持时传递current_iter
         sup_weight = self.semi_train_cfg.get('sup_weight', 1.)
         return rename_loss_dict('sup_', reweight_loss_dict(losses, sup_weight))
 
     def loss_by_pseudo_instances(self,
                                  batch_inputs: Tensor,
                                  batch_data_samples: SampleList,
-                                 batch_info: Optional[dict] = None) -> dict:
+                                 batch_info: Optional[dict] = None,
+                                 current_iter: Optional[int] = None) -> dict:
         """Calculate losses from a batch of inputs and pseudo data samples.
 
         Args:
@@ -374,7 +377,7 @@ class SemiBaseDiffDetector(BaseDetector):
         """
         batch_data_samples = filter_gt_instances(
             batch_data_samples, score_thr=self.semi_train_cfg.cls_pseudo_thr)
-        losses = self.student.loss(batch_inputs, batch_data_samples)
+        losses = self._call_student_loss(batch_inputs, batch_data_samples, current_iter=current_iter)  # 中文注释：通过统一入口确保current_iter被安全透传
         pseudo_instances_num = sum([
             len(data_samples.gt_instances)
             for data_samples in batch_data_samples
@@ -383,6 +386,24 @@ class SemiBaseDiffDetector(BaseDetector):
             'unsup_weight', 1.) if pseudo_instances_num > 0 else 0.
         return rename_loss_dict('unsup_',
                                 reweight_loss_dict(losses, unsup_weight))
+
+    def _call_student_loss(self,
+                           batch_inputs: Tensor,
+                           batch_data_samples: SampleList,
+                           current_iter: Optional[int] = None) -> dict:
+        """中文注释：封装学生loss调用并在其支持current_iter时安全传参。"""
+        loss_func = getattr(self.student, 'loss')  # 中文注释：读取学生loss方法用于后续调用
+        support_flag = getattr(self, '_student_loss_supports_current_iter', None)  # 中文注释：尝试读取缓存的参数支持标记
+        if support_flag is None:  # 中文注释：当尚未缓存检测结果时执行一次签名分析
+            try:  # 中文注释：捕获inspect过程中可能出现的异常
+                signature = inspect.signature(loss_func)  # 中文注释：获取loss方法的函数签名
+                support_flag = 'current_iter' in signature.parameters  # 中文注释：判断签名中是否包含current_iter形参
+            except (ValueError, TypeError):  # 中文注释：当无法获取签名时回退为不支持
+                support_flag = False  # 中文注释：将支持标记置为False保证兼容
+            self._student_loss_supports_current_iter = support_flag  # 中文注释：缓存检测结果避免重复开销
+        if support_flag:  # 中文注释：若学生loss支持current_iter参数
+            return loss_func(batch_inputs, batch_data_samples, current_iter=current_iter)  # 中文注释：携带当前迭代索引调用loss
+        return loss_func(batch_inputs, batch_data_samples)  # 中文注释：否则保持原始调用方式
 
     @staticmethod
     def _interp_schedule_value(schedule_cfg: Any, current_iter: Optional[int], default: float = 0.0) -> float:
