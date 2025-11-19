@@ -60,6 +60,15 @@ model = dict(
             w_couple=ssdc_schedule['w_couple'],  # 中文注释：耦合损失权重调度同样引用共享字典
             w_di_consistency=ssdc_schedule['w_di_consistency'],  # 中文注释：域不变一致性权重同步共享定义
             consistency_gate=ssdc_schedule['consistency_gate']  # 中文注释：一致性门控阈值亦保持共享配置
+        ),
+        feature_loss_cfg=dict(  # 中文注释：补充特征蒸馏配置以满足DomainAdaptationDetector初始化需求
+            feature_loss_type='mse',  # 中文注释：设置主教师特征蒸馏损失类型为MSE保证稳定
+            feature_loss_weight=1.0,  # 中文注释：指定主教师特征蒸馏损失权重为1.0作为安全默认值
+            cross_feature_loss_weight=0.0,  # 中文注释：默认关闭交叉特征蒸馏可按需升高该权重
+            cross_consistency_cfg=dict(  # 中文注释：为交叉一致性分支提供显式字典避免读取空值
+                cls_weight=0.0,  # 中文注释：默认分类一致性权重为0保持关闭状态
+                reg_weight=0.0  # 中文注释：默认回归一致性权重为0保持关闭状态
+            )
         )
     )
 )
