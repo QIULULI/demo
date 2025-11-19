@@ -11,10 +11,25 @@ detector = _base_.model  # 中文注释：从基础配置中取得模型字典
 classes = ('drone',)  # 中文注释：显式声明类别元组方便下游组件复用
 detector.detector.roi_head.bbox_head.num_classes = 1  # 中文注释：任务为单类无人机检测
 detector.detector.init_cfg = dict(type='Pretrained', checkpoint='work_dirs/DG/Ours/drone/student_rgb_fused.pth')  # 中文注释：加载Stage-1学生权重作为初始化
-detector.detector.enable_ssdc = True  # 中文注释：开启SS-DC模块构建SAID与耦合颈
-detector.detector.use_ds_tokens = True  # 中文注释：启用域特异token以支撑解耦
-detector.detector.backbone.setdefault('ssdc_cfg', dict())  # 中文注释：确保骨干网络具备SS-DC子配置容器方便写入跳过开关
-detector.detector.backbone.ssdc_cfg['skip_local_loss'] = True  # 中文注释：显式要求学生模型在本地损失阶段跳过SS-DC计算
+ssdc_schedule = dict(  # 中文注释：集中定义SS-DC损失调度以便骨干与训练阶段共享
+    w_decouple=[(0, 0.1), (6000, 0.5)],  # 中文注释：解耦损失权重在0到6000迭代间线性由0.1升至0.5
+    w_couple=[(2000, 0.2), (10000, 0.5)],  # 中文注释：耦合损失权重在2000到10000迭代间从0.2提升到0.5
+    w_di_consistency=0.3,  # 中文注释：域不变一致性损失采用固定0.3权重
+    consistency_gate=[(0, 0.9), (12000, 0.6)]  # 中文注释：DI一致性阈值从0.9逐步降至0.6以放宽伪标签筛选
+)  # 中文注释：调度字典定义结束
+
+detector.detector.backbone.enable_ssdc = True  # 中文注释：直接在骨干网络启用SS-DC路径以满足新版要求
+detector.detector.backbone.ssdc_cfg = dict(  # 中文注释：为骨干提供完整SS-DC子配置
+    enable_ssdc=True,  # 中文注释：再次显式打开子配置中的开关以兼容多重来源
+    said_filter=dict(type='SAIDFilterBank'),  # 中文注释：使用默认SAID滤波器实现即可在FPN特征上提取频段
+    coupling_neck=dict(type='SSDCouplingNeck', use_ds_tokens=True),  # 中文注释：耦合颈设置启用域特异token满足既有逻辑
+    loss_decouple=dict(type='LossDecouple', loss_weight=1.0),  # 中文注释：保持解耦损失类型与权重为通用默认值
+    loss_couple=dict(type='LossCouple', loss_weight=1.0),  # 中文注释：保持耦合损失类型与权重为通用默认值
+    w_decouple=ssdc_schedule['w_decouple'],  # 中文注释：引用共享调度以确保前向构建与训练调度一致
+    w_couple=ssdc_schedule['w_couple'],  # 中文注释：耦合权重调度亦复用共享定义保持一致
+    w_di_consistency=ssdc_schedule['w_di_consistency'],  # 中文注释：域不变一致性权重同步骨干与训练阶段
+    consistency_gate=ssdc_schedule['consistency_gate']  # 中文注释：一致性阈值调度保持统一来源防止偏差
+)  # 中文注释：骨干SS-DC配置结束
 
 # 中文注释：包装DomainAdaptationDetector并指定训练超参
 model = dict(
@@ -27,11 +42,11 @@ model = dict(
     ),
     train_cfg=dict(
         detector_cfg=dict(type='SemiBaseDiff', burn_up_iters=2000),  # 中文注释：采用半监督扩散流程并设置2000步预热
-        ssdc_cfg=dict(  # 中文注释：SS-DC相关超参及调度
-            w_decouple=[(0, 0.1), (6000, 0.5)],  # 中文注释：解耦损失权重线性从0.1升至0.5
-            w_couple=[(2000, 0.2), (10000, 0.5)],  # 中文注释：耦合损失权重在预热后逐步增大
-            w_di_consistency=0.3,  # 中文注释：域不变一致性损失的常数权重
-            consistency_gate=[(0, 0.9), (12000, 0.6)]  # 中文注释：伪标签DI相似度阈值线性下降
+        ssdc_cfg=dict(  # 中文注释：训练阶段复用骨干共享调度以保持损失权重一致
+            w_decouple=ssdc_schedule['w_decouple'],  # 中文注释：解耦损失权重调度引用共享字典避免重复配置
+            w_couple=ssdc_schedule['w_couple'],  # 中文注释：耦合损失权重调度同样引用共享字典
+            w_di_consistency=ssdc_schedule['w_di_consistency'],  # 中文注释：域不变一致性权重同步共享定义
+            consistency_gate=ssdc_schedule['consistency_gate']  # 中文注释：一致性门控阈值亦保持共享配置
         )
     )
 )
@@ -41,3 +56,4 @@ if __name__ == '__main__':
     from mmengine import Config  # 中文注释：导入配置解析器
     cfg = Config.fromfile(__file__)  # 中文注释：载入当前配置文件
     print(cfg.model['type'])  # 中文注释：打印模型类型确认解析成功
+    print(cfg.model.detector.detector.backbone.enable_ssdc)  # 中文注释：额外打印骨干SS-DC开关确保已按需开启
