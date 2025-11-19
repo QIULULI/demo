@@ -110,7 +110,7 @@ class DiffusionDetector(BaseDetector):
         self.loss_decouple_weight = 1.0  # 初始化解耦损失整体权重默认1.0
         self.loss_couple = None  # 初始化耦合损失模块引用占位符
         self.loss_couple_weight = 1.0  # 初始化耦合损失整体权重默认1.0
-        self.ssdc_skip_local_loss = False  # 初始化是否跳过本地SS-DC损失的开关默认False保持向后兼容
+        self.ssdc_skip_local_loss = False  # 初始化是否跳过本地SS-DC损失的开关默认False保持向后兼容，域自适应包装器会在需要统一汇总时改写该标志
         self.ssdc_burn_in_iters = 0  # 初始化SS-DC烧入迭代计数默认0保持兼容
         self.ssdc_w_decouple_cfg = 1.0  # 初始化解耦损失的调度或常量配置默认1.0与旧逻辑一致
         self.ssdc_w_couple_cfg = 1.0  # 初始化耦合损失的调度或常量配置默认1.0与旧逻辑一致
@@ -557,7 +557,7 @@ class DiffusionDetector(BaseDetector):
 
         # ssdc loss
         ##############################################################################################################
-        if self.training and self.enable_ssdc and not self.ssdc_skip_local_loss:  # 仅在训练阶段且开启SS-DC且未跳过时计算额外损失
+        if self.training and self.enable_ssdc and not self.ssdc_skip_local_loss:  # 仅在训练阶段且开启SS-DC且未跳过时计算额外损失，若DomainAdaptationDetector接管SS-DC则该分支会被显式跳过
             cache_noref = self.ssdc_feature_cache.get('noref')  # 读取无参考分支的SS-DC缓存
             cache_ref = self.ssdc_feature_cache.get('ref')  # 读取有参考分支的SS-DC缓存
             if cache_noref is not None and cache_ref is not None:  # 确保两个分支缓存均存在

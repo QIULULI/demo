@@ -45,6 +45,7 @@ model = dict(
         enable_ssdc=False,  # 默认关闭SS-DC训练以保持现有行为
         ssdc_cfg=dict(  # 提供SS-DC模块的最小可用默认配置
             enable_ssdc=False,  # 通过配置开关控制是否启用SS-DC流程
+            skip_local_loss=False,  # 中文注释：默认不跳过本地SS-DC损失，包装器可按需覆盖以避免重复累加
             said_filter=dict(type='SAIDFilterBank'),  # 使用默认SAID滤波器参数便于快速启用
             coupling_neck=dict(type='SSDCouplingNeck'),  # 使用默认耦合颈部参数便于快速启用
             loss_decouple=dict(  # 解耦损失配置模块化支持超参数调整
