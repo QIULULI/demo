@@ -405,6 +405,31 @@ class SemiBaseDiffDetector(BaseDetector):
             return loss_func(batch_inputs, batch_data_samples, current_iter=current_iter)  # 中文注释：携带当前迭代索引调用loss
         return loss_func(batch_inputs, batch_data_samples)  # 中文注释：否则保持原始调用方式
 
+    @staticmethod  # 中文注释：使用静态方法封装签名检测逻辑便于在任意实例上下文复用
+    def _supports_current_iter_arg(target_callable) -> bool:  # 中文注释：判断目标可调用是否支持current_iter关键字
+        """中文注释：检测目标可调用对象是否声明了current_iter参数以便按需传参。"""
+        try:  # 中文注释：通过inspect读取函数签名可能触发异常因此使用try保证稳健
+            signature = inspect.signature(target_callable)  # 中文注释：获取可调用对象的参数签名
+            return 'current_iter' in signature.parameters  # 中文注释：判断签名中是否存在current_iter参数
+        except (ValueError, TypeError):  # 中文注释：若无法获取签名则视为不支持
+            return False  # 中文注释：返回False防止误传递额外参数
+
+    def _extract_feat_with_optional_iter(self,  # 中文注释：封装extract_feat调用以在需要时透传current_iter参数
+                                         module: Optional[nn.Module],  # 中文注释：目标模块可以是教师或学生模型
+                                         batch_inputs: Tensor,  # 中文注释：输入图像张量
+                                         current_iter: Optional[int]):  # 中文注释：当前训练迭代索引用于驱动burn-in调度
+        """中文注释：在支持current_iter时携带该参数调用extract_feat并对检测结果进行缓存。"""
+        if module is None or not hasattr(module, 'extract_feat'):  # 中文注释：若模块不存在或缺少特征提取接口则直接返回
+            return None  # 中文注释：保持接口安全
+        extract_func = getattr(module, 'extract_feat')  # 中文注释：读取模块的特征提取函数
+        support_flag = getattr(module, '_extract_feat_supports_current_iter', None)  # 中文注释：尝试读取先前缓存的支持标记
+        if support_flag is None:  # 中文注释：当未缓存检测结果时执行一次签名分析
+            support_flag = self._supports_current_iter_arg(extract_func)  # 中文注释：复用静态函数检测是否支持current_iter
+            setattr(module, '_extract_feat_supports_current_iter', support_flag)  # 中文注释：将检测结果挂载到模块以便复用
+        if support_flag:  # 中文注释：若模块支持current_iter参数则携带该关键字调用
+            return extract_func(batch_inputs, current_iter=current_iter)  # 中文注释：传入当前迭代索引驱动burn-in调度
+        return extract_func(batch_inputs)  # 中文注释：不支持时沿用旧式调用避免异常
+
     @staticmethod
     def _interp_schedule_value(schedule_cfg: Any, current_iter: Optional[int], default: float = 0.0) -> float:
         """中文注释：根据迭代步线性插值获取调度值。"""
@@ -444,12 +469,12 @@ class SemiBaseDiffDetector(BaseDetector):
         student_inv = None  # 中文注释：初始化学生域不变特征占位符
         if teacher_inv is None and hasattr(self.teacher, 'extract_feat'):  # 中文注释：当扩散教师未提供特征时回退均值教师提取流程
             getattr(self.teacher, 'ssdc_feature_cache', {}).clear()  # 中文注释：在提取前清空缓存避免跨batch残留影响本次相似度
-            _ = self.teacher.extract_feat(teacher_inputs)  # 中文注释：运行一次前向以填充SS-DC缓存
+            _ = self._extract_feat_with_optional_iter(self.teacher, teacher_inputs, current_iter)  # 中文注释：调用带有current_iter适配的特征提取以保持burn-in一致
             teacher_cache = getattr(self.teacher, 'ssdc_feature_cache', {}).get('noref', {})  # 中文注释：读取教师缓存
             teacher_inv = teacher_cache.get('inv')  # 中文注释：获取域不变特征
         if hasattr(self.student, 'extract_feat'):  # 中文注释：确保学生模型支持特征提取
             getattr(self.student, 'ssdc_feature_cache', {}).clear()  # 中文注释：同样清空学生缓存以保证当前迭代使用的特征最新
-            _ = self.student.extract_feat(student_inputs)  # 中文注释：运行学生前向以填充缓存但不求梯度
+            _ = self._extract_feat_with_optional_iter(self.student, student_inputs, current_iter)  # 中文注释：通过统一入口传递current_iter以维持burn-in调度一致
             student_cache = getattr(self.student, 'ssdc_feature_cache', {}).get('noref', {})  # 中文注释：读取学生缓存
             student_inv = student_cache.get('inv')  # 中文注释：获取学生域不变特征
         if teacher_inv is None or student_inv is None:  # 中文注释：任一特征缺失则无法过滤
