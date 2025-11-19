@@ -1,16 +1,29 @@
 # 中文注释：Stage-2 UDA配置，融合扩散教师并启用SS-DC模块
 # 中文注释：引用Stage-1基础配置（扩散引导UDA、20k半监督日程与Sim→Real无人机数据集），相对路径需从当前文件起算
+import os  # 中文注释：引入os模块以便通过环境变量灵活切换扩散教师路径
+
 _base_ = [
     '../../../../DA/_base_/models/diffusion_guided_adaptation_faster_rcnn_r101_fpn.py',  # 中文注释：基础检测与扩散蒸馏结构（实际存在的Stage-1模型配置）
     '../../../../DA/_base_/da_setting/semi_20k.py',  # 中文注释：20k迭代的半监督训练调度（实际存在的Stage-1训练日程）
     '../../../../DA/_base_/datasets/sim_to_real/semi_drone_rgb_aug.py'  # 中文注释：Sim→Real无人机数据集配置（实际存在的Stage-1数据设置）
 ]
 
+stage1_diff_teacher_config = os.environ.get(  # 中文注释：优先读取环境变量以适配不同服务器路径
+    'STAGE1_DIFF_TEACHER_CONFIG',  # 中文注释：可选环境变量名称，部署时可export来自定义
+    'DG/Ours/drone/fused_diff_teacher_stage1_A_rpn_roi.py'  # 中文注释：默认指向Stage-1扩散教师配置文件（需按需替换）
+)  # 中文注释：配置路径变量定义结束
+stage1_diff_teacher_ckpt = os.environ.get(  # 中文注释：同理读取环境变量为权重路径提供默认值
+    'STAGE1_DIFF_TEACHER_CKPT',  # 中文注释：可选环境变量名称，未设置时回落至示例权重
+    'work_dirs/DG/Ours/drone/fused_teacher_stage1_A/best_coco_bbox_mAP_50_iter_20000.pth'  # 中文注释：Stage-1教师最佳权重示例
+)  # 中文注释：权重路径变量定义结束
+
 # 中文注释：读取基础模型配置并覆盖关键字段
 detector = _base_.model  # 中文注释：从基础配置中取得模型字典
 classes = ('drone',)  # 中文注释：显式声明类别元组方便下游组件复用
 detector.detector.roi_head.bbox_head.num_classes = 1  # 中文注释：任务为单类无人机检测
 detector.detector.init_cfg = dict(type='Pretrained', checkpoint='work_dirs/DG/Ours/drone/student_rgb_fused.pth')  # 中文注释：加载Stage-1学生权重作为初始化
+detector.diff_model.config = stage1_diff_teacher_config  # 中文注释：指向Stage-1扩散教师配置（默认值可通过环境变量或直接修改替换）
+detector.diff_model.pretrained_model = stage1_diff_teacher_ckpt  # 中文注释：指向Stage-1扩散教师权重（默认值为示例路径）
 ssdc_schedule = dict(  # 中文注释：集中定义SS-DC损失调度以便骨干与训练阶段共享
     w_decouple=[(0, 0.1), (6000, 0.5)],  # 中文注释：解耦损失权重在0到6000迭代间线性由0.1升至0.5
     w_couple=[(2000, 0.2), (10000, 0.5)],  # 中文注释：耦合损失权重在2000到10000迭代间从0.2提升到0.5
@@ -57,3 +70,5 @@ if __name__ == '__main__':
     cfg = Config.fromfile(__file__)  # 中文注释：载入当前配置文件
     print(cfg.model['type'])  # 中文注释：打印模型类型确认解析成功
     print(cfg.model.detector.detector.backbone.enable_ssdc)  # 中文注释：额外打印骨干SS-DC开关确保已按需开启
+    print(cfg.model.detector.diff_model.config)  # 中文注释：打印扩散教师配置路径确认注入成功
+    print(cfg.model.detector.diff_model.pretrained_model)  # 中文注释：打印扩散教师权重路径确认注入成功
