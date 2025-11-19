@@ -399,7 +399,8 @@ class DiffusionDetector(BaseDetector):
         return x
 
     def _forward(self, batch_inputs: Tensor,
-                 batch_data_samples: SampleList) -> tuple:
+                 batch_data_samples: SampleList,
+                 current_iter: Optional[int] = None) -> tuple:
         """Network forward process. Usually includes backbone, neck and head
         forward without any post-processing.
 
@@ -415,7 +416,7 @@ class DiffusionDetector(BaseDetector):
         """
         self.ssdc_feature_cache.clear()  # 在正式前向推理前清空SS-DC特征缓存以防止跨调用残留影响当前特征流
         results = ()
-        x = self.extract_feat(batch_inputs)
+        x = self.extract_feat(batch_inputs, current_iter=current_iter)  # 中文注释：在前向推理时同步记录迭代索引以保持SS-DC调度一致
 
         if self.with_rpn:
             rpn_results_list = self.rpn_head.predict(
@@ -432,7 +433,8 @@ class DiffusionDetector(BaseDetector):
 
     def loss(self, batch_inputs: Tensor,
              batch_data_samples: SampleList,
-             return_feature=False) -> dict:
+             return_feature: bool = False,
+             current_iter: Optional[int] = None) -> dict:
         """Calculate losses from a batch of inputs and data samples.
 
         Args:
@@ -441,6 +443,7 @@ class DiffusionDetector(BaseDetector):
             batch_data_samples (List[:obj:`DetDataSample`]): The batch
                 data samples. It usually includes information such
                 as `gt_instance` or `gt_panoptic_seg` or `gt_sem_seg`.
+            current_iter (int, optional): 当前训练迭代索引用于驱动SS-DC的burn-in调度。
 
         Returns:
             dict: A dictionary of loss components
@@ -455,11 +458,11 @@ class DiffusionDetector(BaseDetector):
         if self.apply_auxiliary_branch:
             N, _, H, W = batch_inputs.shape
             ref_masks, ref_labels = bbox_to_mask(batch_data_samples, N, H, W, self.class_maps)
-            x_w_ref = self.extract_feat(batch_inputs, ref_masks, ref_labels)
-            x_wo_ref = self.extract_feat(batch_inputs)
+            x_w_ref = self.extract_feat(batch_inputs, ref_masks, ref_labels, current_iter=current_iter)
+            x_wo_ref = self.extract_feat(batch_inputs, current_iter=current_iter)
         ###########################################################################
         else:
-            x_wo_ref = self.extract_feat(batch_inputs)
+            x_wo_ref = self.extract_feat(batch_inputs, current_iter=current_iter)
             # 当未启用辅助分支时复制无参考分支的SS-DC缓存为参考分支防止后续读取缺失
             #######################################################################
             if 'noref' in self.ssdc_feature_cache:
@@ -714,7 +717,8 @@ class DiffusionDetector(BaseDetector):
                 batch_inputs: Tensor,
                 batch_data_samples: SampleList,
                 rescale: bool = True,
-                return_feature=False):
+                return_feature: bool = False,
+                current_iter: Optional[int] = None):
         """Predict results from a batch of inputs and data samples with post-
         processing.
 
@@ -725,6 +729,7 @@ class DiffusionDetector(BaseDetector):
                 `gt_instance`, `gt_panoptic_seg` and `gt_sem_seg`.
             rescale (bool): Whether to rescale the results.
                 Defaults to True.
+            current_iter (int, optional): 当前迭代编号用于在推理/验证阶段保持SS-DC调度一致。
 
         Returns:
             list[:obj:`DetDataSample`]: Return the detection results of the
@@ -743,7 +748,7 @@ class DiffusionDetector(BaseDetector):
 
         assert self.with_bbox, 'Bbox head must be implemented.'
         self.ssdc_feature_cache.clear()  # 在推理阶段开始时清空SS-DC缓存避免训练阶段遗留数据干扰预测
-        x = self.extract_feat(batch_inputs)
+        x = self.extract_feat(batch_inputs, current_iter=current_iter)  # 中文注释：推理阶段同样可接受外部提供的迭代索引以控制burn-in状态
         # If there are no pre-defined proposals, use RPN to get proposals
         if batch_data_samples[0].get('proposals', None) is None:
             rpn_results_list = self.rpn_head.predict(

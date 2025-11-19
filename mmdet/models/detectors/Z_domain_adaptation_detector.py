@@ -1,6 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
-from typing import Any, Dict, Tuple  # 中文注释：引入Any用于处理动态结构的特征信息
+from typing import Any, Dict, Tuple, Optional  # 中文注释：引入Optional以便在函数签名中携带current_iter开关
 import torch
 import torch.nn.functional as F  # 中文注释：引入函数式接口用于计算一致性与MSE损失
 from torch import Tensor
@@ -143,27 +143,27 @@ class DomainAdaptationDetector(BaseDetector):
             dict: A dictionary of loss components
         """
         losses = dict() 
+        current_iter = self.local_iter  # 中文注释：在进入分支前统一记录当前迭代索引用于所有调用透传
         if self.train_cfg.detector_cfg.get('type') in ['SemiBase']:
             if self.local_iter >= self.burn_up_iters:
                 losses.update(**self.model.loss(multi_batch_inputs, multi_batch_data_samples))
             else:
                 losses.update(**self.model.loss_by_gt_instances(multi_batch_inputs['sup'], multi_batch_data_samples['sup']))
             self.local_iter += 1
-            
+
         elif self.train_cfg.detector_cfg.get('type') in ['SemiBaseDiff']:
-            current_iter = self.local_iter  # 中文注释：缓存当前迭代索引用于判断预热阶段
             distill_blocked = (current_iter < self.burn_up_iters  # 中文注释：遵循旧版烧入阶段限制
                                or current_iter < self.warmup_start_iters)  # 中文注释：在预热起点前禁止蒸馏
             if distill_blocked:  # 中文注释：当蒸馏尚未开放时仅执行有监督分支
                 losses.update(**self.model.loss_by_gt_instances(
-                    multi_batch_inputs['sup'], multi_batch_data_samples['sup']))  # 中文注释：计算监督学习损失
+                    multi_batch_inputs['sup'], multi_batch_data_samples['sup'], current_iter=current_iter))  # 中文注释：计算监督学习损失并同步传递迭代索引
             else:  # 中文注释：当满足蒸馏开放条件时执行跨模型与特征蒸馏分支
                 warmup_weight = self._get_distill_warmup_weight(current_iter)  # 中文注释：根据迭代进度获取预热权重
                 semi_loss, diff_feature = self.model.loss_diff_adaptation(
                     multi_batch_inputs, multi_batch_data_samples, ssdc_cfg=self.ssdc_cfg, current_iter=current_iter)  # 中文注释：获取跨模型损失与教师特征并传入SS-DC配置用于伪标签过滤
                 ssdc_losses = self._compute_ssdc_loss(current_iter) if self.ssdc_compute_in_wrapper else {}  # 中文注释：根据配置决定是否在包装器内汇总SS-DC损失
                 feature_loss = self.loss_feature(
-                    multi_batch_inputs['unsup_teacher'], diff_feature)  # 中文注释：在读取SS-DC损失后再计算特征蒸馏，避免额外前向刷新ssdc_feature_cache造成缓存漂移
+                    multi_batch_inputs['unsup_teacher'], diff_feature, current_iter=current_iter)  # 中文注释：在读取SS-DC损失后再计算特征蒸馏并同步当前迭代索引，避免额外前向刷新ssdc_feature_cache造成缓存漂移
                 losses.update(**semi_loss)  # 中文注释：合并跨模型损失项
                 losses.update(**ssdc_losses)  # 中文注释：提前合并SS-DC损失以保留与缓存读取顺序一致的日志
                 losses.update(**feature_loss)  # 中文注释：最后合并特征蒸馏损失，保持接口输出结构不变
@@ -256,10 +256,10 @@ class DomainAdaptationDetector(BaseDetector):
         return x_neck
 
     
-    def cross_loss(self, batch_inputs: Tensor, batch_data_samples: SampleList):
+    def cross_loss(self, batch_inputs: Tensor, batch_data_samples: SampleList, current_iter: Optional[int] = None):
         losses = dict()
 
-        diff_x = self.model.diff_detector.extract_feat(batch_inputs)
+        diff_x = self.model.diff_detector.extract_feat(batch_inputs, current_iter=current_iter)
           
         if not self.with_rpn:
             detector_loss = self.model.student.bbox_head.loss(
@@ -290,7 +290,7 @@ class DomainAdaptationDetector(BaseDetector):
         return losses, diff_x
 
 
-    def loss_feature(self, batch_inputs: Tensor, diff_feature) -> dict:
+    def loss_feature(self, batch_inputs: Tensor, diff_feature, current_iter: Optional[int] = None) -> dict:
         """Calculate losses from a batch of inputs and data samples.
 
         Args:
@@ -303,7 +303,7 @@ class DomainAdaptationDetector(BaseDetector):
         Returns:
             dict: A dictionary of loss components
         """
-        student_x = self.model.student.extract_feat(batch_inputs)  # 中文注释：提取学生模型在输入图像上的多尺度特征
+        student_x = self.model.student.extract_feat(batch_inputs, current_iter=current_iter)  # 中文注释：提取学生模型在输入图像上的多尺度特征并同步记录迭代索引
         main_teacher_feature = diff_feature  # 中文注释：默认将传入特征视作主教师特征
         cross_teacher_info = None  # 中文注释：初始化交叉教师信息为None
         if isinstance(diff_feature, dict):  # 中文注释：当传入结构为字典时按约定键拆分主教师与交叉教师
