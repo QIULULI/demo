@@ -56,6 +56,7 @@ class DomainAdaptationDetector(BaseDetector):
         self.ssdc_compute_in_wrapper = bool(self.ssdc_cfg.get('compute_in_wrapper', True))  # 中文注释：控制SS-DC损失是否仅由包装器统一计算默认开启避免重复
         self.ssdc_skip_student_loss = bool(self.ssdc_cfg.get('skip_student_ssdc_loss', self.ssdc_compute_in_wrapper))  # 中文注释：当包装器统一计算时默认跳过学生内部损失
         self.ssdc_cfg.setdefault('skip_local_loss', self.ssdc_skip_student_loss)  # 中文注释：向学生侧传递跳过开关保持配置一致
+        self._propagate_ssdc_skip_flags()  # 中文注释：在模型构建后立即下发跳过本地SS-DC损失的控制位避免重复累加
         detector_cfg = self.train_cfg.detector_cfg  # 中文注释：提取检测器子配置以便访问蒸馏相关阈值
         self.warmup_start_iters = self.train_cfg.get(  # 中文注释：读取蒸馏预热起始迭代默认0保持兼容
             'warmup_start_iters', detector_cfg.get('warmup_start_iters', 0))
@@ -96,6 +97,31 @@ class DomainAdaptationDetector(BaseDetector):
     @property
     def with_student(self):
         return hasattr(self.model, 'student')
+
+    def _propagate_ssdc_skip_flags(self) -> None:
+        """中文注释：遍历学生/教师/扩散教师模块并同步跳过SS-DC本地损失的配置。"""
+        skip_local_loss = bool(self.ssdc_cfg.get('skip_local_loss', self.ssdc_skip_student_loss))  # 中文注释：解析应当下发的跳过标志并确保布尔化避免歧义
+        self.ssdc_cfg['skip_local_loss'] = skip_local_loss  # 中文注释：回写最终布尔值便于后续组件引用统一语义
+        target_modules = []  # 中文注释：收集需要同步开关的模块实例
+        for attr_name in ('student', 'teacher', 'diff_detector'):  # 中文注释：依次检查学生、主教师以及默认扩散教师
+            module = getattr(self.model, attr_name, None)  # 中文注释：安全地获取对应属性避免未定义时报错
+            if module is not None:  # 中文注释：仅在模块存在时才加入同步列表
+                target_modules.append(module)  # 中文注释：缓存需要更新的模块实例
+        diff_teacher_bank = getattr(self.model, 'diff_detectors', None)  # 中文注释：尝试读取扩散教师字典以便同步所有分支
+        if isinstance(diff_teacher_bank, dict):  # 中文注释：仅当教师仓库为字典时才遍历其中的模块
+            for bank_module in diff_teacher_bank.values():  # 中文注释：遍历所有扩散教师实例
+                if bank_module is not None:  # 中文注释：过滤掉空占位符
+                    target_modules.append(bank_module)  # 中文注释：将额外教师加入待同步列表
+        for module in target_modules:  # 中文注释：依次同步每个模块的开关状态
+            module_ssdc_cfg = getattr(module, 'ssdc_cfg', None)  # 中文注释：尝试读取模块内部的SS-DC配置引用
+            if module_ssdc_cfg is not None and hasattr(module_ssdc_cfg, 'setdefault'):  # 中文注释：确保配置结构支持setdefault以避免不兼容类型
+                module_ssdc_cfg.setdefault('skip_local_loss', skip_local_loss)  # 中文注释：若模块尚未定义跳过字段则写入默认值
+                try:  # 中文注释：尝试以映射形式直接覆盖字段
+                    module_ssdc_cfg['skip_local_loss'] = skip_local_loss  # 中文注释：确保模块配置内的跳过字段与包装器保持一致
+                except Exception:  # 中文注释：兼容无法通过下标赋值的配置对象
+                    setattr(module_ssdc_cfg, 'skip_local_loss', skip_local_loss)  # 中文注释：回退到属性赋值方式写入布尔值
+            if hasattr(module, 'ssdc_skip_local_loss'):  # 中文注释：若模块拥有运行期跳过标志则直接覆盖
+                module.ssdc_skip_local_loss = skip_local_loss  # 中文注释：将布尔值写入模块实例确保本地loss逻辑立即生效
 
     def _get_distill_warmup_weight(self, current_iter: int) -> float:
         """中文注释：根据当前迭代计算蒸馏损失对应的预热权重。"""
