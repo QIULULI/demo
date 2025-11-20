@@ -59,9 +59,33 @@ class DiffusionDetector(BaseDetector):
                  test_cfg: OptConfigType = None,
                  auxiliary_branch_cfg: OptConfigType = None,
                  data_preprocessor: OptConfigType = None,
-                 init_cfg: OptMultiConfig = None) -> None:
+                 init_cfg: OptMultiConfig = None,
+                 enable_ssdc: bool = False,
+                 ssdc_cfg: Optional[dict] = None,
+                 use_ds_tokens: bool = False) -> None:
         super().__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
+        explicit_ssdc_cfg = copy.deepcopy(ssdc_cfg) if isinstance(ssdc_cfg, dict) else {}  # 中文注释：深拷贝构造函数入参中的SS-DC配置以避免后续修改影响原对象
+        explicit_enable_ssdc = bool(enable_ssdc)  # 中文注释：记录构造函数显式传入的SS-DC开关优先级最高
+        explicit_use_ds_tokens = bool(use_ds_tokens)  # 中文注释：记录构造函数显式传入的域特异令牌开关以覆盖配置默认值
+        merged_ssdc_cfg = {}  # 中文注释：初始化合并后的SS-DC配置字典用于聚合多来源参数
+        backbone_enable_ssdc = False  # 中文注释：初始化来自骨干配置的SS-DC开关默认关闭
+        if isinstance(backbone, dict):  # 中文注释：当骨干配置为字典时解析其中的SS-DC字段
+            merged_ssdc_cfg.update(copy.deepcopy(backbone.get('ssdc_cfg', {})))  # 中文注释：优先合并骨干自带的SS-DC子配置
+            backbone_enable_ssdc = bool(backbone.get('enable_ssdc', False))  # 中文注释：读取骨干级别的SS-DC开关
+        train_cfg_enable_ssdc = False  # 中文注释：初始化来自训练配置的SS-DC开关默认关闭
+        ssdc_cfg_from_train = None  # 中文注释：初始化训练配置中的SS-DC子配置占位
+        if train_cfg is not None:  # 中文注释：仅在提供训练配置时尝试读取附加参数
+            if hasattr(train_cfg, 'get'):  # 中文注释：优先使用字典式访问保证兼容ConfigDict等实现
+                train_cfg_enable_ssdc = bool(train_cfg.get('enable_ssdc', False))  # 中文注释：读取训练配置中的SS-DC开关
+                ssdc_cfg_from_train = train_cfg.get('ssdc_cfg', None)  # 中文注释：提取训练配置中的SS-DC子配置
+            else:  # 中文注释：当训练配置不支持get方法时回退到属性访问
+                train_cfg_enable_ssdc = bool(getattr(train_cfg, 'enable_ssdc', False))  # 中文注释：读取属性形式的SS-DC开关
+                ssdc_cfg_from_train = getattr(train_cfg, 'ssdc_cfg', None)  # 中文注释：提取属性形式的SS-DC子配置
+        if isinstance(ssdc_cfg_from_train, dict):  # 中文注释：若训练配置提供了有效字典则合并覆盖骨干默认
+            merged_ssdc_cfg.update(copy.deepcopy(ssdc_cfg_from_train))  # 中文注释：深拷贝训练配置以避免外部共享引用
+        if explicit_ssdc_cfg:  # 中文注释：最后使用构造函数传入的配置覆盖前述来源以满足优先级要求
+            merged_ssdc_cfg.update(explicit_ssdc_cfg)  # 中文注释：合并显式SS-DC配置确保用户输入生效
         self.backbone = MODELS.build(backbone)
 
         if neck is not None:
@@ -102,7 +126,7 @@ class DiffusionDetector(BaseDetector):
         self.loss_feature = KDLoss(loss_weight=1.0, loss_type='mse')  # 初始化特征蒸馏损失用于辅助训练
 
         self.enable_ssdc = False  # 初始化标志位默认关闭光谱空间解耦模块
-        self.use_ds_tokens = False  # 初始化是否启用域特异令牌的标志位
+        self.use_ds_tokens = explicit_use_ds_tokens  # 初始化是否启用域特异令牌的标志位并应用构造函数优先级
         self.said_filter = None  # 初始化SAID滤波器引用占位以便条件构建
         self.coupling_neck = None  # 初始化耦合颈部引用占位以便条件构建
         self.ssdc_feature_cache = {}  # 初始化缓存字典用于保存最近一次的SS-DC特征
@@ -120,36 +144,21 @@ class DiffusionDetector(BaseDetector):
         self._ssdc_level_names = None  # 初始化特征层级名称列表占位符用于配置同步
         self._ssdc_start_level = None  # 初始化特征层级起始索引占位符用于动态生成
         self._ssdc_level_prefix = None  # 初始化特征层级前缀占位符用于统一命名
-        ssdc_cfg = {}  # 初始化SS-DC配置字典收集不同来源的参数
-        backbone_enable_ssdc = False  # 初始化来自骨干网络配置的开关标志
-        if isinstance(backbone, dict):  # 若骨干配置为字典则读取SS-DC相关配置
-            ssdc_cfg = copy.deepcopy(backbone.get('ssdc_cfg', {}))  # 从骨干配置中提取SS-DC子配置并深拷贝避免原地修改
-            backbone_enable_ssdc = backbone.get('enable_ssdc', False)  # 读取骨干配置中的SS-DC开关默认关闭
-        train_cfg_enable_ssdc = False  # 初始化来自训练配置的开关标志
-        ssdc_cfg_from_train = None  # 初始化训练阶段提供的SS-DC配置占位
-        if train_cfg is not None:  # 当训练配置存在时尝试读取附加配置
-            if hasattr(train_cfg, 'get'):  # 当训练配置实现get方法时优先使用字典式访问
-                train_cfg_enable_ssdc = train_cfg.get('enable_ssdc', False)  # 读取训练配置中的SS-DC开关默认关闭
-                ssdc_cfg_from_train = train_cfg.get('ssdc_cfg', None)  # 读取训练配置中的SS-DC详细参数若未提供则为空
-            else:  # 当训练配置不支持get方法时使用属性访问回退
-                train_cfg_enable_ssdc = getattr(train_cfg, 'enable_ssdc', False)  # 通过属性访问获取SS-DC开关默认False
-                ssdc_cfg_from_train = getattr(train_cfg, 'ssdc_cfg', None)  # 通过属性访问获取SS-DC配置默认None
-        if isinstance(ssdc_cfg_from_train, dict):  # 若训练配置提供了字典形式的SS-DC参数则合并到最终配置中
-            ssdc_cfg.update(copy.deepcopy(ssdc_cfg_from_train))  # 使用深拷贝合并训练阶段覆盖的SS-DC参数
         enable_flags = (  # 组合多个来源的开关标志
+            explicit_enable_ssdc,  # 来自构造函数入参的开关标志优先级最高
             backbone_enable_ssdc,  # 来自骨干配置的开关标志
             train_cfg_enable_ssdc,  # 来自训练配置的开关标志
-            ssdc_cfg.get('enable_ssdc', False),  # 来自SS-DC配置自身的开关标志
+            merged_ssdc_cfg.get('enable_ssdc', False),  # 来自SS-DC配置自身的开关标志
         )
         self.enable_ssdc = any(enable_flags)  # 只要任一来源开启则启用SS-DC
-        self.ssdc_cfg = copy.deepcopy(ssdc_cfg)  # 中文注释：缓存SS-DC配置便于特征提取阶段读取调度参数
+        self.ssdc_cfg = copy.deepcopy(merged_ssdc_cfg)  # 中文注释：缓存整合后的SS-DC配置便于特征提取阶段读取调度参数
         if self.enable_ssdc:  # 当确定启用SS-DC时实例化对应模块
-            said_cfg_ref = ssdc_cfg.setdefault('said_filter', {})  # 初始化或获取SAID滤波器配置以便写入层级标签
-            coupling_cfg_ref = ssdc_cfg.setdefault('coupling_neck', {})  # 初始化或获取耦合颈部配置以便写入层级标签
-            self.ssdc_skip_local_loss = bool(ssdc_cfg.get('skip_local_loss', False))  # 读取是否跳过本地SS-DC损失的配置默认False保持旧版累加逻辑
-            self.ssdc_burn_in_iters = int(ssdc_cfg.get('burn_in_iters', 0) or 0)  # 解析烧入迭代数若未配置则回退为0保持兼容
-            self.ssdc_w_decouple_cfg = self._prepare_ssdc_weight(ssdc_cfg.get('w_decouple', None), self.loss_decouple_weight)  # 解析解耦权重支持常量或调度未提供时使用loss_weight
-            self.ssdc_w_couple_cfg = self._prepare_ssdc_weight(ssdc_cfg.get('w_couple', None), self.loss_couple_weight)  # 解析耦合权重支持常量或调度未提供时使用loss_weight
+            said_cfg_ref = merged_ssdc_cfg.setdefault('said_filter', {})  # 初始化或获取SAID滤波器配置以便写入层级标签
+            coupling_cfg_ref = merged_ssdc_cfg.setdefault('coupling_neck', {})  # 初始化或获取耦合颈部配置以便写入层级标签
+            self.ssdc_skip_local_loss = bool(merged_ssdc_cfg.get('skip_local_loss', False))  # 读取是否跳过本地SS-DC损失的配置默认False保持旧版累加逻辑
+            self.ssdc_burn_in_iters = int(merged_ssdc_cfg.get('burn_in_iters', 0) or 0)  # 解析烧入迭代数若未配置则回退为0保持兼容
+            self.ssdc_w_decouple_cfg = self._prepare_ssdc_weight(merged_ssdc_cfg.get('w_decouple', None), self.loss_decouple_weight)  # 解析解耦权重支持常量或调度未提供时使用loss_weight
+            self.ssdc_w_couple_cfg = self._prepare_ssdc_weight(merged_ssdc_cfg.get('w_couple', None), self.loss_couple_weight)  # 解析耦合权重支持常量或调度未提供时使用loss_weight
             self.ssdc_cfg['w_decouple'] = self.ssdc_w_decouple_cfg  # 中文注释：回写规范化后的解耦权重配置以便后续调用保持一致
             self.ssdc_cfg['w_couple'] = self.ssdc_w_couple_cfg  # 中文注释：回写规范化后的耦合权重配置以便特征阶段使用同一来源
             num_feature_levels, level_names = self._infer_num_feature_levels(said_cfg_ref, coupling_cfg_ref)  # 调用内部方法优先基于实网结构推断层级数量与名称
@@ -178,12 +187,12 @@ class DiffusionDetector(BaseDetector):
                 self.coupling_neck = MODELS.build(coupling_cfg)  # 使用注册表构建耦合颈部模块以支持灵活替换
             else:  # 否则直接实例化默认实现
                 self.coupling_neck = SSDCouplingNeck(**coupling_cfg)  # 以关键字参数构建耦合颈部模块使用合理默认值
-            self.use_ds_tokens = bool(coupling_cfg.get('use_ds_tokens', False))  # 读取配置中是否启用域特异令牌的标志
-            loss_decouple_cfg = copy.deepcopy(ssdc_cfg.get('loss_decouple', {}))  # 深拷贝解耦损失配置以避免污染原配置
+            self.use_ds_tokens = bool(explicit_use_ds_tokens or coupling_cfg.get('use_ds_tokens', False))  # 结合显式入参与配置决定是否启用域特异令牌
+            loss_decouple_cfg = copy.deepcopy(merged_ssdc_cfg.get('loss_decouple', {}))  # 深拷贝解耦损失配置以避免污染原配置
             self.loss_decouple_weight = float(loss_decouple_cfg.pop('loss_weight', 1.0))  # 读取解耦损失总权重缺省为1.0
             loss_decouple_cfg.setdefault('type', 'LossDecouple')  # 若未指定类型则默认使用LossDecouple实现
             self.loss_decouple = MODELS.build(loss_decouple_cfg)  # 通过注册表构建解耦损失模块实例
-            loss_couple_cfg = copy.deepcopy(ssdc_cfg.get('loss_couple', {}))  # 深拷贝耦合损失配置以避免污染原配置
+            loss_couple_cfg = copy.deepcopy(merged_ssdc_cfg.get('loss_couple', {}))  # 深拷贝耦合损失配置以避免污染原配置
             self.loss_couple_weight = float(loss_couple_cfg.pop('loss_weight', 1.0))  # 读取耦合损失总权重缺省为1.0
             loss_couple_cfg.setdefault('type', 'LossCouple')  # 若未指定类型则默认使用LossCouple实现
             self.loss_couple = MODELS.build(loss_couple_cfg)  # 通过注册表构建耦合损失模块实例
