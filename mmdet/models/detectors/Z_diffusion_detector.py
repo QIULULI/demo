@@ -413,6 +413,8 @@ class DiffusionDetector(BaseDetector):
             }  # 完成基础缓存的构造
             x = features  # 将原始特征作为输出
 
+        return x  # 中文注释：无论是否启用SS-DC或耦合流程均返回最终特征元组以供下游RPN/ROI使用
+
     def _forward(self, batch_inputs: Tensor,
                  batch_data_samples: SampleList,
                  current_iter: Optional[int] = None) -> tuple:
