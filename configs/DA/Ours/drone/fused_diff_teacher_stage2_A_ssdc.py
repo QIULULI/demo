@@ -46,7 +46,12 @@ model = dict(  # 通过层级覆盖更新模型结构
             ssdc_cfg=dict(  # 注入SS-DC模块配置
                 enable_ssdc=True,  # 再次声明开启以便合并生效
                 said_filter=dict(type='SAIDFilterBank'),  # 指定SAID滤波器类型
-                coupling_neck=dict(type='SSDCouplingNeck', use_ds_tokens=True),  # 设置耦合颈结构并启用域特异token
+                coupling_neck=dict(  # 设置耦合颈结构并启用域特异token
+                    type='SSDCouplingNeck',  # 指明耦合颈类别
+                    use_ds_tokens=True,  # 启用域特异token以保留跨域差异
+                    in_channels=256,  # 显式指定输入通道数与FPN输出保持一致
+                    levels=('P2', 'P3', 'P4', 'P5')  # 明确耦合颈接受的特征层级避免层数不匹配
+                ),
                 loss_decouple=dict(type='LossDecouple', loss_weight=1.0),  # 解耦损失配置
                 loss_couple=dict(type='LossCouple', loss_weight=1.0),  # 耦合损失配置
                 w_decouple=ssdc_schedule['w_decouple'],  # 绑定解耦权重调度
