@@ -3,6 +3,7 @@
 import os  # 中文注释：引入os模块以便通过环境变量灵活切换扩散教师路径
 import copy  # 中文注释：引入copy模块以便安全复制基础检测器配置防止原地污染
 import importlib.util  # 中文注释：引入importlib工具模块以便按文件路径动态加载带连字符的配置文件
+from mmengine import Config  # 中文注释：引入Config解析器以便按路径读取基础配置对象
 
 module_path = os.path.join(  # 中文注释：组合当前文件所在目录到基础模型配置的相对路径
     os.path.dirname(__file__),  # 中文注释：获取当前配置文件的目录
@@ -16,8 +17,11 @@ faster_rcnn_module = importlib.util.module_from_spec(spec)  # 中文注释：根
 spec.loader.exec_module(faster_rcnn_module)  # 中文注释：执行模块以填充对象内容，确保model变量可用
 diff_detector_template = faster_rcnn_module.model  # 中文注释：从动态加载的模块中取出包含DiffusionDetector与diff_config的基础模板
 
+base_model_cfg_relative = '../../../../DA/_base_/models/diffusion_guided_adaptation_faster_rcnn_r101_fpn.py'  # 中文注释：定义基础SemiBaseDiffDetector配置的相对路径以便复用
+base_model_cfg_path = os.path.join(os.path.dirname(__file__), base_model_cfg_relative)  # 中文注释：将相对路径转换为绝对路径确保Config.fromfile可用
+base_cfg = Config.fromfile(base_model_cfg_path)  # 中文注释：读取基础配置对象以便安全取得model字段
 _base_ = [
-    '../../../../DA/_base_/models/diffusion_guided_adaptation_faster_rcnn_r101_fpn.py',  # 中文注释：基础SemiBaseDiffDetector封装（保留半监督扩散蒸馏结构）
+    base_model_cfg_relative,  # 中文注释：基础SemiBaseDiffDetector封装（保留半监督扩散蒸馏结构）
     '../../../../DA/_base_/da_setting/semi_20k.py',  # 中文注释：20k迭代的半监督训练调度（实际存在的Stage-1训练日程）
     '../../../../DA/_base_/datasets/sim_to_real/semi_drone_rgb_aug.py'  # 中文注释：Sim→Real无人机数据集配置（实际存在的Stage-1数据设置）
 ]
@@ -34,7 +38,7 @@ stage1_diff_teacher_ckpt = os.environ.get(  # 中文注释：同理读取环境�
 # 中文注释：读取基础模型配置并覆盖关键字段
 classes = ('drone',)  # 中文注释：显式声明类别元组方便下游组件复用
 # 中文注释：从半监督扩散包装基础配置复制整体检测器配置
-semibase_detector = _base_.model  # 中文注释：获取基础配置中的SemiBaseDiffDetector定义
+semibase_detector = copy.deepcopy(base_cfg.model)  # 中文注释：深拷贝基础配置中的SemiBaseDiffDetector定义避免污染原对象
 # 中文注释：深拷贝DiffusionDetector模板以便在学生/教师内部复用且不污染原模板
 ssdc_ready_diff_detector = copy.deepcopy(diff_detector_template)  # 中文注释：复制包含diff_config的扩散检测器
 ssdc_ready_diff_detector.roi_head.bbox_head.num_classes = 1  # 中文注释：任务为单类无人机检测
