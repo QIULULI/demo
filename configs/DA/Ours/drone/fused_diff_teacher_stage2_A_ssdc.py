@@ -209,7 +209,6 @@ diffusion_detector['ssdc_cfg'] = dict(  # 写入SS-DC模块配置
 )  # SSDC配置结束
 
 semi_base_diff_detector = dict(  # 构建包含扩散教师的半监督检测器
-    _delete_=True,  # 删除基础模型同名键以避免残留
     type='SemiBaseDiffDetector',  # 使用半监督扩散检测器封装学生与教师
     detector=diffusion_detector,  # 注入经过无人机特化的DiffusionDetector主体
     diff_model=dict(  # 配置主扩散教师来源
