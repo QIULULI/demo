@@ -2,7 +2,19 @@
 # 中文注释：引用Stage-1基础配置（扩散引导UDA、20k半监督日程与Sim→Real无人机数据集），相对路径需从当前文件起算
 import os  # 中文注释：引入os模块以便通过环境变量灵活切换扩散教师路径
 import copy  # 中文注释：引入copy模块以便安全复制基础检测器配置防止原地污染
-from DA._base_.models.faster-rcnn_diff_fpn import model as diff_detector_template  # 中文注释：导入包含DiffusionDetector与diff_config的基础模板
+import importlib.util  # 中文注释：引入importlib工具模块以便按文件路径动态加载带连字符的配置文件
+
+module_path = os.path.join(  # 中文注释：组合当前文件所在目录到基础模型配置的相对路径
+    os.path.dirname(__file__),  # 中文注释：获取当前配置文件的目录
+    '../../../_base_/models/faster-rcnn_diff_fpn.py'  # 中文注释：指向包含DiffusionDetector模板的配置文件路径
+)
+spec = importlib.util.spec_from_file_location(  # 中文注释：基于文件路径创建模块规范以支持合法的模块名加载
+    'faster_rcnn_diff_fpn',  # 中文注释：为动态模块指定合法的Python模块名称
+    module_path  # 中文注释：提供实际的配置文件路径
+)
+faster_rcnn_module = importlib.util.module_from_spec(spec)  # 中文注释：根据模块规范创建模块对象
+spec.loader.exec_module(faster_rcnn_module)  # 中文注释：执行模块以填充对象内容，确保model变量可用
+diff_detector_template = faster_rcnn_module.model  # 中文注释：从动态加载的模块中取出包含DiffusionDetector与diff_config的基础模板
 
 _base_ = [
     '../../../../DA/_base_/models/diffusion_guided_adaptation_faster_rcnn_r101_fpn.py',  # 中文注释：基础SemiBaseDiffDetector封装（保留半监督扩散蒸馏结构）
