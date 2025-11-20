@@ -59,12 +59,16 @@ class LossCouple(nn.Module):  # 定义耦合损失模块
     def __init__(self,
                  align_weight: float = 1.0,  # 设置特征对齐损失权重默认1.0
                  ds_weight: float = 1.0,  # 设置域特异抑制损失权重默认1.0
-                 ds_margin: float = 0.2  # 设置域特异权重上限建议0.2
+                 ds_margin: float = 0.2,  # 设置域特异权重上限建议0.2
+                 ds_gate_mode: str = 'none',  # 设置额外域特异阈值惩罚模式支持'none'/'soft'/'hard'
+                 ds_gate_weight: float = 1.0  # 设置额外阈值惩罚的缩放权重默认1.0
                  ) -> None:  # 构造函数返回None
         super().__init__()  # 调用父类初始化
         self.align_weight = align_weight  # 保存对齐损失权重
         self.ds_weight = ds_weight  # 保存域特异抑制权重
         self.ds_margin = ds_margin  # 保存域特异注意力阈值
+        self.ds_gate_mode = ds_gate_mode  # 保存域特异阈值惩罚模式用于动态控制是否启用
+        self.ds_gate_weight = ds_gate_weight  # 保存域特异阈值惩罚的额外缩放权重
 
     def forward(self,
                 fused_feats: Sequence[torch.Tensor],
@@ -79,6 +83,21 @@ class LossCouple(nn.Module):  # 定义耦合损失模块
             ds_ratio = stats['ds_ratios']  # 取出域特异占比张量
             penalty = F.relu(ds_ratio - self.ds_margin)  # 超过阈值的部分产生惩罚
             loss_ds = self.ds_weight * penalty.mean()  # 平均惩罚并施加权重
+            gate_loss = ds_ratio.new_tensor(0.0)  # 初始化额外阈值惩罚为0保持兼容
+            consistency_tau = stats.get('consistency_tau', None)  # 读取耦合阶段记录的一致性门控阈值
+            if self.ds_gate_mode in ('soft', 'hard') and consistency_tau is not None:  # 当配置启用额外惩罚且阈值可用时执行
+                if torch.is_tensor(consistency_tau):  # 若阈值为张量则取均值转换为标量
+                    tau_scalar = float(consistency_tau.detach().mean().item())  # 将张量阈值转换为浮点数用于计算
+                else:  # 若阈值为数值或其他可转换类型
+                    tau_scalar = float(consistency_tau)  # 直接转换为浮点数
+                if tau_scalar > 0:  # 仅在阈值大于零时才计算惩罚
+                    tau_tensor = ds_ratio.new_tensor(tau_scalar)  # 使用域特异占比所在设备创建阈值张量
+                    if self.ds_gate_mode == 'hard':  # 当模式为硬阈值时按掩码惩罚
+                        gate_penalty = (ds_ratio > tau_tensor).float()  # 计算超过阈值的布尔掩码并转为浮点
+                    else:  # 当模式为软阈值时按超出幅度惩罚
+                        gate_penalty = F.relu(ds_ratio - tau_tensor)  # 计算软阈值超出部分
+                    gate_loss = self.ds_weight * self.ds_gate_weight * gate_penalty.mean()  # 按配置缩放并平均额外惩罚
+            loss_ds = loss_ds + gate_loss  # 将基础惩罚与额外惩罚累加形成最终域特异损失
         else:
             loss_ds = fused_feats[0].new_tensor(0.0)  # 若无统计信息则损失为零
         return {'loss_couple_align': loss_align, 'loss_couple_ds': loss_ds}  # 返回包含两项损失的字典
