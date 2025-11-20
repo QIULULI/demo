@@ -114,6 +114,7 @@ class DiffusionDetector(BaseDetector):
         self.ssdc_burn_in_iters = 0  # 初始化SS-DC烧入迭代计数默认0保持兼容
         self.ssdc_w_decouple_cfg = 1.0  # 初始化解耦损失的调度或常量配置默认1.0与旧逻辑一致
         self.ssdc_w_couple_cfg = 1.0  # 初始化耦合损失的调度或常量配置默认1.0与旧逻辑一致
+        self._ssdc_coupling_frozen = False  # 初始化耦合颈部是否已被冻结的标记避免重复切换参数状态
         self._ssdc_last_iter = None  # 初始化最近一次前向使用的迭代索引用于权重调度
         self._ssdc_num_feature_levels = None  # 初始化特征层级数量占位便于运行时校验
         self._ssdc_level_names = None  # 初始化特征层级名称列表占位符用于配置同步
@@ -317,6 +318,18 @@ class DiffusionDetector(BaseDetector):
                 return float(val_a + ratio * (val_b - val_a))  # 中文注释：返回插值后的权重
         return float(default)  # 中文注释：兜底返回默认值防止遗漏
 
+    def _update_coupling_grad_state(self, current_iter: Optional[int], burn_in_iters: int) -> None:
+        """中文注释：根据烧入阶段迭代数动态冻结或解冻耦合颈部参数。"""
+        if self.coupling_neck is None:  # 中文注释：当耦合颈部不存在时直接返回避免属性错误
+            return  # 中文注释：无需进一步处理
+        in_burn_in = (current_iter is not None) and (burn_in_iters > 0) and (current_iter < burn_in_iters)  # 中文注释：判定当前是否处于烧入阶段
+        target_requires_grad = not in_burn_in  # 中文注释：烧入阶段关闭梯度，超过后恢复梯度
+        if self._ssdc_coupling_frozen == (not target_requires_grad):  # 中文注释：若当前标记与目标状态一致则无需切换
+            return  # 中文注释：直接返回避免重复遍历参数
+        for param in self.coupling_neck.parameters():  # 中文注释：遍历耦合颈部的所有参数张量
+            param.requires_grad = target_requires_grad  # 中文注释：按目标状态设置是否需要梯度
+        self._ssdc_coupling_frozen = not target_requires_grad  # 中文注释：更新内部标记以避免下一次重复切换
+
     def extract_feat(self, batch_inputs: Tensor, ref_masks=None, ref_labels=None, current_iter: Optional[int] = None, ssdc_cfg: Optional[dict] = None) -> Tuple[Tensor]:
         """Extract features.
 
@@ -337,6 +350,7 @@ class DiffusionDetector(BaseDetector):
         bypass_couple = False  # 中文注释：初始化仅用于控制耦合阶段的绕过标志，解耦始终根据权重单独决策
         effective_ssdc_cfg = copy.deepcopy(ssdc_cfg) if ssdc_cfg is not None else copy.deepcopy(getattr(self, 'ssdc_cfg', {}))  # 中文注释：合并外部传入与内部缓存的SS-DC配置
         burn_in_iters = int(effective_ssdc_cfg.get('burn_in_iters', 0) or 0)  # 中文注释：读取烧入阶段迭代阈值用于早期禁用耦合或统计
+        self._update_coupling_grad_state(current_iter, burn_in_iters)  # 中文注释：在每次前向前依据烧入状态动态冻结或解冻耦合颈部参数
 
         decouple_weight = self._interp_schedule(effective_ssdc_cfg.get('w_decouple', self.ssdc_w_decouple_cfg), current_iter, self.loss_decouple_weight)  # 中文注释：计算当前迭代下的解耦权重支持常量与调度
         couple_weight = self._interp_schedule(effective_ssdc_cfg.get('w_couple', self.ssdc_w_couple_cfg), current_iter, self.loss_couple_weight)  # 中文注释：计算当前迭代下的耦合权重支持常量与调度

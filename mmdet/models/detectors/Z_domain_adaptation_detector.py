@@ -646,8 +646,6 @@ class DomainAdaptationDetector(BaseDetector):
         losses = dict()  # 中文注释：初始化损失容器
         if not self.ssdc_cfg:  # 中文注释：若未配置SS-DC则直接返回空字典
             return losses  # 中文注释：保持兼容
-        if current_iter < self.burn_up_iters:  # 中文注释：在烧入阶段不引入SS-DC损失避免干扰基础学习
-            return losses  # 中文注释：直接退出
         student_detector = getattr(self.model, 'student', None)  # 中文注释：获取学生检测器引用
         teacher_detector = getattr(self.model, 'teacher', None)  # 中文注释：获取教师检测器引用
         if student_detector is None or not hasattr(student_detector, 'ssdc_feature_cache'):  # 中文注释：若学生不支持SS-DC则退出
@@ -664,6 +662,10 @@ class DomainAdaptationDetector(BaseDetector):
         w_decouple = self._interp_schedule(self.ssdc_cfg.get('w_decouple', 0.0), current_iter, 0.0)  # 中文注释：插值获得解耦损失权重
         w_couple = self._interp_schedule(self.ssdc_cfg.get('w_couple', 0.0), current_iter, 0.0)  # 中文注释：插值获得耦合损失权重
         w_di = self._interp_schedule(self.ssdc_cfg.get('w_di_consistency', 0.0), current_iter, 0.0)  # 中文注释：获取域不变一致性权重
+        in_burn_in = current_iter < self.burn_up_iters  # 中文注释：记录是否处于UDA烧入阶段以屏蔽无监督耦合与一致性项
+        if in_burn_in:  # 中文注释：当仍在烧入期时禁止耦合与一致性损失但允许解耦监督预训练滤波器
+            w_couple = 0.0  # 中文注释：将耦合权重强制置零避免未稳定时梯度干扰
+            w_di = 0.0  # 中文注释：将域不变一致性权重置零保持仅有监督学习
         if w_decouple > 0 and student_cache is not None and student_cache.get('inv') is not None and getattr(student_detector, 'loss_decouple', None) is not None:  # 中文注释：仅在权重与缓存合法时计算学生解耦损失
             student_decouple = student_detector.loss_decouple(  # 中文注释：调用学生解耦损失并显式保持梯度
                 student_cache.get('raw'),  # 中文注释：传入学生原始特征序列
