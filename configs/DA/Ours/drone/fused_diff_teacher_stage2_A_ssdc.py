@@ -26,9 +26,10 @@ detector.diff_model.config = stage1_diff_teacher_config  # 中文注释：指向
 detector.diff_model.pretrained_model = stage1_diff_teacher_ckpt  # 中文注释：指向Stage-1扩散教师权重（默认值为示例路径）
 ssdc_schedule = dict(  # 中文注释：集中定义SS-DC损失调度以便骨干与训练阶段共享
     w_decouple=[(0, 0.1), (6000, 0.5)],  # 中文注释：解耦损失权重在0到6000迭代间线性由0.1升至0.5
-    w_couple=[(2000, 0.2), (10000, 0.5)],  # 中文注释：耦合损失权重在2000到10000迭代间从0.2提升到0.5
+    w_couple=[(0, 0.0), (2000, 0.2), (10000, 0.5)],  # 中文注释：耦合损失权重在0到1999迭代为0，2000到10000迭代由0.2提升至0.5
     w_di_consistency=0.3,  # 中文注释：域不变一致性损失采用固定0.3权重
-    consistency_gate=[(0, 0.9), (12000, 0.6)]  # 中文注释：DI一致性阈值从0.9逐步降至0.6以放宽伪标签筛选
+    consistency_gate=[(0, 0.9), (12000, 0.6)],  # 中文注释：DI一致性阈值从0.9逐步降至0.6以放宽伪标签筛选
+    burn_in_iters=2000  # 中文注释：设置耦合损失的预热迭代数为2000步以匹配Stage-2规划
 )  # 中文注释：调度字典定义结束
 
 detector.detector.backbone.enable_ssdc = True  # 中文注释：直接在骨干网络启用SS-DC路径以满足新版要求
@@ -41,7 +42,8 @@ detector.detector.backbone.ssdc_cfg = dict(  # 中文注释：为骨干提供完
     w_decouple=ssdc_schedule['w_decouple'],  # 中文注释：引用共享调度以确保前向构建与训练调度一致
     w_couple=ssdc_schedule['w_couple'],  # 中文注释：耦合权重调度亦复用共享定义保持一致
     w_di_consistency=ssdc_schedule['w_di_consistency'],  # 中文注释：域不变一致性权重同步骨干与训练阶段
-    consistency_gate=ssdc_schedule['consistency_gate']  # 中文注释：一致性阈值调度保持统一来源防止偏差
+    consistency_gate=ssdc_schedule['consistency_gate'],  # 中文注释：一致性阈值调度保持统一来源防止偏差
+    burn_in_iters=ssdc_schedule['burn_in_iters']  # 中文注释：将预热迭代同步到骨干以便extract_feat依据该字段跳过耦合
 )  # 中文注释：骨干SS-DC配置结束
 
 # 中文注释：包装DomainAdaptationDetector并指定训练超参
@@ -59,7 +61,8 @@ model = dict(
             w_decouple=ssdc_schedule['w_decouple'],  # 中文注释：解耦损失权重调度引用共享字典避免重复配置
             w_couple=ssdc_schedule['w_couple'],  # 中文注释：耦合损失权重调度同样引用共享字典
             w_di_consistency=ssdc_schedule['w_di_consistency'],  # 中文注释：域不变一致性权重同步共享定义
-            consistency_gate=ssdc_schedule['consistency_gate']  # 中文注释：一致性门控阈值亦保持共享配置
+            consistency_gate=ssdc_schedule['consistency_gate'],  # 中文注释：一致性门控阈值亦保持共享配置
+            burn_in_iters=ssdc_schedule['burn_in_iters']  # 中文注释：训练配置携带预热步数确保学生与教师耦合控制一致
         ),
         feature_loss_cfg=dict(  # 中文注释：补充特征蒸馏配置以满足DomainAdaptationDetector初始化需求
             feature_loss_type='mse',  # 中文注释：设置主教师特征蒸馏损失类型为MSE保证稳定
