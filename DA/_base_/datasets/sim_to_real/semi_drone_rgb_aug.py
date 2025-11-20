@@ -1,6 +1,6 @@
 # dataset settings
 dataset_type = 'CocoDataset'  # 指定数据集类型为 COCO 格式
-data_root = 'data/'  # 指定数据根目录，配合 COCO json 中的相对路径使用
+data_root = 'data/drone'  # 指定数据根目录，配合 COCO json 中的相对路径使用
 classes = ('drone',)  # 定义单类别元信息，仅包含无人机
 backend_args = None  # 默认使用本地文件后端读取图像
 branch_field = ['sup', 'unsup_teacher', 'unsup_student']  # 定义多分支字段名称，确保增广流水线输出一致
