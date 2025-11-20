@@ -339,6 +339,7 @@ class DiffusionDetector(BaseDetector):
         burn_in_iters = int(effective_ssdc_cfg.get('burn_in_iters', 0) or 0)  # 中文注释：读取烧入阶段迭代阈值用于早期禁用耦合
 
         couple_weight = self._interp_schedule(effective_ssdc_cfg.get('w_couple', 1.0), current_iter, 1.0)  # 中文注释：计算当前迭代下的耦合权重支持常量与调度
+        consistency_tau = self._interp_schedule(self.ssdc_cfg.get('consistency_gate', 0.0), current_iter, 0.0)  # 中文注释：插值读取一致性门控阈值以便在SS-DC统计中复用
         if current_iter is not None and burn_in_iters > 0 and current_iter < burn_in_iters:  # 中文注释：烧入阶段禁用SS-DC避免干扰监督学习
             bypass_ssdc = True  # 中文注释：设置绕过标志
         if couple_weight <= 0:  # 中文注释：耦合权重为0时直接跳过解耦与耦合
@@ -374,6 +375,8 @@ class DiffusionDetector(BaseDetector):
             if len(f_inv_list) != feature_count or len(f_ds_list) != feature_count:  # 校验SAID输出层数与输入特征层数一致以避免错配
                 raise RuntimeError(f'SAIDFilterBank输出层数(inv:{len(f_inv_list)}, ds:{len(f_ds_list)})与输入特征层数{feature_count}不匹配，请核对levels配置。')  # 抛出运行时异常提醒调整配置
             coupled_feats, ssdc_stats = self.coupling_neck(features, f_inv_list, f_ds_list)  # 将解耦特征送入耦合颈部融合并返回统计量
+            if isinstance(ssdc_stats, dict):  # 中文注释：当耦合颈部返回统计字典时附加一致性阈值便于下游损失使用
+                ssdc_stats['consistency_tau'] = f_inv_list[0].new_tensor(float(consistency_tau))  # 中文注释：将插值后的阈值转换为张量存入统计信息
             if not isinstance(coupled_feats, (list, tuple)):  # 校验耦合颈部输出类型必须为列表或元组保持接口一致
                 raise TypeError('SSDCouplingNeck需要返回列表/元组形式的耦合特征，请检查实现。')  # 抛出类型异常提示实现问题
             if len(coupled_feats) != feature_count:  # 校验耦合后特征层数与输入保持一致避免后续检测头维度错位

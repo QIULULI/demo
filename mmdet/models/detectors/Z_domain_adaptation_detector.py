@@ -545,6 +545,9 @@ class DomainAdaptationDetector(BaseDetector):
         if tau_value <= 0:  # 中文注释：阈值无效时不做处理
             return  # 中文注释：保持伪标签
         decay_mode = bool(gate_cfg.get('decay', False)) if isinstance(gate_cfg, dict) else False  # 中文注释：读取是否采用权重衰减模式
+        logger = MMLogger.get_current_instance()  # 中文注释：获取日志记录器以便输出当前阈值与过滤统计
+        if logger is not None:  # 中文注释：仅在日志器可用时输出信息避免异常
+            logger.info(f"consistency_gate_tau={tau_value:.4f}")  # 中文注释：记录当前迭代的一致性门控阈值用于调参
         teacher_map = self._get_cached_inv_feature(getattr(self.model, 'teacher', None))  # 中文注释：提取教师域不变特征图
         student_map = self._get_cached_inv_feature(getattr(self.model, 'student', None))  # 中文注释：提取学生域不变特征图
         if teacher_map is None or student_map is None:  # 中文注释：缺失任一特征则无法计算相似度
@@ -580,9 +583,10 @@ class DomainAdaptationDetector(BaseDetector):
         pseudo_payload['student_pseudo_samples'] = filtered_samples  # 中文注释：将过滤结果写回伪标签负载
         if total_instances > 0:  # 中文注释：仅在存在伪标签时记录过滤比例
             filter_ratio = float(filtered_instances) / float(total_instances)  # 中文注释：计算过滤比例
-            logger = MMLogger.get_current_instance()  # 中文注释：获取当前日志记录器
             if logger is not None:  # 中文注释：日志记录器可用时写入过滤信息
-                logger.info(f"consistency_gate_filtered_ratio={filter_ratio:.4f}")  # 中文注释：输出过滤比例便于监控
+                logger.info(f"consistency_gate_filtered_ratio={filter_ratio:.4f}, removed={filtered_instances}, total={total_instances}, tau={tau_value:.4f}")  # 中文注释：输出过滤比例与数量便于监控与调参
+        elif logger is not None:  # 中文注释：当不存在伪标签时也输出阈值信息辅助排查
+            logger.info(f"consistency_gate_filtered_ratio=0.0000, removed=0, total=0, tau={tau_value:.4f}")  # 中文注释：明确标记当前批次未含伪标签但记录阈值
 
     def _gate_single_sample(self, teacher_sample: Any, student_sample: Any, teacher_map: Tensor, student_map: Tensor,
                              batch_idx: int, teacher_scale: float, student_scale: float, tau_value: float,
