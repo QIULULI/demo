@@ -29,6 +29,7 @@ ssdc_schedule = dict(  # 定义SS-DC损失调度以便前向与训练阶段复�
 )  # 调度定义结束
 
 model = dict(  # 通过层级覆盖更新模型结构
+    _delete_=True,  # 顶层删除基础模型配置以避免遗留键混入
     type='DomainAdaptationDetector',  # 将Stage-2模型包装为域自适应检测器
     detector=dict(  # 指定内部半监督扩散检测器配置
         detector=dict(  # 覆盖DiffusionDetector关键字段
@@ -99,7 +100,8 @@ default_hooks = dict(  # 追加默认钩子配置以在Stage-2训练中启用SSD
 if __name__ == '__main__':  # 当作为脚本运行时执行自检
     from mmengine import Config  # 导入配置解析器
     cfg = Config.fromfile(__file__)  # 载入当前配置文件
-    print(cfg.model['type'])  # 打印模型类型确认解析成功
-    print(cfg.model.detector.detector.enable_ssdc)  # 检查DiffusionDetector层级SS-DC开关
-    print(cfg.model.detector.diff_model.config)  # 输出扩散教师配置路径
-    print(cfg.model.detector.detector.init_cfg)  # 打印初始化配置确认权重设置
+    print('cfg.model.type:', cfg.model['type'])  # 打印模型类型确认解析成功
+    print('cfg.model.detector keys:', cfg.model.detector.keys())  # 打印检测器键集合确认未混入基础键
+    print('cfg.model.detector.detector.enable_ssdc:', cfg.model.detector.detector.enable_ssdc)  # 检查DiffusionDetector层级SS-DC开关
+    print('cfg.model.detector.diff_model.config:', cfg.model.detector.diff_model.config)  # 输出扩散教师配置路径
+    print('cfg.model.detector.detector.init_cfg:', cfg.model.detector.detector.init_cfg)  # 打印初始化配置确认权重设置
