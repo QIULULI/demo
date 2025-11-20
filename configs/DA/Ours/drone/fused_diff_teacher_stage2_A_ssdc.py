@@ -7,7 +7,7 @@ from mmengine import Config  # 中文注释：引入Config解析器以便按路�
 
 module_path = os.path.join(  # 中文注释：组合当前文件所在目录到基础模型配置的相对路径
     os.path.dirname(__file__),  # 中文注释：获取当前配置文件的目录
-    '../../../_base_/models/faster-rcnn_diff_fpn.py'  # 中文注释：指向包含DiffusionDetector模板的配置文件路径
+    '../../../../DA/_base_/models/faster-rcnn_diff_fpn.py'  # 中文注释：指向仓库根目录下DA/_base_/models的DiffusionDetector模板配置文件路径
 )
 spec = importlib.util.spec_from_file_location(  # 中文注释：基于文件路径创建模块规范以支持合法的模块名加载
     'faster_rcnn_diff_fpn',  # 中文注释：为动态模块指定合法的Python模块名称
