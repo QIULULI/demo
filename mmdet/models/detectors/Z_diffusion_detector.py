@@ -334,16 +334,17 @@ class DiffusionDetector(BaseDetector):
             x = self.backbone(batch_inputs)
         if self.with_neck:
             x = self.neck(x)
-        bypass_ssdc = False  # 中文注释：初始化SS-DC绕过标志避免无条件耦合
+        bypass_couple = False  # 中文注释：初始化仅用于控制耦合阶段的绕过标志，解耦始终根据权重单独决策
         effective_ssdc_cfg = copy.deepcopy(ssdc_cfg) if ssdc_cfg is not None else copy.deepcopy(getattr(self, 'ssdc_cfg', {}))  # 中文注释：合并外部传入与内部缓存的SS-DC配置
-        burn_in_iters = int(effective_ssdc_cfg.get('burn_in_iters', 0) or 0)  # 中文注释：读取烧入阶段迭代阈值用于早期禁用耦合
+        burn_in_iters = int(effective_ssdc_cfg.get('burn_in_iters', 0) or 0)  # 中文注释：读取烧入阶段迭代阈值用于早期禁用耦合或统计
 
-        couple_weight = self._interp_schedule(effective_ssdc_cfg.get('w_couple', 1.0), current_iter, 1.0)  # 中文注释：计算当前迭代下的耦合权重支持常量与调度
+        decouple_weight = self._interp_schedule(effective_ssdc_cfg.get('w_decouple', self.ssdc_w_decouple_cfg), current_iter, self.loss_decouple_weight)  # 中文注释：计算当前迭代下的解耦权重支持常量与调度
+        couple_weight = self._interp_schedule(effective_ssdc_cfg.get('w_couple', self.ssdc_w_couple_cfg), current_iter, self.loss_couple_weight)  # 中文注释：计算当前迭代下的耦合权重支持常量与调度
         consistency_tau = self._interp_schedule(self.ssdc_cfg.get('consistency_gate', 0.0), current_iter, 0.0)  # 中文注释：插值读取一致性门控阈值以便在SS-DC统计中复用
-        if current_iter is not None and burn_in_iters > 0 and current_iter < burn_in_iters:  # 中文注释：烧入阶段禁用SS-DC避免干扰监督学习
-            bypass_ssdc = True  # 中文注释：设置绕过标志
-        if couple_weight <= 0:  # 中文注释：耦合权重为0时直接跳过解耦与耦合
-            bypass_ssdc = True  # 中文注释：避免无意义的额外前向
+        if current_iter is not None and burn_in_iters > 0 and current_iter < burn_in_iters:  # 中文注释：烧入阶段仅绕过耦合以避免早期统计干扰
+            bypass_couple = True  # 中文注释：标记耦合绕过但允许解耦特征生成
+        if couple_weight <= 0:  # 中文注释：耦合权重为0时仅跳过耦合阶段但仍执行解耦以支持LossDecouple
+            bypass_couple = True  # 中文注释：避免无意义的耦合计算同时保留解耦特征
         storage_key = 'ref' if (ref_masks is not None and ref_labels is not None) else 'noref'  # 根据参考信息选择缓存键
         if isinstance(x, tuple):  # 当颈部或骨干直接返回元组特征时直接沿用保持结构不变
             features = x  # 记录元组特征供后续SS-DC与检测头使用
@@ -352,7 +353,9 @@ class DiffusionDetector(BaseDetector):
         else:  # 当返回单个Tensor时包装为单元素元组以兼容多层特征接口
             features = (x,)  # 将单层特征封装为元组便于统一处理
         feature_count = len(features)  # 记录当前实际特征层级数量便于与配置对齐
-        if self.enable_ssdc and self.said_filter is not None and self.coupling_neck is not None and not bypass_ssdc:  # 当启用SS-DC且未绕过时执行层级数量校验
+        run_ssdc = self.enable_ssdc and self.said_filter is not None and self.coupling_neck is not None  # 中文注释：预判当前是否具备运行SS-DC的所有模块条件
+        need_decompose = run_ssdc and (decouple_weight > 0 or not bypass_couple)  # 中文注释：仅在解耦权重大于0或需要耦合时才执行SAID分解以节省计算
+        if run_ssdc and not bypass_couple:  # 中文注释：当启用SS-DC且不绕过耦合时执行层级数量校验保证耦合输入完整
             expected_levels = self._ssdc_num_feature_levels  # 读取初始化阶段推断的预期层级数
             if expected_levels is None and hasattr(self.coupling_neck, 'num_feature_levels'):  # 当预期值缺失时尝试从耦合颈部读取声明
                 coupling_levels = getattr(self.coupling_neck, 'num_feature_levels')  # 获取耦合颈部声明的层级数量
@@ -368,38 +371,47 @@ class DiffusionDetector(BaseDetector):
                 raise RuntimeError(
                     f'检测到SS-DC模块收到的特征层数为{feature_count}，但配置/推断期望{expected_levels}层，请检查backbone/neck输出或ssdc配置的levels/num_feature_levels设置。'
                 )  # 抛出运行时异常以避免隐式形状错误
-        if self.enable_ssdc and self.said_filter is not None and self.coupling_neck is not None and not bypass_ssdc:  # 启用SS-DC且未绕过时执行解耦与耦合
+        if need_decompose:  # 启用SS-DC且需要执行SAID分解时进行解耦与（可选的）耦合
             f_inv_list, f_ds_list = self.said_filter(features)  # 调用SAID滤波器获取域不变与域特异特征列表
             if not isinstance(f_inv_list, (list, tuple)) or not isinstance(f_ds_list, (list, tuple)):  # 校验SAID输出类型必须为列表或元组避免后续索引错误
                 raise TypeError('SAIDFilterBank需要返回列表/元组形式的inv与ds特征，请检查实现。')  # 抛出类型异常提示检查实现
             if len(f_inv_list) != feature_count or len(f_ds_list) != feature_count:  # 校验SAID输出层数与输入特征层数一致以避免错配
                 raise RuntimeError(f'SAIDFilterBank输出层数(inv:{len(f_inv_list)}, ds:{len(f_ds_list)})与输入特征层数{feature_count}不匹配，请核对levels配置。')  # 抛出运行时异常提醒调整配置
-            coupled_feats, ssdc_stats = self.coupling_neck(features, f_inv_list, f_ds_list)  # 将解耦特征送入耦合颈部融合并返回统计量
-            if isinstance(ssdc_stats, dict):  # 中文注释：当耦合颈部返回统计字典时附加一致性阈值便于下游损失使用
-                ssdc_stats['consistency_tau'] = f_inv_list[0].new_tensor(float(consistency_tau))  # 中文注释：将插值后的阈值转换为张量存入统计信息
-            if not isinstance(coupled_feats, (list, tuple)):  # 校验耦合颈部输出类型必须为列表或元组保持接口一致
-                raise TypeError('SSDCouplingNeck需要返回列表/元组形式的耦合特征，请检查实现。')  # 抛出类型异常提示实现问题
-            if len(coupled_feats) != feature_count:  # 校验耦合后特征层数与输入保持一致避免后续检测头维度错位
-                raise RuntimeError(f'SSDCouplingNeck输出层数{len(coupled_feats)}与输入特征层数{feature_count}不一致，请检查num_feature_levels配置。')  # 抛出异常提醒调整配置
-            coupled_tuple = tuple(coupled_feats)  # 将融合后的特征转换为元组以符合检测头输入要求
-            self.ssdc_feature_cache[storage_key] = {  # 为当前分支缓存SS-DC相关特征供损失计算
-                'raw': features,  # 缓存原始未耦合的FPN特征
-                'inv': tuple(f_inv_list),  # 缓存域不变特征列表
-                'ds': tuple(f_ds_list),  # 缓存域特异特征列表
-                'coupled': coupled_tuple,  # 缓存耦合后的特征结果
-                'stats': ssdc_stats,  # 缓存耦合过程的统计信息如域特异占比
-            }  # 完成缓存字典的构造
-            x = coupled_tuple  # 将耦合结果作为后续检测模块输入
-        else:  # 当未启用SS-DC或模块未构建或被绕过时直接返回原始特征
+            if not bypass_couple:  # 中文注释：在允许耦合时调用耦合颈部生成融合特征与统计量
+                coupled_feats, ssdc_stats = self.coupling_neck(features, f_inv_list, f_ds_list)  # 将解耦特征送入耦合颈部融合并返回统计量
+                if isinstance(ssdc_stats, dict):  # 中文注释：当耦合颈部返回统计字典时附加一致性阈值便于下游损失使用
+                    ssdc_stats['consistency_tau'] = f_inv_list[0].new_tensor(float(consistency_tau))  # 中文注释：将插值后的阈值转换为张量存入统计信息
+                if not isinstance(coupled_feats, (list, tuple)):  # 校验耦合颈部输出类型必须为列表或元组保持接口一致
+                    raise TypeError('SSDCouplingNeck需要返回表/元组形式的耦合特征，请检查实现。')  # 抛出类型异常提示实现问题
+                if len(coupled_feats) != feature_count:  # 校验耦合后特征层数与输入保持一致避免后续检测头维度错位
+                    raise RuntimeError(f'SSDCouplingNeck输出层数{len(coupled_feats)}与输入特征层数{feature_count}不一致，请检查num_feature_levels配置。')  # 抛出异常提醒调整配置
+                coupled_tuple = tuple(coupled_feats)  # 将融合后的特征转换为元组以符合检测头输入要求
+                self.ssdc_feature_cache[storage_key] = {  # 为当前分支缓存SS-DC相关特征供损失计算
+                    'raw': features,  # 缓存原始未耦合的FPN特征
+                    'inv': tuple(f_inv_list),  # 缓存域不变特征列表
+                    'ds': tuple(f_ds_list),  # 缓存域特异特征列表
+                    'coupled': coupled_tuple,  # 缓存耦合后的特征结果
+                    'stats': ssdc_stats,  # 缓存耦合过程的统计信息如域特异占比
+                }  # 完成缓存字典的构造
+                x = coupled_tuple  # 将耦合结果作为后续检测模块输入
+            else:  # 中文注释：当仅绕过耦合时仍缓存解耦特征以供LossDecouple使用
+                self.ssdc_feature_cache[storage_key] = {  # 构造仅含解耦特征的缓存条目
+                    'raw': features,  # 缓存原始FPN特征供能量约束
+                    'inv': tuple(f_inv_list),  # 缓存域不变特征确保LossDecouple可用
+                    'ds': tuple(f_ds_list),  # 缓存域特异特征确保LossDecouple可用
+                    'coupled': features,  # 当跳过耦合时将原始特征作为耦合输出占位保持接口一致
+                    'stats': None,  # 跳过耦合时无统计信息可用以避免误用
+                }  # 完成绕过耦合情况下的缓存构造
+                x = features  # 在耦合绕过时将原始特征直接返回给检测头
+        else:  # 当未启用SS-DC或模块未构建时直接返回原始特征
             self.ssdc_feature_cache[storage_key] = {  # 缓存基础特征以保持接口一致
                 'raw': features,  # 缓存原始FPN特征
-                'inv': None if bypass_ssdc else None,  # 中文注释：绕过时显式置空域不变特征占位
-                'ds': None if bypass_ssdc else None,  # 中文注释：绕过时显式置空域特异特征占位
+                'inv': None,  # 中文注释：未启用SS-DC时域不变特征为空
+                'ds': None,  # 中文注释：未启用SS-DC时域特异特征为空
                 'coupled': features,  # 将原始特征视作耦合结果保持一致性
                 'stats': None,  # 占位符表明无附加统计量
             }  # 完成基础缓存的构造
             x = features  # 将原始特征作为输出
-        return x
 
     def _forward(self, batch_inputs: Tensor,
                  batch_data_samples: SampleList,
@@ -573,9 +585,8 @@ class DiffusionDetector(BaseDetector):
                 in_burn_in = burn_in_iters > 0 and current_iter < burn_in_iters  # 中文注释：判断当前迭代是否处于烧入阶段
                 effective_decouple_weight = self._interp_schedule(self.ssdc_w_decouple_cfg, current_iter, self.loss_decouple_weight)  # 中文注释：解析当前迭代下解耦损失的有效权重
                 effective_couple_weight = self._interp_schedule(self.ssdc_w_couple_cfg, current_iter, self.loss_couple_weight)  # 中文注释：解析当前迭代下耦合损失的有效权重
-                if in_burn_in:  # 中文注释：在烧入阶段直接屏蔽两项损失确保稳定
-                    effective_decouple_weight = 0.0  # 中文注释：烧入期解耦损失权重设为0
-                    effective_couple_weight = 0.0  # 中文注释：烧入期耦合损失权重设为0
+                if in_burn_in:  # 中文注释：在烧入阶段仅屏蔽耦合损失以避免早期统计扰动，同时保留解耦监督
+                    effective_couple_weight = 0.0  # 中文注释：烧入期耦合损失权重设为0但继续允许解耦损失生效
                 if (self.loss_decouple is not None  # 确认解耦损失模块已构建
                         and cache_noref['inv'] is not None  # 确认无参考分支解耦域不变特征可用
                         and cache_noref['ds'] is not None  # 确认无参考分支解耦域特异特征可用
