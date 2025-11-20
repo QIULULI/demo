@@ -157,6 +157,14 @@ class DiffusionDetector(BaseDetector):
             coupling_cfg_ref = merged_ssdc_cfg.setdefault('coupling_neck', {})  # 初始化或获取耦合颈部配置以便写入层级标签
             self.ssdc_skip_local_loss = bool(merged_ssdc_cfg.get('skip_local_loss', False))  # 读取是否跳过本地SS-DC损失的配置默认False保持旧版累加逻辑
             self.ssdc_burn_in_iters = int(merged_ssdc_cfg.get('burn_in_iters', 0) or 0)  # 解析烧入迭代数若未配置则回退为0保持兼容
+            loss_decouple_cfg = copy.deepcopy(merged_ssdc_cfg.get('loss_decouple', {}))  # 深拷贝解耦损失配置以避免污染原配置
+            self.loss_decouple_weight = float(loss_decouple_cfg.pop('loss_weight', 1.0))  # 读取解耦损失总权重缺省为1.0
+            loss_decouple_cfg.setdefault('type', 'LossDecouple')  # 若未指定类型则默认使用LossDecouple实现
+            self.loss_decouple = MODELS.build(loss_decouple_cfg)  # 通过注册表构建解耦损失模块实例
+            loss_couple_cfg = copy.deepcopy(merged_ssdc_cfg.get('loss_couple', {}))  # 深拷贝耦合损失配置以避免污染原配置
+            self.loss_couple_weight = float(loss_couple_cfg.pop('loss_weight', 1.0))  # 读取耦合损失总权重缺省为1.0
+            loss_couple_cfg.setdefault('type', 'LossCouple')  # 若未指定类型则默认使用LossCouple实现
+            self.loss_couple = MODELS.build(loss_couple_cfg)  # 通过注册表构建耦合损失模块实例
             self.ssdc_w_decouple_cfg = self._prepare_ssdc_weight(merged_ssdc_cfg.get('w_decouple', None), self.loss_decouple_weight)  # 解析解耦权重支持常量或调度未提供时使用loss_weight
             self.ssdc_w_couple_cfg = self._prepare_ssdc_weight(merged_ssdc_cfg.get('w_couple', None), self.loss_couple_weight)  # 解析耦合权重支持常量或调度未提供时使用loss_weight
             self.ssdc_cfg['w_decouple'] = self.ssdc_w_decouple_cfg  # 中文注释：回写规范化后的解耦权重配置以便后续调用保持一致
@@ -188,14 +196,6 @@ class DiffusionDetector(BaseDetector):
             else:  # 否则直接实例化默认实现
                 self.coupling_neck = SSDCouplingNeck(**coupling_cfg)  # 以关键字参数构建耦合颈部模块使用合理默认值
             self.use_ds_tokens = bool(explicit_use_ds_tokens or coupling_cfg.get('use_ds_tokens', False))  # 结合显式入参与配置决定是否启用域特异令牌
-            loss_decouple_cfg = copy.deepcopy(merged_ssdc_cfg.get('loss_decouple', {}))  # 深拷贝解耦损失配置以避免污染原配置
-            self.loss_decouple_weight = float(loss_decouple_cfg.pop('loss_weight', 1.0))  # 读取解耦损失总权重缺省为1.0
-            loss_decouple_cfg.setdefault('type', 'LossDecouple')  # 若未指定类型则默认使用LossDecouple实现
-            self.loss_decouple = MODELS.build(loss_decouple_cfg)  # 通过注册表构建解耦损失模块实例
-            loss_couple_cfg = copy.deepcopy(merged_ssdc_cfg.get('loss_couple', {}))  # 深拷贝耦合损失配置以避免污染原配置
-            self.loss_couple_weight = float(loss_couple_cfg.pop('loss_weight', 1.0))  # 读取耦合损失总权重缺省为1.0
-            loss_couple_cfg.setdefault('type', 'LossCouple')  # 若未指定类型则默认使用LossCouple实现
-            self.loss_couple = MODELS.build(loss_couple_cfg)  # 通过注册表构建耦合损失模块实例
 
         self.class_maps = backbone['diff_config']['classes']
 
