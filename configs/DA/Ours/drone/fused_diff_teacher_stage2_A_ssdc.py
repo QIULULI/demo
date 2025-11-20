@@ -101,6 +101,16 @@ model = dict(
     )
 )
 
+default_hooks = dict(  # 中文注释：追加默认钩子配置以在Stage-2训练中启用SSDC监控
+    _delete_=False,  # 中文注释：通过保持False确保在保留基础默认钩子的同时追加新监控钩子
+    ssdc_monitor=dict(  # 中文注释：注册名为ssdc_monitor的钩子实例以便mmengine正确合并
+        type='SSDCMonitorHook',  # 中文注释：钩子类型指向mmdet/engine/hooks/ssdc_monitor_hook.py中已注册的实现
+        interval=100,  # 中文注释：设置统计打印间隔为100迭代，保证日志中持续输出SSDCMonitor前缀指标
+        vis_interval=1000,  # 中文注释：设置可视化保存间隔为1000迭代以降低开销
+        max_vis_samples=1  # 中文注释：每次可视化最多取1个样本，控制显存与存储消耗
+    )
+)
+
 # 中文注释：小型自检代码（仅导入与前向张量）
 if __name__ == '__main__':
     from mmengine import Config  # 中文注释：导入配置解析器
