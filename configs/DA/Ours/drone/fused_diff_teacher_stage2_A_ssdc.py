@@ -57,7 +57,8 @@ model = dict(  # 通过层级覆盖更新模型结构
                 w_decouple=ssdc_schedule['w_decouple'],  # 绑定解耦权重调度
                 w_couple=ssdc_schedule['w_couple'],  # 绑定耦合权重调度
                 w_di_consistency=ssdc_schedule['w_di_consistency'],  # 绑定域不变一致性权重
-                consistency_gate=ssdc_schedule['consistency_gate']  # 绑定一致性阈值调度
+                consistency_gate=ssdc_schedule['consistency_gate'],  # 绑定一致性阈值调度
+                burn_in_iters=ssdc_schedule['burn_in_iters']  # 对齐训练阶段的耦合预热步数
             )
         ),
         diff_model=dict(  # 替换扩散教师配置
