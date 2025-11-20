@@ -103,6 +103,7 @@ class SSDCMonitorHook(Hook):  # 中文注释：定义SS-DC监控钩子类
         visualizer = getattr(runner, 'visualizer', None)  # 中文注释：获取可视化器实例
         if visualizer is None:  # 中文注释：未配置可视化器时跳过图像生成
             return  # 中文注释：直接退出以避免不必要开销
+        step = runner.iter + 1  # 中文注释：统一记录当前迭代步数避免重复计算
         inv_feats: Optional[Sequence[torch.Tensor]] = cache.get('inv') if isinstance(cache, dict) else None  # 中文注释：读取域不变特征
         ds_feats: Optional[Sequence[torch.Tensor]] = cache.get('ds') if isinstance(cache, dict) else None  # 中文注释：读取域特异特征
         if not isinstance(inv_feats, (list, tuple)) or not isinstance(ds_feats, (list, tuple)):  # 中文注释：无有效特征时返回
@@ -120,15 +121,63 @@ class SSDCMonitorHook(Hook):  # 中文注释：定义SS-DC监控钩子类
             visualizer.add_image(  # 中文注释：将域不变热力图写入可视化器
                 name=f'SSDC/Inv_L{level_idx}',  # 中文注释：指定图像名称包含层级索引
                 img=inv_norm[0].detach(),  # 中文注释：取批次第一张图并detach以避免梯度
-                step=runner.iter + 1)  # 中文注释：记录当前迭代步数
+                step=step)  # 中文注释：记录当前迭代步数
             visualizer.add_image(  # 中文注释：将域特异热力图写入可视化器
                 name=f'SSDC/DS_L{level_idx}',  # 中文注释：指定域特异图像名称
                 img=ds_norm[0].detach(),  # 中文注释：同样取第一张图用于可视化
-                step=runner.iter + 1)  # 中文注释：使用相同步数方便对齐
+                step=step)  # 中文注释：使用相同步数方便对齐
+            energy_inv = inv_map.pow(2).mean(dim=1, keepdim=True)  # 中文注释：计算域不变特征的平方能量并在通道求均值
+            energy_ds = ds_map.pow(2).mean(dim=1, keepdim=True)  # 中文注释：计算域特异特征的平方能量并在通道求均值
+            max_energy = torch.max(torch.stack([energy_inv.max(), energy_ds.max()])).clamp_min(1e-6)  # 中文注释：求取能量最大值并设置安全下限
+            inv_energy_norm = (energy_inv / max_energy).clamp(0.0, 1.0)  # 中文注释：将域不变能量归一化到0-1区间便于可视化
+            ds_energy_norm = (energy_ds / max_energy).clamp(0.0, 1.0)  # 中文注释：将域特异能量归一化到0-1区间
+            energy_grid = torch.cat([inv_energy_norm, ds_energy_norm], dim=1)  # 中文注释：拼接形成两通道能量热力图用于对比
+            visualizer.add_image(  # 中文注释：输出能量覆盖热力图展示低频与高频分布
+                name=f'SSDC/Energy_L{level_idx}',  # 中文注释：命名中包含层级索引便于区分
+                img=energy_grid[0].detach(),  # 中文注释：取批次第一张样本的能量图
+                step=step)  # 中文注释：标记当前迭代步数
+            said_module = getattr(detector, 'said_filter', None)  # 中文注释：获取SAID滤波器实例以重建掩码
+            if said_module is not None and hasattr(said_module, 'cutoff_logit'):  # 中文注释：仅在具备可训练截止参数时执行
+                cutoff_param = said_module.cutoff_logit[0] if getattr(said_module, 'share_mask', True) else said_module.cutoff_logit[level_idx]  # 中文注释：根据共享配置选择对应层级的logit
+                cutoff_value = torch.sigmoid(cutoff_param.detach())  # 中文注释：将logit转换为0-1的截止比例
+                if hasattr(said_module, '_compute_radius_grid'):  # 中文注释：优先使用模块内部的半径网格实现确保一致性
+                    radius_grid = said_module._compute_radius_grid(inv_map.shape[-2], inv_map.shape[-1], inv_map.device, inv_map.dtype)  # 中文注释：调用内部函数生成归一化半径网格
+                else:  # 中文注释：若内部函数不存在则回退到本地实现
+                    freq_y = torch.fft.fftfreq(inv_map.shape[-2], device=inv_map.device, dtype=inv_map.dtype).view(inv_map.shape[-2], 1)  # 中文注释：计算垂直频率分布
+                    freq_x = torch.fft.fftfreq(inv_map.shape[-1], device=inv_map.device, dtype=inv_map.dtype).view(1, inv_map.shape[-1])  # 中文注释：计算水平频率分布
+                    radius = torch.sqrt(freq_y.square() + freq_x.square())  # 中文注释：根据勾股定理得到半径矩阵
+                    radius_grid = (radius / radius.max().clamp_min(1e-6)).to(inv_map.dtype)  # 中文注释：归一化半径并匹配数据类型
+                if getattr(said_module, 'use_hard_mask', False):  # 中文注释：根据配置选择硬掩码或软掩码
+                    mask = (radius_grid <= cutoff_value).to(dtype=inv_map.dtype)  # 中文注释：生成二值低频掩码
+                else:  # 中文注释：软掩码情况下使用温度控制平滑度
+                    temperature = max(getattr(said_module, 'temperature', 0.1), 1e-6)  # 中文注释：读取温度并避免接近零导致数值问题
+                    mask = torch.sigmoid((cutoff_value - radius_grid) / temperature).to(dtype=inv_map.dtype)  # 中文注释：按SAID定义生成软掩码
+                mask_vis = mask.unsqueeze(0)  # 中文注释：扩展通道维度以符合可视化接口的CHW格式
+                visualizer.add_image(  # 中文注释：输出当前层级的低频掩码热力图
+                    name=f'SSDC/Mask_L{level_idx}',  # 中文注释：命名突出Mask与层级编号
+                    img=mask_vis.detach(),  # 中文注释：分离计算图避免干扰训练
+                    step=step)  # 中文注释：记录对应迭代步数
         said_module = getattr(detector, 'said_filter', None)  # 中文注释：尝试获取SAID滤波器以可视化频率掩码
         if said_module is not None and hasattr(said_module, 'cutoff_logit'):  # 中文注释：仅当滤波器存在且含可学习掩码时处理
             cutoff = torch.sigmoid(said_module.cutoff_logit.detach())  # 中文注释：将logit转换为截止比例
-            visualizer.add_scalar('SSDC/Cutoff', float(cutoff.mean().item()), runner.iter + 1)  # 中文注释：记录平均截止比例便于监控
+            visualizer.add_scalar('SSDC/Cutoff', float(cutoff.mean().item()), step)  # 中文注释：记录平均截止比例便于监控
+        if isinstance(cache, dict) and isinstance(cache.get('stats', None), dict):  # 中文注释：确认统计字段存在以提取DS注意力
+            ds_ratios = cache['stats'].get('ds_ratios', None)  # 中文注释：尝试读取域特异token比例张量
+            if torch.is_tensor(ds_ratios):  # 中文注释：仅在存在有效张量时进行可视化
+                ratio_tensor = ds_ratios.detach().float()  # 中文注释：分离计算图并转换为浮点便于归一化
+                if ratio_tensor.dim() > 1:  # 中文注释：当包含批次或多头维度时先按批次求均值
+                    ratio_tensor = ratio_tensor.mean(dim=0)  # 中文注释：压缩批次维获得平均注意力
+                if ratio_tensor.dim() == 1:  # 中文注释：若为一维则扩展成1x1xN条形图
+                    ratio_map = ratio_tensor.view(1, 1, -1)  # 中文注释：调整形状以符合CHW格式
+                elif ratio_tensor.dim() == 2:  # 中文注释：若为二维则视为头数xToken维度
+                    ratio_map = ratio_tensor.unsqueeze(0)  # 中文注释：增加批次通道维形成1xH xW热力图
+                else:  # 中文注释：更高维度则展开除通道外的其余维度
+                    ratio_map = ratio_tensor.flatten(1).unsqueeze(0)  # 中文注释：展平得到紧凑的可视化矩阵
+                ratio_norm = (ratio_map - ratio_map.min()) / (ratio_map.max() - ratio_map.min() + 1e-6)  # 中文注释：归一化到0-1范围提升对比度
+                visualizer.add_image(  # 中文注释：记录DS token注意力分布以排查是否被主导
+                    name='SSDC/DS_Ratios',  # 中文注释：固定名称便于面板聚合
+                    img=ratio_norm,  # 中文注释：传入归一化后的热力图
+                    step=step)  # 中文注释：标记当前迭代步数
 
 
 # 中文注释：小型自检代码（仅执行导入与空缓存调用）
