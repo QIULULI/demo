@@ -4,11 +4,13 @@ from typing import Any, Dict, Tuple, Optional  # 中文注释：引入Optional�
 import torch
 import torch.nn.functional as F  # 中文注释：引入函数式接口用于计算一致性与MSE损失
 from torch import Tensor
+from torchvision.ops import roi_align  # 中文注释：导入ROIAlign用于在域不变特征上执行ROI采样
 
 from mmdet.models.utils import (rename_loss_dict,
                                 reweight_loss_dict)
 from mmdet.registry import MODELS
 from mmdet.structures import SampleList
+from mmdet.structures.bbox import bbox_overlaps  # 中文注释：导入IoU计算工具以匹配教师与学生伪框
 from mmdet.utils import ConfigType, OptConfigType, OptMultiConfig
 from mmengine.logging import MMLogger  # 中文注释：引入日志记录器以便在调试阶段输出一致性损失信息
 from .base import BaseDetector
@@ -160,8 +162,21 @@ class DomainAdaptationDetector(BaseDetector):
                     multi_batch_inputs['sup'], multi_batch_data_samples['sup'], current_iter=current_iter))  # 中文注释：计算监督学习损失并同步传递迭代索引
             else:  # 中文注释：当满足蒸馏开放条件时执行跨模型与特征蒸馏分支
                 warmup_weight = self._get_distill_warmup_weight(current_iter)  # 中文注释：根据迭代进度获取预热权重
-                semi_loss, diff_feature = self.model.loss_diff_adaptation(
-                    multi_batch_inputs, multi_batch_data_samples, ssdc_cfg=self.ssdc_cfg, current_iter=current_iter)  # 中文注释：获取跨模型损失与教师特征并传入SS-DC配置用于伪标签过滤
+                pseudo_payload = None  # 中文注释：初始化伪标签负载占位符，便于后续插入门控过滤
+                semi_output = self.model.loss_diff_adaptation(
+                    multi_batch_inputs, multi_batch_data_samples, ssdc_cfg=self.ssdc_cfg, current_iter=current_iter)  # 中文注释：获取跨模型损失与教师特征，必要时携带伪标签信息
+                semi_loss, diff_feature = self._unpack_diff_adaptation_output(semi_output)  # 中文注释：通过统一解析函数解包损失与教师特征
+                pseudo_payload = self._extract_pseudo_payload(semi_output, diff_feature)  # 中文注释：尝试从返回结果中抽取伪标签与批次信息
+                if pseudo_payload is not None:  # 中文注释：当存在伪标签负载时执行域不变特征门控
+                    self._apply_pseudo_consistency_gate(
+                        pseudo_payload, multi_batch_inputs, current_iter)  # 中文注释：基于余弦相似度对伪标签进行过滤或衰减
+                    if not self._has_pseudo_loss(semi_loss):  # 中文注释：若底层尚未计算伪标签损失则在包装器中补算
+                        gated_student_samples = pseudo_payload.get('student_pseudo_samples', None)  # 中文注释：读取经过门控后的学生伪标签
+                        batch_info = pseudo_payload.get('batch_info', None)  # 中文注释：提取批次信息便于投影使用
+                        if gated_student_samples is not None and hasattr(self.model, 'loss_by_pseudo_instances'):  # 中文注释：确保存在学生伪标签与对应loss接口
+                            pseudo_losses = self.model.loss_by_pseudo_instances(
+                                multi_batch_inputs['unsup_student'], gated_student_samples, batch_info, current_iter=current_iter)  # 中文注释：调用底层loss计算门控后的伪标签损失
+                            semi_loss.update(**pseudo_losses)  # 中文注释：将补算的伪标签损失合并到蒸馏损失中
                 self._update_ssdc_teacher_override(diff_feature)  # 中文注释：尝试从扩散教师返回包中提取域不变特征供SS-DC损失阶段直接复用
                 ssdc_losses = self._compute_ssdc_loss(current_iter) if self.ssdc_compute_in_wrapper else {}  # 中文注释：根据配置决定是否在包装器内汇总SS-DC损失
                 feature_loss = self.loss_feature(
@@ -448,6 +463,179 @@ class DomainAdaptationDetector(BaseDetector):
                 ratio = (current_iter - iter_a) / max(float(iter_b - iter_a), 1.0)  # 中文注释：计算线性插值系数避免除零
                 return float(val_a + ratio * (val_b - val_a))  # 中文注释：返回插值结果
         return default  # 中文注释：兜底返回默认值避免逻辑遗漏
+
+    def _unpack_diff_adaptation_output(self, semi_output: Any) -> Tuple[dict, Any]:
+        """中文注释：解析diff自适应分支的返回值以获得损失与特征包。"""
+        semi_loss = dict()  # 中文注释：初始化蒸馏损失字典
+        diff_feature = None  # 中文注释：初始化教师特征占位符
+        if isinstance(semi_output, tuple):  # 中文注释：当返回值为元组时按位置解析
+            if len(semi_output) >= 1:  # 中文注释：确认存在损失输出
+                semi_loss = semi_output[0] if isinstance(semi_output[0], dict) else dict()  # 中文注释：确保返回值为字典类型
+            if len(semi_output) >= 2:  # 中文注释：当提供第二个元素时将其视为教师特征
+                diff_feature = semi_output[1]  # 中文注释：记录教师特征包
+        elif isinstance(semi_output, dict):  # 中文注释：当返回值本身为字典时直接视作损失
+            semi_loss = semi_output  # 中文注释：将字典作为损失输出
+        return semi_loss, diff_feature  # 中文注释：返回解析得到的损失与教师特征
+
+    def _extract_pseudo_payload(self, semi_output: Any, diff_feature: Any) -> Optional[dict]:
+        """中文注释：从返回结果与教师特征中提取伪标签与批次信息。"""
+        pseudo_payload = None  # 中文注释：初始化负载为空
+        candidate = None  # 中文注释：准备候选伪标签容器
+        batch_info = None  # 中文注释：初始化批次信息
+        if isinstance(semi_output, tuple) and len(semi_output) >= 3:  # 中文注释：当元组包含第三个元素时将其视为伪标签候选
+            candidate = semi_output[2]  # 中文注释：读取潜在伪标签负载
+        if candidate is None and isinstance(diff_feature, dict):  # 中文注释：若教师特征为字典尝试直接提取伪标签键
+            candidate = diff_feature.get('pseudo_samples', diff_feature.get('pseudo_data_samples'))  # 中文注释：兼容旧键名
+            batch_info = diff_feature.get('batch_info', batch_info)  # 中文注释：同时提取批次信息
+        if candidate is None:  # 中文注释：若仍未找到伪标签则直接返回空
+            return None  # 中文注释：无伪标签时不执行门控
+        teacher_samples = None  # 中文注释：初始化教师伪标签列表
+        student_samples = None  # 中文注释：初始化学生伪标签列表
+        if isinstance(candidate, dict):  # 中文注释：伪标签负载为字典时按键提取
+            teacher_samples = candidate.get('teacher_pseudo_samples', candidate.get('teacher'))  # 中文注释：兼容不同键名的教师伪标签
+            student_samples = candidate.get('student_pseudo_samples', candidate.get('student'))  # 中文注释：兼容不同键名的学生伪标签
+            batch_info = candidate.get('batch_info', batch_info)  # 中文注释：更新批次信息
+        elif isinstance(candidate, (list, tuple)) and len(candidate) == 2:  # 中文注释：当候选为长度为2的序列时按顺序视作教师与学生伪标签
+            teacher_samples, student_samples = candidate  # 中文注释：解包教师与学生伪标签
+        elif isinstance(candidate, (list, tuple)):  # 中文注释：若仅提供学生伪标签列表则直接赋值
+            student_samples = candidate  # 中文注释：默认序列代表学生伪标签
+        if student_samples is None:  # 中文注释：没有学生伪标签则无法继续
+            return None  # 中文注释：返回空
+        pseudo_payload = {  # 中文注释：构造统一的伪标签负载字典
+            'teacher_pseudo_samples': teacher_samples,  # 中文注释：教师侧伪标签列表
+            'student_pseudo_samples': student_samples,  # 中文注释：学生侧伪标签列表
+            'batch_info': batch_info  # 中文注释：批次信息
+        }
+        return pseudo_payload  # 中文注释：返回标准化的伪标签负载
+
+    @staticmethod
+    def _has_pseudo_loss(loss_dict: dict) -> bool:
+        """中文注释：检测损失字典中是否已包含伪标签相关的损失项。"""
+        if not isinstance(loss_dict, dict):  # 中文注释：非字典直接返回False
+            return False  # 中文注释：缺少损失键时需要补算
+        for key in loss_dict.keys():  # 中文注释：遍历所有损失键
+            if 'pseudo' in key or 'unsup' in key:  # 中文注释：通过关键词判断是否已计算伪标签损失
+                return True  # 中文注释：存在相关条目时返回True
+        return False  # 中文注释：未发现伪标签损失则返回False
+
+    @staticmethod
+    def _get_cached_inv_feature(detector: Any) -> Optional[Tensor]:
+        """中文注释：从检测器的SS-DC缓存中获取首层域不变特征。"""
+        if detector is None or not hasattr(detector, 'ssdc_feature_cache'):  # 中文注释：无缓存时直接返回
+            return None  # 中文注释：保持稳健
+        inv_cache = detector.ssdc_feature_cache.get('noref', None)  # 中文注释：优先读取无参考分支缓存
+        if inv_cache is None:  # 中文注释：若无参考缓存为空则尝试读取参考分支
+            inv_cache = detector.ssdc_feature_cache.get('ref', None)  # 中文注释：回退到参考分支
+        if inv_cache is None:  # 中文注释：依然缺失时返回None
+            return None  # 中文注释：无法提供域不变特征
+        inv_feature = inv_cache.get('inv', None)  # 中文注释：提取域不变特征列表
+        if isinstance(inv_feature, (list, tuple)) and inv_feature:  # 中文注释：当缓存为序列时取首层特征图
+            return inv_feature[0]  # 中文注释：返回首层域不变特征
+        if torch.is_tensor(inv_feature):  # 中文注释：若直接为张量则原样返回
+            return inv_feature  # 中文注释：返回张量形式的域不变特征
+        return None  # 中文注释：其余情况返回空
+
+    def _apply_pseudo_consistency_gate(self, pseudo_payload: dict, multi_batch_inputs: Dict[str, Tensor], current_iter: int) -> None:
+        """中文注释：利用教师/学生域不变特征对伪标签执行余弦相似度门控。"""
+        gate_cfg = self.ssdc_cfg.get('consistency_gate', None)  # 中文注释：读取门控配置
+        if gate_cfg is None:  # 中文注释：未配置门控时直接返回
+            return  # 中文注释：保持现有伪标签
+        tau_schedule = gate_cfg.get('tau', gate_cfg) if isinstance(gate_cfg, dict) else gate_cfg  # 中文注释：兼容直接给定阈值或调度
+        tau_value = self._interp_schedule(tau_schedule, current_iter, 0.0)  # 中文注释：计算当前迭代的阈值
+        if tau_value <= 0:  # 中文注释：阈值无效时不做处理
+            return  # 中文注释：保持伪标签
+        decay_mode = bool(gate_cfg.get('decay', False)) if isinstance(gate_cfg, dict) else False  # 中文注释：读取是否采用权重衰减模式
+        teacher_map = self._get_cached_inv_feature(getattr(self.model, 'teacher', None))  # 中文注释：提取教师域不变特征图
+        student_map = self._get_cached_inv_feature(getattr(self.model, 'student', None))  # 中文注释：提取学生域不变特征图
+        if teacher_map is None or student_map is None:  # 中文注释：缺失任一特征则无法计算相似度
+            return  # 中文注释：直接退出
+        teacher_inputs = multi_batch_inputs.get('unsup_teacher', None)  # 中文注释：读取教师分支输入
+        student_inputs = multi_batch_inputs.get('unsup_student', None)  # 中文注释：读取学生分支输入
+        if teacher_inputs is None or student_inputs is None:  # 中文注释：未提供输入张量无法获取空间尺度
+            return  # 中文注释：结束门控
+        if teacher_inputs.shape[-1] > 0:  # 中文注释：计算教师特征图与输入的尺度比
+            teacher_scale = float(teacher_map.shape[-1]) / float(teacher_inputs.shape[-1])  # 中文注释：特征宽度除以输入宽度得到空间比例
+        else:  # 中文注释：宽度异常时
+            teacher_scale = 1.0  # 中文注释：使用单位比例避免除零
+        if student_inputs.shape[-1] > 0:  # 中文注释：计算学生侧空间比例
+            student_scale = float(student_map.shape[-1]) / float(student_inputs.shape[-1])  # 中文注释：特征宽度除以输入宽度
+        else:  # 中文注释：宽度异常时
+            student_scale = 1.0  # 中文注释：使用单位比例
+        teacher_pseudo_samples = pseudo_payload.get('teacher_pseudo_samples', None)  # 中文注释：获取教师伪标签列表
+        student_pseudo_samples = pseudo_payload.get('student_pseudo_samples', None)  # 中文注释：获取学生伪标签列表
+        if student_pseudo_samples is None:  # 中文注释：没有学生伪标签无法执行过滤
+            return  # 中文注释：直接返回
+        filtered_samples = []  # 中文注释：准备存放过滤后的学生伪标签
+        total_instances = 0  # 中文注释：统计总伪标签数量
+        filtered_instances = 0  # 中文注释：统计被过滤或衰减的伪标签数量
+        for batch_idx, student_sample in enumerate(student_pseudo_samples):  # 中文注释：逐个样本处理学生伪标签
+            teacher_sample = None  # 中文注释：初始化对应的教师样本
+            if isinstance(teacher_pseudo_samples, (list, tuple)) and batch_idx < len(teacher_pseudo_samples):  # 中文注释：教师伪标签可用时按索引取出
+                teacher_sample = teacher_pseudo_samples[batch_idx]  # 中文注释：获取对应教师样本
+            filtered_sample, removed_count, sample_total = self._gate_single_sample(
+                teacher_sample, student_sample, teacher_map, student_map, batch_idx, teacher_scale, student_scale, tau_value, decay_mode)  # 中文注释：对单个样本执行门控并返回过滤结果
+            filtered_samples.append(filtered_sample)  # 中文注释：收集处理后的学生伪标签
+            total_instances += sample_total  # 中文注释：累计当前样本的伪标签数量
+            filtered_instances += removed_count  # 中文注释：累计过滤或衰减的伪标签数量
+        pseudo_payload['student_pseudo_samples'] = filtered_samples  # 中文注释：将过滤结果写回伪标签负载
+        if total_instances > 0:  # 中文注释：仅在存在伪标签时记录过滤比例
+            filter_ratio = float(filtered_instances) / float(total_instances)  # 中文注释：计算过滤比例
+            logger = MMLogger.get_current_instance()  # 中文注释：获取当前日志记录器
+            if logger is not None:  # 中文注释：日志记录器可用时写入过滤信息
+                logger.info(f"consistency_gate_filtered_ratio={filter_ratio:.4f}")  # 中文注释：输出过滤比例便于监控
+
+    def _gate_single_sample(self, teacher_sample: Any, student_sample: Any, teacher_map: Tensor, student_map: Tensor,
+                             batch_idx: int, teacher_scale: float, student_scale: float, tau_value: float,
+                             decay_mode: bool) -> Tuple[Any, int, int]:
+        """中文注释：对单个样本的伪标签执行ROI对齐与余弦相似度过滤。"""
+        if student_sample is None or not hasattr(student_sample, 'gt_instances') or student_sample.gt_instances is None:  # 中文注释：缺少学生伪标签时直接返回
+            return student_sample, 0, 0  # 中文注释：无过滤发生
+        student_boxes = student_sample.gt_instances.bboxes  # 中文注释：读取学生伪框
+        if student_boxes.numel() == 0:  # 中文注释：当学生伪框为空时返回
+            return student_sample, 0, 0  # 中文注释：无过滤
+        teacher_boxes = None  # 中文注释：初始化教师伪框
+        if teacher_sample is not None and hasattr(teacher_sample, 'gt_instances') and teacher_sample.gt_instances is not None:  # 中文注释：教师伪标签存在时读取
+            teacher_boxes = getattr(teacher_sample.gt_instances, 'teacher_view_bboxes', teacher_sample.gt_instances.bboxes)  # 中文注释：优先使用教师视角坐标
+        if teacher_boxes is None or teacher_boxes.numel() == 0:  # 中文注释：若教师伪框缺失则与学生框数量对齐使用自身
+            teacher_boxes = student_boxes.to(device=teacher_map.device, dtype=teacher_map.dtype)  # 中文注释：直接使用学生框作为教师参考
+        if teacher_boxes.shape[0] != student_boxes.shape[0]:  # 中文注释：当教师与学生伪框数量不一致时按IoU匹配
+            iou_matrix = bbox_overlaps(teacher_boxes, student_boxes, mode='iou')  # 中文注释：计算IoU矩阵用于匹配
+            best_iou, best_teacher_idx = iou_matrix.max(dim=0)  # 中文注释：为每个学生框找到最佳教师框
+            valid_mask = best_iou > 0  # 中文注释：仅保留IoU大于0的匹配
+            if not valid_mask.any():  # 中文注释：无有效匹配时直接返回原样本
+                return student_sample, 0, int(student_boxes.shape[0])  # 中文注释：无过滤但记录总数
+            matched_teacher_boxes = teacher_boxes[best_teacher_idx[valid_mask]]  # 中文注释：按匹配索引抽取教师框
+            matched_student_boxes = student_boxes[valid_mask]  # 中文注释：同步抽取学生框
+            matched_mask = valid_mask  # 中文注释：保留有效匹配掩码
+        else:  # 中文注释：数量一致时直接按索引对应
+            matched_teacher_boxes = teacher_boxes  # 中文注释：教师框按顺序对应
+            matched_student_boxes = student_boxes  # 中文注释：学生框按顺序对应
+            matched_mask = torch.ones(student_boxes.shape[0], dtype=torch.bool, device=student_boxes.device)  # 中文注释：掩码全为True
+        teacher_batch_index = torch.full((matched_teacher_boxes.shape[0], 1), batch_idx, device=teacher_map.device, dtype=teacher_map.dtype)  # 中文注释：构造教师ROI批次索引
+        teacher_roi = torch.cat([teacher_batch_index, matched_teacher_boxes.to(device=teacher_map.device, dtype=teacher_map.dtype)], dim=1)  # 中文注释：拼接批次索引与教师框
+        student_batch_index = torch.full((matched_student_boxes.shape[0], 1), batch_idx, device=student_map.device, dtype=student_map.dtype)  # 中文注释：构造学生ROI批次索引
+        student_roi = torch.cat([student_batch_index, matched_student_boxes.to(device=student_map.device, dtype=student_map.dtype)], dim=1)  # 中文注释：拼接批次索引与学生框
+        pooled_teacher = roi_align(teacher_map, teacher_roi, output_size=1, spatial_scale=teacher_scale, aligned=True)  # 中文注释：在教师域不变特征上采样ROI
+        pooled_student = roi_align(student_map, student_roi, output_size=1, spatial_scale=student_scale, aligned=True)  # 中文注释：在学生域不变特征上采样ROI
+        cosine_scores = (F.normalize(pooled_teacher.flatten(1), dim=1) * F.normalize(pooled_student.flatten(1), dim=1)).sum(dim=1)  # 中文注释：计算归一化后向量的余弦相似度
+        keep_mask = torch.zeros(student_boxes.shape[0], dtype=torch.bool, device=student_boxes.device)  # 中文注释：初始化全局保留掩码
+        keep_mask[matched_mask] = cosine_scores >= tau_value  # 中文注释：仅对已匹配的框应用阈值判断
+        removed_count = int((~keep_mask[matched_mask]).sum().item())  # 中文注释：统计当前样本被剔除的伪标签数量
+        total_count = int(student_boxes.shape[0])  # 中文注释：记录当前样本伪标签总数
+        if decay_mode:  # 中文注释：当启用衰减模式时不直接删除低相似度伪标签
+            decay_scale = torch.ones_like(keep_mask, dtype=cosine_scores.dtype)  # 中文注释：初始化衰减系数
+            safe_denom = max(float(tau_value), 1e-6)  # 中文注释：设置安全除数避免除零
+            decay_values = torch.clamp(cosine_scores / safe_denom, max=1.0)  # 中文注释：将相似度归一化到[0,1]
+            decay_scale[matched_mask] = decay_values  # 中文注释：仅对匹配框写入衰减权重
+            if hasattr(student_sample.gt_instances, 'scores') and student_sample.gt_instances.scores is not None:  # 中文注释：当伪标签包含分类分数时直接缩放
+                scores = student_sample.gt_instances.scores.to(decay_scale.device)  # 中文注释：确保分数张量与权重在同一设备
+                student_sample.gt_instances.scores = scores * decay_scale[:scores.shape[0]]  # 中文注释：按衰减权重缩放分数
+            else:  # 中文注释：若缺少分数字段则额外存储权重
+                student_sample.gt_instances.score_factors = decay_scale.to(student_sample.gt_instances.bboxes.device)  # 中文注释：以score_factors形式提供衰减权重
+        else:  # 中文注释：未启用衰减时直接剔除低相似度伪标签
+            if not keep_mask.all():  # 中文注释：仅当存在需要剔除的伪标签时更新实例
+                student_sample.gt_instances = student_sample.gt_instances[keep_mask]  # 中文注释：应用掩码过滤伪标签
+        return student_sample, removed_count, total_count  # 中文注释：返回过滤后的样本及统计信息
 
     def _compute_ssdc_loss(self, current_iter: int) -> dict:
         """中文注释：汇总学生与教师SS-DC模块产生的额外损失。"""
