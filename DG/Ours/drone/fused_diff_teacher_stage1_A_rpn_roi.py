@@ -40,12 +40,12 @@ det_data_preprocessor = dict(  # 定义与仿真RGB模型一致的数据预处�
 )  # 预处理器配置结束
 
 teacher_ir = _apply_drone_specialization(deepcopy(base_model_cfg))  # 基于显式读取的基础模型深拷贝并套用无人机特化配置构建冻结教师
-teacher_ir_default_ckpt = 'work_dirs/diffusion_detector_drone_ir_clear_day/best_coco_bbox_mAP_50_iter_5000_1028.pth'  # 默认教师权重占位路径可通过 --cfg-options model.teacher_ir.init_cfg.checkpoint=xxx 覆盖
+teacher_ir_default_ckpt = '/userhome/liqiulu/code/FGT-stage2/best_coco_bbox_mAP_50_iter_5000_1028.pth'  # 默认教师权重占位路径可通过 --cfg-options model.teacher_ir.init_cfg.checkpoint=xxx 覆盖
 teacher_ir['init_cfg'] = dict(type='Pretrained', checkpoint=teacher_ir_default_ckpt)  # 使用Pretrained初始化教师扩散检测器权重
 teacher_ir['data_preprocessor'] = det_data_preprocessor  # 将教师的数据预处理器与学生保持一致避免分布差异
 
 student_rgb = _apply_drone_specialization(deepcopy(base_model_cfg))  # 深拷贝显式读取的基础模型构建学生分支并应用同样的无人机特化修改
-student_rgb_default_ckpt = '/mnt/ssd/lql/Fitness-Generalization-Transferability/work_dirs/diffusion_detector_drone_rgb_sim/best_coco_bbox_mAP_50_iter_20000.pth'  # 默认学生预热权重占位路径可通过 --cfg-options model.student_rgb.init_cfg.checkpoint=xxx 覆盖
+student_rgb_default_ckpt = '/userhome/liqiulu/code/FGT-stage2/best_coco_bbox_mAP_50_iter_20000.pth'  # 默认学生预热权重占位路径可通过 --cfg-options model.student_rgb.init_cfg.checkpoint=xxx 覆盖
 student_rgb['init_cfg'] = dict(type='Pretrained', checkpoint=student_rgb_default_ckpt)  # 指定学生扩散检测器的预训练权重
 student_rgb['data_preprocessor'] = det_data_preprocessor  # 指定学生的数据预处理器确保输入管线一致
 
