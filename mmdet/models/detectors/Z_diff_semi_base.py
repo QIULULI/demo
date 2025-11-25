@@ -68,11 +68,18 @@ class SemiBaseDiffDetector(BaseDetector):
         selected_key = None  # 中文注释：初始化最终选定的教师键值
         selected_meta = None  # 中文注释：初始化最终选定的教师元数据
         if normalized_teachers:  # 中文注释：当解析到至少一个教师配置时执行选择逻辑
-            if main_teacher_hint is not None and main_teacher_hint in normalized_teachers:  # 中文注释：若显式提示存在且匹配配置
-                selected_key = main_teacher_hint  # 中文注释：使用提示指定的教师键
-            else:  # 中文注释：否则默认选择首个教师配置
+            if main_teacher_hint is not None:  # 中文注释：若显式提示存在则尝试匹配别名集合
+                for teacher_key, teacher_meta in normalized_teachers.items():  # 中文注释：遍历所有教师配置检查别名匹配
+                    if main_teacher_hint in teacher_meta.get('aliases', {teacher_key}):  # 中文注释：在别名集合或主键中查找提示标识
+                        selected_key = teacher_key  # 中文注释：使用匹配到的教师键
+                        selected_meta = teacher_meta  # 中文注释：缓存对应元数据
+                        break  # 中文注释：匹配成功立即退出
+                if selected_key is None and main_teacher_hint in normalized_teachers:  # 中文注释：若未在别名中命中但键存在则回退使用键匹配
+                    selected_key = main_teacher_hint
+                    selected_meta = normalized_teachers[selected_key]
+            if selected_key is None:  # 中文注释：若未指定或未匹配到显式主教师则默认选择首个教师配置
                 selected_key = next(iter(normalized_teachers.keys()))  # 中文注释：取出字典中第一个键作为主教师
-            selected_meta = normalized_teachers[selected_key]  # 中文注释：提取主教师的元数据配置
+                selected_meta = normalized_teachers[selected_key]  # 中文注释：提取主教师的元数据配置
         else:  # 中文注释：当未解析到教师配置时使用旧式配置字段兜底
             selected_key = self._fetch_config_value(diff_model, 'sensor', 'default') if diff_model is not None else 'default'  # 中文注释：尽量复用传感器字段作为键名
             selected_meta = {'config': self._fetch_config_value(diff_model, 'config', None),  # 中文注释：从旧式字段抽取配置路径
