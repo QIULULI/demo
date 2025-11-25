@@ -9,7 +9,9 @@ _base_ = [  # 列出需要继承的基础配置文件
     '../../_base_/dg_setting/dg_20k.py',  # 继承20k迭代训练调度与默认钩子设置
 ]  # 基础配置列表结束
 
-base_cfg = Config.fromfile('/mnt/ssd/lql/Fitness-Generalization-Transferability/DG/_base_/models/faster-rcnn_diff_fpn.py')  # 显式加载基础模型配置文件获取原始结构定义
+#base_cfg = Config.fromfile('/mnt/ssd/lql/Fitness-Generalization-Transferability/DG/_base_/models/faster-rcnn_diff_fpn.py')  # 显式加载基础模型配置文件获取原始结构定义
+base_cfg = Config.fromfile('/userhome/liqiulu/code/FGT-stage2/DG/_base_/models/faster-rcnn_diff_fpn.py')  # 显式加载基础模型配置文件获取原始结构定义
+
 base_model_cfg = base_cfg.model  # 提取基础配置中的模型字典以供教师与学生深拷贝复用
 del Config, base_cfg # 清理命名空间避免污染
 classes = ('drone',)  # 定义单类别任务仅包含无人机目标
