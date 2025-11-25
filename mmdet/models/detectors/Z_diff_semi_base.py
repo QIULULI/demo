@@ -118,7 +118,8 @@ class SemiBaseDiffDetector(BaseDetector):
         self.teacher_ema.load_state_dict(copy_state_dict, strict=False)  # 中文注释：将复制的权重加载到影子模型中保持初始一致
         self.teacher_ema.requires_grad_(False)  # 中文注释：关闭影子模型所有参数的梯度避免被优化器更新
         self.teacher_ema.eval()  # 中文注释：强制影子模型保持评估模式以稳定均值估计
-        teacher_device = next(self.teacher.parameters()).device if any(self.teacher.parameters()) else None  # 中文注释：获取教师模型当前设备用于同步影子模型
+        first_teacher_param = next(self.teacher.parameters(), None)  # 中文注释：安全地获取首个教师参数以确认设备
+        teacher_device = first_teacher_param.device if first_teacher_param is not None else None  # 中文注释：仅在存在参数时读取设备信息
         if teacher_device is not None:  # 中文注释：仅当教师存在参数时才执行设备同步
             self.teacher_ema.to(device=teacher_device)  # 中文注释：将影子模型迁移到与教师相同的设备以便高效更新
 
