@@ -4,9 +4,9 @@ from pathlib import Path  # 中文注释：用于构造绝对路径避免相对�
 
 from mmengine.config import Config  # 中文注释：使用Config绕过连字符模块名的直接import限制
 
-_ROOT = Path(__file__).resolve().parents[3]  # 中文注释：定位仓库根目录
+_ROOT = Path(__name__).resolve().parents[3]  # 中文注释：定位仓库根目录
 diffusion_detector_template = Config.fromfile(
-    _ROOT / 'configs/_base_/models/faster-rcnn_diff_fpn.py'
+    _ROOT / '/userhome/liqiulu/code/FGT-stage2/DA/_base_/models/faster-rcnn_diff_fpn.py'
 ).model  # 中文注释：加载支持SS-DC的DiffusionDetector模板
 
 _base_ = [  # 继承基础配置列表
@@ -62,6 +62,12 @@ model = dict(  # 最外层模型封装
         feature_loss_cfg=dict(  # 兼容原有特征蒸馏开关
             feature_loss_type='mse',  # 蒸馏类型
             feature_loss_weight=1.0)))  # 蒸馏权重
+__all__ = ['_base_', 'model']  # 中文注释：仅导出基础列表与模型字典避免额外符号泄漏
+
+del Config  # 中文注释：删除仅用于模板加载的Config符号防止暴露到外部作用域
+del Path  # 中文注释：删除仅用于路径解析的Path符号防止暴露到外部作用域
+del _ROOT  # 中文注释：删除根路径中间变量保证最终字典精简
+del diffusion_detector_template  # 中文注释：删除模板配置中间变量避免用户误用
 
 # 自检代码（复制到REPL快速验证构建与前向占位）：
 # from mmengine.config import Config  # 中文注释：导入配置解析器
