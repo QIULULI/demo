@@ -18,6 +18,7 @@ from .base import BaseDetector
 
 from pathlib import Path
 from mmengine.config import Config  # 中文注释：导入Config以便从文件读取模型配置
+from mmengine.model import ExponentialMovingAverage  # 中文注释：引入EMA工具用于在单一教师上挂载参数影子
 from mmengine.runner import load_checkpoint  # 中文注释：导入检查点加载函数以便恢复预训练权重
 
 
@@ -112,16 +113,7 @@ class SemiBaseDiffDetector(BaseDetector):
         self.active_diff_key = selected_key  # 中文注释：记录当前主教师标识确保兼容旧接口
         self.diff_teacher_bank = self.diff_detectors  # 中文注释：确保教师资源库最终指向统一的教师字典
         ema_momentum = float(self._fetch_config_value(semi_train_cfg, 'ema_momentum', 0.9996)) if semi_train_cfg is not None else 0.9996  # 中文注释：读取或设置教师EMA动量默认0.9996
-        self.teacher_ema_momentum = ema_momentum  # 中文注释：缓存EMA动量用于后续自维护更新逻辑
-        copy_state_dict = {k: v.clone().detach() for k, v in self.teacher.state_dict().items()}  # 中文注释：复制教师全部参数与缓冲为独立张量避免引用共享
-        self.teacher_ema = MODELS.build(copy.deepcopy(teacher_model_cfg))  # 中文注释：基于教师配置重新构建EMA影子模型实例
-        self.teacher_ema.load_state_dict(copy_state_dict, strict=False)  # 中文注释：将复制的权重加载到影子模型中保持初始一致
-        self.teacher_ema.requires_grad_(False)  # 中文注释：关闭影子模型所有参数的梯度避免被优化器更新
-        self.teacher_ema.eval()  # 中文注释：强制影子模型保持评估模式以稳定均值估计
-        first_teacher_param = next(self.teacher.parameters(), None)  # 中文注释：安全地获取首个教师参数以确认设备
-        teacher_device = first_teacher_param.device if first_teacher_param is not None else None  # 中文注释：仅在存在参数时读取设备信息
-        if teacher_device is not None:  # 中文注释：仅当教师存在参数时才执行设备同步
-            self.teacher_ema.to(device=teacher_device)  # 中文注释：将影子模型迁移到与教师相同的设备以便高效更新
+        self.teacher_ema = ExponentialMovingAverage(self.teacher, momentum=ema_momentum)  # 中文注释：在唯一教师上挂载EMA影子而非新建独立模型
 
         self.semi_train_cfg = semi_train_cfg  # 中文注释：记录半监督训练阶段的配置字典以便各类损失读取参数
         cross_cfg_candidate = self._fetch_config_value(self.semi_train_cfg, 'cross_consistency_cfg', {}) if self.semi_train_cfg is not None else {}  # 中文注释：尝试从训练配置中抽取交叉一致性相关的子配置
@@ -250,30 +242,6 @@ class SemiBaseDiffDetector(BaseDetector):
         if hasattr(self, 'teacher_ema') and self.teacher_ema is not None and hasattr(self.teacher_ema, 'to'):  # 中文注释：若EMA影子实现to接口则同时迁移
             self.teacher_ema.to(device=device)  # 中文注释：保持EMA影子参数与教师设备一致
         return super().to(device=device)
-
-    @torch.no_grad()  # 中文注释：关闭梯度记录以避免EMA更新污染计算图
-    def update_ema(self) -> None:  # 中文注释：自维护的EMA更新函数在每次训练迭代后调用
-        """中文注释：按照动量规则更新教师影子模型以缓解统计抖动。"""
-        if getattr(self, 'teacher_ema', None) is None:  # 中文注释：若尚未构建EMA影子则无需执行更新
-            return  # 中文注释：直接返回保持稳定
-        momentum = getattr(self, 'teacher_ema_momentum', 0.9996)  # 中文注释：读取当前EMA动量若不存在则使用默认值
-        teacher_params = dict(self.teacher.named_parameters())  # 中文注释：将教师参数转为字典便于按名称索引
-        teacher_buffers = dict(self.teacher.named_buffers())  # 中文注释：收集教师缓冲区如均值方差以实现一致更新
-        for name, ema_param in self.teacher_ema.named_parameters():  # 中文注释：遍历影子模型的所有参数
-            if name not in teacher_params:  # 中文注释：若教师中不存在同名参数则跳过
-                continue  # 中文注释：避免KeyError并保持影子完整
-            src_param = teacher_params[name].detach()  # 中文注释：分离教师参数以免梯度回传
-            ema_param.mul_(momentum)  # 中文注释：先按动量衰减已有影子参数
-            ema_param.add_(src_param, alpha=1 - momentum)  # 中文注释：再加权当前教师参数实现指数滑动平均
-        for name, ema_buffer in self.teacher_ema.named_buffers():  # 中文注释：遍历影子模型的缓冲区以同步统计量
-            if name not in teacher_buffers:  # 中文注释：若教师不存在同名缓冲则直接跳过
-                continue  # 中文注释：保持缓冲一致性
-            src_buffer = teacher_buffers[name].detach()  # 中文注释：分离教师缓冲避免梯度关联
-            if torch.is_floating_point(ema_buffer):  # 中文注释：仅对浮点缓冲使用EMA规则
-                ema_buffer.mul_(momentum)  # 中文注释：对影子缓冲进行动量衰减
-                ema_buffer.add_(src_buffer, alpha=1 - momentum)  # 中文注释：融合当前教师缓冲实现平滑更新
-            else:  # 中文注释：非浮点缓冲直接覆盖以保持一致
-                ema_buffer.copy_(src_buffer)  # 中文注释：采用硬拷贝同步离散缓冲数据
 
     def train(self, mode: bool = True) -> None:  # 重载train方法，统一保持教师处于评估模式
         """Set the same train mode for teacher and student model."""
