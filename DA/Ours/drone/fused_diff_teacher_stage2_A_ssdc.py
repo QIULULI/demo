@@ -1,6 +1,13 @@
 # DA/Ours/drone/fused_diff_teacher_stage2_A_ssdc.py
 import copy  # 中文注释：导入copy用于安全深拷贝配置字典
-from configs._base_.models.faster-rcnn_diff_fpn import model as diffusion_detector_template  # 中文注释：引入支持SS-DC的DiffusionDetector模板
+from pathlib import Path  # 中文注释：用于构造绝对路径避免相对导入问题
+
+from mmengine.config import Config  # 中文注释：使用Config绕过连字符模块名的直接import限制
+
+_ROOT = Path(__file__).resolve().parents[3]  # 中文注释：定位仓库根目录
+diffusion_detector_template = Config.fromfile(
+    _ROOT / 'configs/_base_/models/faster-rcnn_diff_fpn.py'
+).model  # 中文注释：加载支持SS-DC的DiffusionDetector模板
 
 _base_ = [  # 继承基础配置列表
     '../../_base_/models/diffusion_guided_adaptation_faster_rcnn_r101_fpn.py',  # 基础扩散-检测模型结构
