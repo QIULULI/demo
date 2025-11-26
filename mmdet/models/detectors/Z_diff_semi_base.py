@@ -1,5 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import copy  # 中文注释：引入copy库以便后续深拷贝数据或配置
+import copy
 import inspect  # 中文注释：引入inspect以便在运行时检测学生loss是否支持current_iter参数
 from typing import Dict
 from typing import Any, List, Optional, Union, Tuple
@@ -17,9 +17,8 @@ from mmdet.utils import ConfigType, OptConfigType, OptMultiConfig
 from .base import BaseDetector
 
 from pathlib import Path
-from mmengine.config import Config  # 中文注释：导入Config以便从文件读取模型配置
-from mmengine.model import ExponentialMovingAverage  # 中文注释：引入EMA工具用于在单一教师上挂载参数影子
-from mmengine.runner import load_checkpoint  # 中文注释：导入检查点加载函数以便恢复预训练权重
+from mmengine.config import Config
+from mmengine.runner import load_checkpoint
 
 
 @MODELS.register_module()
@@ -55,65 +54,65 @@ class SemiBaseDiffDetector(BaseDetector):
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
 
         self.student = MODELS.build(detector.deepcopy())  # 构建学生模型副本用于梯度更新
-        self.teacher = None  # 中文注释：初始化教师占位符等待后续统一构建
-        self.diff_detector = None  # 中文注释：扩散教师引用与教师本体保持一致
-        self.diff_detectors = dict()  # 中文注释：创建扩散教师存储字典用于兼容旧接口
-        self.diff_teacher_bank = self.diff_detectors  # 中文注释：教师资源库直接引用统一的扩散教师字典
+        self.teacher = MODELS.build(detector.deepcopy())  # 构建教师模型副本用于生成伪标签
+        self.diff_detector = None  # 初始化扩散教师占位符
+        self.diff_detectors = dict()  # 创建扩散教师存储字典
+        self.diff_teacher_bank = self.diff_detectors  # 将教师资源库引用到同一字典以便统一维护
         self.trainable_diff_teacher_keys: List[str] = []  # 中文注释：记录需要训练的扩散教师标识列表以便后续逻辑快速判断
         self.trainable_diff_teachers: List[nn.Module] = []  # 中文注释：缓存所有可训练扩散教师模块对象方便外部优化器访问
         self._trainable_diff_teacher_modules = nn.ModuleDict()  # 中文注释：使用ModuleDict注册可训练教师以便state_dict与优化器捕获参数
-        self.active_diff_key = None  # 中文注释：记录当前激活的扩散教师标识以便快速路由
-        normalized_teachers = self._normalize_diff_teacher_configs(diff_model)  # 中文注释：调用解析函数获取标准化教师配置
-        main_teacher_hint = self._fetch_config_value(diff_model, 'main_teacher') if diff_model is not None else None  # 中文注释：读取主教师提示便于选择唯一教师
-        selected_key = None  # 中文注释：初始化最终选定的教师键值
-        selected_meta = None  # 中文注释：初始化最终选定的教师元数据
-        if normalized_teachers:  # 中文注释：当解析到至少一个教师配置时执行选择逻辑
-            if main_teacher_hint is not None:  # 中文注释：若显式提示存在则尝试匹配别名集合
-                for teacher_key, teacher_meta in normalized_teachers.items():  # 中文注释：遍历所有教师配置检查别名匹配
-                    if main_teacher_hint in teacher_meta.get('aliases', {teacher_key}):  # 中文注释：在别名集合或主键中查找提示标识
-                        selected_key = teacher_key  # 中文注释：使用匹配到的教师键
-                        selected_meta = teacher_meta  # 中文注释：缓存对应元数据
-                        break  # 中文注释：匹配成功立即退出
-                if selected_key is None and main_teacher_hint in normalized_teachers:  # 中文注释：若未在别名中命中但键存在则回退使用键匹配
-                    selected_key = main_teacher_hint
-                    selected_meta = normalized_teachers[selected_key]
-            if selected_key is None:  # 中文注释：若未指定或未匹配到显式主教师则默认选择首个教师配置
-                selected_key = next(iter(normalized_teachers.keys()))  # 中文注释：取出字典中第一个键作为主教师
-                selected_meta = normalized_teachers[selected_key]  # 中文注释：提取主教师的元数据配置
-        else:  # 中文注释：当未解析到教师配置时使用旧式配置字段兜底
-            selected_key = self._fetch_config_value(diff_model, 'sensor', 'default') if diff_model is not None else 'default'  # 中文注释：尽量复用传感器字段作为键名
-            selected_meta = {'config': self._fetch_config_value(diff_model, 'config', None),  # 中文注释：从旧式字段抽取配置路径
-                             'pretrained_model': self._fetch_config_value(diff_model, 'pretrained_model', None) or self._fetch_config_value(diff_model, 'pretrained', None),  # 中文注释：兼容旧式预训练字段
-                             'raw': diff_model}  # 中文注释：保留原始配置以便后续判断可训练标识
-        teacher_model_cfg = detector.deepcopy()  # 中文注释：默认教师结构与学生一致以保证子模块完全共享
-        teacher_config_path = selected_meta.get('config') if selected_meta is not None else None  # 中文注释：读取教师独立配置文件路径
-        raw_config_entry = selected_meta.get('raw') if selected_meta is not None else None  # 中文注释：保留原始配置对象便于回退
-        if teacher_config_path:  # 中文注释：当提供独立配置文件时优先加载对应模型结构
-            teacher_config_obj = Config.fromfile(teacher_config_path)  # 中文注释：载入配置文件生成Config对象
-            teacher_model_cfg = teacher_config_obj['model']  # 中文注释：提取模型结构配置作为教师骨架
-        elif isinstance(raw_config_entry, dict) and 'model' in raw_config_entry:  # 中文注释：若原始配置直接给出模型字段
-            teacher_model_cfg = raw_config_entry['model']  # 中文注释：直接使用内嵌模型配置构建教师
-        self.teacher = MODELS.build(copy.deepcopy(teacher_model_cfg))  # 中文注释：根据确定的模型配置构建唯一教师实例
-        pretrained_path = selected_meta.get('pretrained_model') if selected_meta is not None else None  # 中文注释：读取预训练权重路径以复用SD1.5权重
-        if pretrained_path:  # 中文注释：若存在对应权重则进行加载
-            load_checkpoint(self.teacher, pretrained_path, map_location='cpu', strict=True)  # 中文注释：加载预训练权重确保教师与SD1.5子模块一致
-        self.teacher.cuda()  # 中文注释：将教师模型迁移至GPU以加速推理
-        is_trainable_teacher = bool(self._fetch_config_value(selected_meta, 'trainable', False) or self._fetch_config_value(selected_meta, 'requires_training', False))  # 中文注释：解析教师是否需要梯度更新
-        if is_trainable_teacher:  # 中文注释：当教师需要训练时确保梯度开启
-            for param in self.teacher.parameters():  # 中文注释：遍历所有参数确保梯度开关处于激活状态
-                param.requires_grad = True  # 中文注释：显式开启梯度以防加载权重过程中被关闭
-            self.teacher.train(True)  # 中文注释：设置为训练模式以便批归一化等层更新统计量
-            self.trainable_diff_teacher_keys.append(selected_key)  # 中文注释：记录可训练教师的键值方便后续检索
-            self.trainable_diff_teachers.append(self.teacher)  # 中文注释：将教师实例加入可训练列表供优化器构建参数组
-            self._trainable_diff_teacher_modules[selected_key] = self.teacher  # 中文注释：将可训练教师注册到ModuleDict确保参数写入state_dict
-        else:  # 中文注释：对于仅推理使用的教师仍保持冻结逻辑
-            self.freeze(self.teacher)  # 中文注释：冻结教师模型参数避免训练阶段被更新
-        self.diff_detectors[selected_key] = self.teacher  # 中文注释：将唯一教师登记到扩散教师字典
-        self.diff_detector = self.teacher  # 中文注释：扩散教师引用直接指向唯一教师对象
-        self.active_diff_key = selected_key  # 中文注释：记录当前主教师标识确保兼容旧接口
-        self.diff_teacher_bank = self.diff_detectors  # 中文注释：确保教师资源库最终指向统一的教师字典
-        ema_momentum = float(self._fetch_config_value(semi_train_cfg, 'ema_momentum', 0.9996)) if semi_train_cfg is not None else 0.9996  # 中文注释：读取或设置教师EMA动量默认0.9996
-        self.teacher_ema = ExponentialMovingAverage(self.teacher, momentum=ema_momentum)  # 中文注释：在唯一教师上挂载EMA影子而非新建独立模型
+        self.active_diff_key = None  # 记录当前激活的扩散教师标识
+        normalized_teachers = self._normalize_diff_teacher_configs(diff_model)  # 调用解析函数获取标准化教师配置
+        main_teacher_hint = self._fetch_config_value(diff_model, 'main_teacher') if diff_model is not None else None  # 读取主教师提示
+        for teacher_key, teacher_meta in normalized_teachers.items():  # 遍历标准化后的教师配置字典
+            teacher_model_cfg = None  # 初始化教师模型结构占位符
+            teacher_config_path = teacher_meta.get('config')  # 获取教师独立配置文件路径
+            raw_config_entry = teacher_meta.get('raw')  # 保留原始配置对象便于回退
+            if teacher_config_path:  # 若提供独立配置文件
+                teacher_config_obj = Config.fromfile(teacher_config_path)  # 载入配置文件生成Config对象
+                teacher_model_cfg = teacher_config_obj['model']  # 提取模型结构配置
+            elif isinstance(raw_config_entry, dict) and 'model' in raw_config_entry:  # 若原始配置直接给出模型字段
+                teacher_model_cfg = raw_config_entry['model']  # 直接使用内嵌模型配置
+            else:  # 当未提供专用配置时回退到学生检测器结构
+                teacher_model_cfg = detector.deepcopy()  # 复制学生模型配置以保持一致结构
+            teacher_instance = MODELS.build(copy.deepcopy(teacher_model_cfg))  # 根据模型配置构建扩散教师实例
+            pretrained_path = teacher_meta.get('pretrained_model')  # 读取预训练权重路径
+            if pretrained_path:  # 若存在对应权重
+                load_checkpoint(teacher_instance, pretrained_path, map_location='cpu', strict=True)  # 加载预训练权重确保参数一致
+            teacher_instance.cuda()  # 将教师模型迁移至GPU以加速推理
+            is_trainable_teacher = bool(teacher_meta.get('trainable', False) or teacher_meta.get('requires_training', False))  # 中文注释：根据配置标识判断当前教师是否需要参与训练
+            if is_trainable_teacher:  # 中文注释：当教师需要训练时跳过冻结流程
+                for param in teacher_instance.parameters():  # 中文注释：遍历所有参数确保梯度开关处于激活状态
+                    param.requires_grad = True  # 中文注释：显式开启梯度以防加载权重过程中被关闭
+                teacher_instance.train(True)  # 中文注释：设置为训练模式以便批归一化等层更新统计量
+                self.trainable_diff_teacher_keys.append(teacher_key)  # 中文注释：记录可训练教师的键值方便后续检索
+                self.trainable_diff_teachers.append(teacher_instance)  # 中文注释：将教师实例加入可训练列表供优化器构建参数组
+                self._trainable_diff_teacher_modules[teacher_key] = teacher_instance  # 中文注释：将可训练教师注册到ModuleDict以确保参数写入state_dict
+            else:  # 中文注释：对于仅推理使用的教师仍保持冻结逻辑
+                self.freeze(teacher_instance)  # 中文注释：冻结教师模型参数避免训练阶段被更新
+            self.diff_detectors[teacher_key] = teacher_instance  # 将实例化教师写入字典并以标识符索引
+            alias_set = teacher_meta.get('aliases', set())  # 取出可选别名集合用于主教师匹配
+            if self.active_diff_key is None and main_teacher_hint is not None and (main_teacher_hint == teacher_key or main_teacher_hint in alias_set):  # 若尚未确定主教师且提示匹配当前教师
+                self.active_diff_key = teacher_key  # 将当前教师设为主教师
+        if self.diff_detectors:  # 若成功加载至少一名扩散教师
+            if self.active_diff_key is None:  # 若尚未确定主教师
+                self.active_diff_key = next(iter(self.diff_detectors.keys()))  # 默认选择字典中的第一名教师
+            self.diff_detector = self.diff_detectors[self.active_diff_key]  # 将当前激活教师指向主教师实例
+        elif diff_model is not None and self._fetch_config_value(diff_model, 'config') is not None:  # 若未能解析教师但存在旧式配置字段
+            teacher_config = Config.fromfile(self._fetch_config_value(diff_model, 'config'))  # 载入旧式配置文件
+            self.diff_detector = MODELS.build(teacher_config['model'])  # 构建单一扩散教师实例
+            pretrained_path = self._fetch_config_value(diff_model, 'pretrained_model') or self._fetch_config_value(diff_model, 'pretrained')  # 获取旧式权重字段
+            if pretrained_path:  # 若存在旧式权重
+                load_checkpoint(self.diff_detector, pretrained_path, map_location='cpu', strict=True)  # 加载旧式教师权重
+            self.diff_detector.cuda()  # 将旧式教师迁移至GPU
+            self.freeze(self.diff_detector)  # 冻结旧式教师参数
+            self.diff_detectors['default'] = self.diff_detector  # 将旧式教师登记到字典中
+            self.active_diff_key = 'default'  # 记录当前主教师标识
+        else:  # 当未提供任何有效教师配置时
+            self.diff_detector = self.student  # 使用学生模型作为退路教师
+            self.diff_detectors['student'] = self.student  # 将学生登记到扩散教师字典
+            self.active_diff_key = 'student'  # 标记学生为当前主教师
+        self.diff_teacher_bank = self.diff_detectors  # 确保教师资源库最终指向完整教师字典
 
         self.semi_train_cfg = semi_train_cfg  # 中文注释：记录半监督训练阶段的配置字典以便各类损失读取参数
         cross_cfg_candidate = self._fetch_config_value(self.semi_train_cfg, 'cross_consistency_cfg', {}) if self.semi_train_cfg is not None else {}  # 中文注释：尝试从训练配置中抽取交叉一致性相关的子配置
@@ -122,8 +121,8 @@ class SemiBaseDiffDetector(BaseDetector):
         self.cross_consistency_min_conf = float(self.cross_consistency_cfg.get('min_conf', 0.0))  # 中文注释：读取主教师候选框的最小置信度筛选阈值默认0
         self.cross_consistency_max_pairs = self.cross_consistency_cfg.get('max_pairs', None)  # 中文注释：读取每幅图像允许用于一致性计算的最大匹配对数量
         self.semi_test_cfg = semi_test_cfg
-        if self.semi_train_cfg.get('freeze_teacher', True) is True and not is_trainable_teacher:  # 中文注释：仅当教师无需训练且配置要求冻结时才关闭梯度
-            self.freeze(self.teacher)  # 中文注释：按照配置冻结教师保持传统均值教师行为
+        if self.semi_train_cfg.get('freeze_teacher', True) is True:
+            self.freeze(self.teacher)
 
     @staticmethod
     def freeze(model: nn.Module):
@@ -230,8 +229,6 @@ class SemiBaseDiffDetector(BaseDetector):
         put the teacher model to cuda when calling ``cuda`` function."""
         for detector_name, detector_module in getattr(self, 'diff_detectors', {}).items():  # 遍历所有扩散教师模块
             detector_module.cuda(device=device)  # 将每个扩散教师迁移到指定设备
-        if hasattr(self, 'teacher_ema') and self.teacher_ema is not None and hasattr(self.teacher_ema, 'to'):  # 中文注释：如EMA影子支持to接口则同步迁移到相同设备
-            self.teacher_ema.to(device=device)  # 中文注释：确保EMA影子参数与教师处于同一设备以便一致更新
         return super().cuda(device=device)
 
     def to(self, device: Optional[str] = None) -> nn.Module:  # 重载to方法，兼容多教师场景下的设备转换
@@ -239,8 +236,6 @@ class SemiBaseDiffDetector(BaseDetector):
         put the teacher model to other device when calling ``to`` function."""
         for detector_name, detector_module in getattr(self, 'diff_detectors', {}).items():  # 遍历全部扩散教师
             detector_module.to(device=device)  # 将每个扩散教师迁移到目标设备
-        if hasattr(self, 'teacher_ema') and self.teacher_ema is not None and hasattr(self.teacher_ema, 'to'):  # 中文注释：若EMA影子实现to接口则同时迁移
-            self.teacher_ema.to(device=device)  # 中文注释：保持EMA影子参数与教师设备一致
         return super().to(device=device)
 
     def train(self, mode: bool = True) -> None:  # 重载train方法，统一保持教师处于评估模式
@@ -885,10 +880,7 @@ class SemiBaseDiffDetector(BaseDetector):
         for teacher_key in self.trainable_diff_teacher_keys:  # 中文注释：遍历所有可训练教师标识
             if teacher_key not in self.diff_teacher_bank:  # 中文注释：若教师未注册则跳过防止异常
                 continue  # 中文注释：继续处理下一个教师
-            if sensor_map is None or all(tag is None for tag in sensor_map):  # 中文注释：当未提供传感器映射时默认处理整个批次
-                sample_indices = list(range(len(batch_data_samples)))  # 中文注释：将所有样本分配给唯一可训练教师
-            else:  # 中文注释：存在传感器映射时按键名或空标签分配
-                sample_indices = [idx for idx, tag in enumerate(sensor_map) if tag == teacher_key or tag is None]  # 中文注释：允许空标签样本由当前教师兜底处理
+            sample_indices = [idx for idx, tag in enumerate(sensor_map) if tag == teacher_key]  # 中文注释：根据传感器映射筛选当前教师负责的样本索引
             if not sample_indices:  # 中文注释：若当前批次无对应样本则无需前向
                 continue  # 中文注释：跳过当前教师
             teacher_model = self.diff_teacher_bank[teacher_key]  # 中文注释：获取教师实例
