@@ -1,7 +1,6 @@
  # Copyright (c) OpenMMLab. All rights reserved.
 from typing import Dict, Optional, Tuple  # 引入类型提示所需的 Dict 与 Tuple，方便后续类型标注
 
-import torch  # 导入基础 PyTorch 库以便访问张量类型与底层操作
 import torch.nn as nn  # 导入 PyTorch 的神经网络模块以使用张量与参数相关操作
 from mmengine.hooks import Hook  # 从 mmengine 中导入 Hook 基类以实现训练 Hook
 from mmengine.logging import MMLogger  # 导入 MMLogger 以便记录警告或错误信息
@@ -40,10 +39,6 @@ class AdaptiveTeacherHook(Hook):
             using pretrained teacher checkpoints, ensure class numbers match
             the current task or reinitialize detection heads to avoid shape
             mismatches.
-        auto_fill_missing_teacher (bool): Whether to automatically copy missing
-            teacher tensors from the student before strict alignment check.
-            Default to True to ease checkpoint migration while still reporting
-            remaining alignment issues.
 
     Example::
 
@@ -62,15 +57,13 @@ class AdaptiveTeacherHook(Hook):
                  interval: int = 1,  # 指定每隔多少个 iteration 进行一次教师模型更新
                  skip_buffer=True,  # 控制是否跳过缓冲区（如 BN 统计量），默认跳过
                  burn_up_iters=12000,  # 预热迭代数，保持原逻辑参数以兼容旧配置
-                 strict_align: bool = True,  # 新增 strict_align 控制键与形状严格对齐，默认开启
-                 auto_fill_missing_teacher: bool = True) -> None:  # 新增 auto_fill_missing_teacher 控制教师缺失权重自动补齐，默认开启
+                 strict_align: bool = True) -> None:  # 新增 strict_align 控制键与形状严格对齐，默认开启
         assert 0 < momentum < 1  # 确保动量取值合法，避免异常行为
         self.momentum = momentum  # 保存动量系数供后续更新使用
         self.interval = interval  # 保存更新间隔参数
         self.skip_buffers = skip_buffer  # 保存是否跳过缓冲区的设置
         self.burn_up_iters = burn_up_iters  # 保存预热迭代数
         self.strict_align = strict_align  # 保存严格对齐开关，影响不匹配时的处理策略
-        self.auto_fill_missing_teacher = auto_fill_missing_teacher  # 保存自动补齐开关，控制是否用学生权重填充教师缺失键
 
     def before_train(self, runner: Runner) -> None:
         """To check that teacher model and student model exist."""
@@ -141,35 +134,6 @@ class AdaptiveTeacherHook(Hook):
         student_tensors = _collect_named_tensors(model.student, not self.skip_buffers)  # 收集学生模型张量
         teacher_tensors = _collect_named_tensors(model.teacher, not self.skip_buffers)  # 收集教师模型张量
 
-        def _get_tensor_from_teacher(name: str) -> Optional[nn.Parameter]:
-            """根据名称分段访问教师模型，返回对应张量引用。"""
-            obj = model.teacher  # 从教师模型本体开始逐级访问
-            for part in name.split('.'):  # 逐段解析名称中的层级
-                if isinstance(obj, nn.Module) and part in obj._parameters:  # 当当前对象是模块且包含同名参数
-                    obj = obj._parameters[part]  # 直接取出参数张量
-                    continue  # 继续处理下一段名称
-                if isinstance(obj, nn.Module) and part in obj._buffers:  # 当当前对象是模块且包含同名缓冲区
-                    obj = obj._buffers[part]  # 直接取出缓冲区张量
-                    continue  # 继续处理下一段名称
-                obj = getattr(obj, part, None)  # 否则尝试通过 getattr 获取子模块或属性
-                if obj is None:  # 若获取失败直接返回 None
-                    return None  # 终止查找并返回空
-            return obj if isinstance(obj, (torch.Tensor, nn.Parameter)) else None  # 仅在返回张量或参数时有效
-
-        filled_keys = []  # 初始化已补齐键的列表
-        if self.auto_fill_missing_teacher:  # 当启用自动补齐教师缺失键时
-            for name, student_tensor in student_tensors.items():  # 遍历学生模型的全部键与张量
-                if name in teacher_tensors:  # 若教师已存在同名张量则跳过
-                    continue  # 不做任何修改直接继续
-                target_tensor = _get_tensor_from_teacher(name)  # 尝试在教师模型中根据名称找到对应张量引用
-                if target_tensor is None:  # 若找不到对应张量
-                    continue  # 无法补齐则跳过，保留缺失状态供后续严格校验
-                target_tensor.data.copy_(student_tensor.data)  # 使用学生张量的数据覆盖教师张量的数据
-                teacher_tensors[name] = target_tensor  # 将补齐后的张量记录到教师映射中以参与后续校验
-                filled_keys.append(name)  # 记录已补齐的键名称便于日志输出
-            if filled_keys:  # 若存在补齐操作
-                logger.info(f"AdaptiveTeacherHook: 自动用学生权重补齐教师缺失键: {filled_keys}")  # 打印信息方便用户确认
-
         student_shapes: Dict[str, Tuple[int, ...]] = {
             name: tuple(tensor.shape) for name, tensor in student_tensors.items()
         }  # 构建学生模型名称到形状的映射
@@ -179,7 +143,7 @@ class AdaptiveTeacherHook(Hook):
 
         missing_in_teacher = [
             name for name in student_shapes.keys() if name not in teacher_shapes
-        ]  # 统计教师缺少的键（包含补齐后的最新结果）
+        ]  # 统计教师缺少的键
         missing_in_student = [
             name for name in teacher_shapes.keys() if name not in student_shapes
         ]  # 统计学生缺少的键
@@ -197,9 +161,7 @@ class AdaptiveTeacherHook(Hook):
                 '常见成因：教师 checkpoint 类别数与当前任务不匹配、加载了不同数据集或迭代的权重、头部未重新初始化。',  # 提供常见原因提示
                 '建议：使用与当前任务类别一致的教师权重，或在配置中重新初始化检测头部。',  # 提供解决建议
             ]  # 构建基础提示信息
-            if filled_keys:  # 如果执行过自动补齐操作
-                issue_lines.append(f'已自动补齐的键: {filled_keys}')  # 记录补齐的键以方便用户确认 checkpoint 质量
-            if missing_in_teacher:  # 如果教师仍缺少键
+            if missing_in_teacher:  # 如果教师缺少键
                 issue_lines.append(f'教师缺少的键: {missing_in_teacher}')  # 记录缺失键列表
             if missing_in_student:  # 如果学生缺少键
                 issue_lines.append(f'学生缺少的键: {missing_in_student}')  # 记录缺失键列表
