@@ -16,7 +16,6 @@ detector.data_preprocessor = dict(  # 覆盖数据预处理模块
 detector.detector.roi_head.bbox_head.num_classes = 1  # 单类别无人机检测
 detector.detector.enable_ssdc = True  # 启用谱-空解耦 SS-DC 模块
 detector.detector.use_ds_tokens = True  # 开启 DS token 注入
-detector.detector.num_ds_tokens = 4  # DS token 数量，建议 4~8 之间
 detector.detector.init_cfg = dict(  # 学生模型初始化
     type='Pretrained',  # 使用预训练权重
     checkpoint='best_coco_bbox_mAP_50_iter_20000.pth')  # Stage-1 学生权重路径
