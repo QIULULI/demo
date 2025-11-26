@@ -75,8 +75,8 @@ diffusion_detector_template = dict(  # 手动移植DiffusionDetector模板避免
         feat_channels=256,  # 特征通道数
         anchor_generator=dict(  # 锚框生成器设置
             type='AnchorGenerator',  # 生成器类型
-            scales=[8],  # 锚框尺度列表
-            ratios=[0.5, 1.0, 2.0],  # 锚框纵横比列表
+            scales=[2, 4, 8],  # 锚框尺度列表
+            ratios=[0.33, 0.5, 1.0, 2.0],  # 锚框纵横比列表
             strides=[4, 8, 16, 32, 64]  # 对应特征层的步长
         ),
         bbox_coder=dict(  # 边框编码器设置
