@@ -30,7 +30,28 @@ model = dict(
                          do_mask_steps=True,
                          classes=('bicycle', 'bus', 'car', 'motorcycle',
                                   'person', 'rider', 'train', 'truck')
-                         )
+                         ),
+        enable_ssdc=False,  # 默认关闭SS-DC训练以保持现有行为
+        ssdc_cfg=dict(  # 提供SS-DC模块的最小可用默认配置
+            enable_ssdc=False,  # 通过配置开关控制是否启用SS-DC流程
+            skip_local_loss=False,  # 中文注释：默认不跳过本地SS-DC损失，包装器可按需覆盖以避免重复累加
+            said_filter=dict(type='SAIDFilterBank'),  # 使用默认SAID滤波器参数便于快速启用
+            coupling_neck=dict(type='SSDCouplingNeck'),  # 使用默认耦合颈部参数便于快速启用
+            loss_decouple=dict(  # 解耦损失配置模块化支持超参数调整
+                type='LossDecouple',  # 指定使用LossDecouple实现
+                idem_weight=1.0,  # 建议默认幂等性权重1.0
+                orth_weight=1.0,  # 建议默认正交性权重1.0
+                energy_weight=1.0,  # 建议默认能量守恒权重1.0
+                loss_weight=1.0  # 总体缩放因子默认1.0
+            ),
+            loss_couple=dict(  # 耦合损失配置模块化支持超参数调整
+                type='LossCouple',  # 指定使用LossCouple实现
+                align_weight=1.0,  # 建议默认耦合对齐权重1.0
+                ds_weight=1.0,  # 建议默认域特异抑制权重1.0
+                ds_margin=0.2,  # 建议默认域特异阈值0.2
+                loss_weight=1.0  # 总体缩放因子默认1.0
+            )
+        )
     ),
     neck=dict(
         type='FPN',

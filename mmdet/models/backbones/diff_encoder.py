@@ -32,8 +32,16 @@ class DIFF(BaseModule):
                                     do_mask_steps=True,
                                     classes=('bicycle', 'bus', 'car', 'motorcycle',
                                             'person', 'rider', 'train', 'truck')
-                                  )
+                                  ),
+                 enable_ssdc: bool = False,
+                 ssdc_cfg: dict | None = None,
+                 **kwargs
                 ):
+        """Diffusion backbone.
+
+        目前 SS-DC 开关和配置只是为了跟检测器的统一接口对齐，
+        在骨干内部可以先不使用，先“吃掉”参数防止报错。
+        """
         super().__init__(init_cfg)
 
         self.diff_model = None

@@ -26,7 +26,12 @@ ssdc_runtime_cfg = dict(  # 中文注释：整理SS-DC运行期配置以直传�
     enable_ssdc=True,  # 中文注释：显式开启SS-DC以触发相关模块构建
     skip_local_loss=False,  # 中文注释：默认不跳过本地SS-DC损失，包装器可按需覆盖
     said_filter=dict(type='SAIDFilterBank'),  # 中文注释：指定SAID滤波器类型保持最小可用配置
-    coupling_neck=dict(type='SSDCouplingNeck', use_ds_tokens=True),  # 中文注释：启用带DS token的耦合颈模块
+    coupling_neck=dict(
+        type='SSDCouplingNeck',
+        use_ds_tokens=False,
+        num_heads=2,     # 可选
+        max_q_chunk=16,  # 或者先 64，再看显存情况
+    ),  # 中文注释：指定耦合颈部类型保持最小可用配置
     loss_decouple=dict(type='LossDecouple', loss_weight=1.0),  # 中文注释：设置解耦损失默认权重
     loss_couple=dict(type='LossCouple', loss_weight=1.0),  # 中文注释：设置耦合损失默认权重
     w_decouple=[(0, 0.1), (6000, 0.5)],  # 中文注释：复制阶段性解耦权重调度
