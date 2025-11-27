@@ -17,7 +17,8 @@ class SSDCouplingNeck(nn.Module):  # 定义光谱-空间耦合颈部模块
                  use_ds_tokens: bool = True,  # 是否启用域特异性令牌注入
                  num_ds_tokens: int = 4,  # 指定每层生成的域特异性令牌数量
                  attn_dropout: float = 0.0,  # 注意力权重的丢弃概率建议默认0避免不稳定
-                 num_feature_levels: Optional[int] = None  # 显式指定期望的特征层数量用于配置校验
+                 num_feature_levels: Optional[int] = None,  # 显式指定期望的特征层数量用于配置校验
+                 max_q_chunk: int = 256  # 控制按查询维度分块的大小默认256以平衡显存与性能
                  ) -> None:  # 构造函数返回None
         super().__init__()  # 调用父类初始化确保参数注册
         assert in_channels % num_heads == 0, 'in_channels must be divisible by num_heads'  # 断言通道数可被头数整除
@@ -31,6 +32,7 @@ class SSDCouplingNeck(nn.Module):  # 定义光谱-空间耦合颈部模块
         self.use_ds_tokens = use_ds_tokens  # 保存是否启用域特异性令牌
         self.num_ds_tokens = num_ds_tokens  # 保存域特异性令牌数量
         self.attn_dropout = attn_dropout  # 保存注意力丢弃概率
+        self.max_q_chunk = max_q_chunk  # 保存查询分块大小以用于分块注意力计算
         head_dim = in_channels // num_heads  # 计算每个注意力头的维度
         self.head_dim = head_dim  # 存储头维度供前向使用
         self.query_convs = nn.ModuleList()  # 创建用于生成查询的卷积层列表
@@ -58,19 +60,29 @@ class SSDCouplingNeck(nn.Module):  # 定义光谱-空间耦合颈部模块
                            k: torch.Tensor,
                            v: torch.Tensor,
                            ds_token_count: int) -> Tuple[torch.Tensor, torch.Tensor]:  # 计算注意力输出并返回注意力矩阵
-        scale = 1.0 / math.sqrt(self.head_dim)  # 计算缩放因子避免梯度爆炸
-        attn_logits = torch.einsum('nhdl,nhdm->nhlm', q, k) * scale  # 通过爱因斯坦求和公式计算注意力打分
-        attn_weights = F.softmax(attn_logits, dim=-1)  # 沿最后一维归一化获取注意力权重
-        if self.attn_dropout > 0:  # 若设置了dropout则施加随机失活
-            attn_weights = F.dropout(attn_weights, p=self.attn_dropout, training=self.training)  # 对注意力权重使用dropout
-        attn_output = torch.einsum('nhlm,nhdm->nhdl', attn_weights, v)  # 再次使用爱因斯坦求和获得加权值
-        if ds_token_count > 0:  # 若存在域特异令牌则计算其权重占比用于后续损失
-            ds_weights = attn_weights[..., -ds_token_count:]  # 截取域特异令牌对应的注意力权重
-            total_weights = attn_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)  # 计算总注意力权重并避免除零
-            ds_ratio = ds_weights.sum(dim=-1, keepdim=True) / total_weights  # 计算域特异权重占比
-        else:
-            ds_ratio = attn_weights.new_zeros(attn_weights.shape[:-1] + (1,))  # 若无令牌则域特异占比为零
-        return attn_output, ds_ratio  # 返回注意力输出与域特异权重占比
+        _, _, d, l = q.shape  # 解包查询张量形状以获取头维度与长度其余维度此处无需使用
+        scale = 1.0 / math.sqrt(d)  # 计算缩放因子避免梯度爆炸保持数值稳定
+        outputs: List[torch.Tensor] = []  # 初始化分块的注意力输出列表
+        ds_ratios: List[torch.Tensor] = []  # 初始化分块的域特异比例列表
+        for start in range(0, l, self.max_q_chunk):  # 按查询长度维度以max_q_chunk步长遍历
+            end = min(start + self.max_q_chunk, l)  # 计算当前分块结束位置确保不越界
+            q_chunk = q[..., start:end]  # 切片当前分块的查询张量形状为[N,H,D,chunk_L]
+            attn_logits = torch.einsum('nhdl,nhdm->nhlm', q_chunk, k) * scale  # 计算当前分块的注意力打分避免一次性分配大矩阵
+            attn_weights = F.softmax(attn_logits, dim=-1)  # 对当前分块沿键长度维度做softmax得到权重
+            if self.attn_dropout > 0:  # 若需要应用dropout则在权重上施加
+                attn_weights = F.dropout(attn_weights, p=self.attn_dropout, training=self.training)  # 使用框架训练模式控制随机性
+            out_chunk = torch.einsum('nhlm,nhdm->nhdl', attn_weights, v)  # 将注意力权重与值张量相乘得到当前分块输出
+            outputs.append(out_chunk)  # 将当前分块输出累积以便稍后拼接
+            if ds_token_count > 0:  # 若启用了域特异令牌则计算对应比例
+                ds_weights = attn_weights[..., -ds_token_count:]  # 获取当前分块中域特异令牌的权重
+                total_weights = attn_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)  # 计算总权重并截断避免除零
+                ds_ratio_chunk = ds_weights.sum(dim=-1, keepdim=True) / total_weights  # 求得当前分块域特异权重比例
+            else:
+                ds_ratio_chunk = attn_weights.new_zeros(attn_weights.shape[:-1] + (1,))  # 若无域特异令牌则比例填零
+            ds_ratios.append(ds_ratio_chunk)  # 将当前分块的域特异比例保存
+        attn_output = torch.cat(outputs, dim=-1)  # 将所有分块输出按长度维度拼接恢复完整序列
+        ds_ratio = torch.cat(ds_ratios, dim=-2)  # 将所有分块域特异比例按查询长度拼接与原逻辑保持一致
+        return attn_output, ds_ratio  # 返回拼接后的注意力输出与域特异比例
 
     def forward(self,
                 spatial_feats: Sequence[torch.Tensor],
