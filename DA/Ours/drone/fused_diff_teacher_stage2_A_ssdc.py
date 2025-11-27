@@ -42,8 +42,8 @@ diffusion_detector['train_cfg']['enable_ssdc'] = ssdc_runtime_cfg['enable_ssdc']
 detector.detector = diffusion_detector  # 中文注释：将半监督框架内部的学生/教师替换为支持SS-DC的DiffusionDetector
 detector.data_preprocessor = diffusion_detector['data_preprocessor']  # 中文注释：复用DiffusionDetector的数据预处理配置保持一致
 
-detector.diff_model.config = 'DG/Ours/drone/fused_diff_teacher_stage1_A_rpn_roi.py'  # 扩散教师配置（沿用 Stage-1）
-detector.diff_model.pretrained_model = 'rgb_fused1111.pth'  # 扩散教师权重
+detector.diff_model.config = 'configs/diff/fused_teacher_deploy.py'  # 扩散教师配置（沿用 Stage-1）
+detector.diff_model.pretrained_model = 'rgb_fused_teacher_only.pth'  # 扩散教师权重
 
 model = dict(  # 最外层模型封装
     _delete_=True,  # 删除并重写基础字段
