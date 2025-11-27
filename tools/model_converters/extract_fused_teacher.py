@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-  # 中文注释：声明文件编码确保中文注释正常显示
 """工具脚本：将Stage1融合模型中的RGB学生分支提取为独立教师ckpt。"""  # 中文注释：模块文档字符串描述用途
 import argparse  # 中文注释：引入argparse用于解析命令行参数
+import logging  # 中文注释：引入logging用于处理日志级别
 from typing import Dict, Tuple  # 中文注释：引入类型别名便于阅读与静态检查
 
 import torch  # 中文注释：引入PyTorch用于处理权重张量
@@ -38,6 +39,11 @@ def parse_args() -> argparse.Namespace:  # 中文注释：定义命令行参数�
         choices=['INFO', 'WARNING', 'ERROR'],  # 中文注释：限制可选日志级别
         help='控制日志输出的严重程度')  # 中文注释：参数用途说明
     return parser.parse_args()  # 中文注释：返回解析结果
+
+
+def to_logging_level(level_name: str) -> int:  # 中文注释：将字符串级别转换为logging常量
+    """Map a string log level (e.g., ``"INFO"``) to a ``logging`` constant."""  # 中文注释：函数文档
+    return logging._nameToLevel.get(level_name.upper(), logging.INFO)  # 中文注释：查找对应常量，默认INFO
 
 
 def load_raw_state_dict(ckpt_path: str) -> Tuple[Dict[str, torch.Tensor], Dict]:  # 中文注释：加载原始ckpt并拆分state_dict与meta
@@ -88,9 +94,9 @@ def build_and_validate(config_path: str,  # 中文注释：配置文件路径
     load_info = model.load_state_dict(state_dict, strict=False)  # 中文注释：以非严格方式加载权重以获知缺失与多余键
     missing_keys, unexpected_keys = load_info  # 中文注释：解包加载信息
     if missing_keys:  # 中文注释：若存在缺失键
-        print_log(f'缺失参数列表：{missing_keys}', logger='current', level='WARNING')  # 中文注释：记录警告
+        print_log(f'缺失参数列表：{missing_keys}', logger='current', level=logging.WARNING)  # 中文注释：记录警告
     if unexpected_keys:  # 中文注释：若存在多余键
-        print_log(f'多余参数列表：{unexpected_keys}', logger='current', level='WARNING')  # 中文注释：记录警告
+        print_log(f'多余参数列表：{unexpected_keys}', logger='current', level=logging.WARNING)  # 中文注释：记录警告
     if run_forward:  # 中文注释：当需要运行前向检查时
         model.eval()  # 中文注释：切换评估模式避免梯度计算
         diff_cfg = cfg.model.get('backbone', {}).get('diff_config', {})  # 中文注释：读取扩散配置字典
@@ -99,22 +105,23 @@ def build_and_validate(config_path: str,  # 中文注释：配置文件路径
         dummy_input = torch.randn(1, 3, height, width)  # 中文注释：构造假输入
         with torch.no_grad():  # 中文注释：关闭梯度
             _ = model.extract_feat(dummy_input)  # 中文注释：执行特征提取验证连通性
-        print_log('extract_feat 前向检查完成。', logger='current', level='INFO')  # 中文注释：输出检查结果
+        print_log('extract_feat 前向检查完成。', logger='current', level=logging.INFO)  # 中文注释：输出检查结果
 
 
 def main() -> None:  # 中文注释：脚本主入口
     args = parse_args()  # 中文注释：解析命令行参数
-    print_log(f'加载Stage1 ckpt：{args.stage1_ckpt}', logger='current', level=args.log_level)  # 中文注释：记录输入路径
+    log_level = to_logging_level(args.log_level)  # 中文注释：规范化日志级别
+    print_log(f'加载Stage1 ckpt：{args.stage1_ckpt}', logger='current', level=log_level)  # 中文注释：记录输入路径
     raw_state_dict, meta = load_raw_state_dict(args.stage1_ckpt)  # 中文注释：加载原始权重与元信息
-    print_log('开始提取student_rgb分支参数。', logger='current', level=args.log_level)  # 中文注释：提示提取流程
+    print_log('开始提取student_rgb分支参数。', logger='current', level=log_level)  # 中文注释：提示提取流程
     student_state_dict = extract_student_branch(raw_state_dict)  # 中文注释：执行权重筛选
     new_checkpoint = dict(state_dict=student_state_dict, meta=meta)  # 中文注释：构造新ckpt
     torch.save(new_checkpoint, args.output_ckpt)  # 中文注释：保存新ckpt
-    print_log(f'已保存教师专用ckpt至：{args.output_ckpt}', logger='current', level=args.log_level)  # 中文注释：记录保存结果
+    print_log(f'已保存教师专用ckpt至：{args.output_ckpt}', logger='current', level=log_level)  # 中文注释：记录保存结果
     if args.deploy_config is not None:  # 中文注释：若提供配置则执行校验
-        print_log('检测到部署配置，开始构建模型进行映射校验。', logger='current', level=args.log_level)  # 中文注释：提示校验阶段
+        print_log('检测到部署配置，开始构建模型进行映射校验。', logger='current', level=log_level)  # 中文注释：提示校验阶段
         build_and_validate(args.deploy_config, student_state_dict, args.run_forward_check)  # 中文注释：执行构建与可选前向
-    print_log('ckpt提取流程完成。', logger='current', level=args.log_level)  # 中文注释：结束日志
+    print_log('ckpt提取流程完成。', logger='current', level=log_level)  # 中文注释：结束日志
 
 
 if __name__ == '__main__':  # 中文注释：脚本入口保护
