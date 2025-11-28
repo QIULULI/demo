@@ -13,22 +13,23 @@ inner_det['roi_head']['bbox_head']['num_classes'] = 1  # 中文注释：将类�
 inner_det['init_cfg'] = dict(  # 中文注释：设置学生初始化权重保持与Stage-1对齐
     type='Pretrained',  # 中文注释：使用预训练权重初始化学生
     checkpoint='best_coco_bbox_mAP_50_iter_20000.pth')  # 中文注释：指定Stage-1学生权重路径
+levels = ('P5',) # 中文注释：定义要处理的FPN层级
 ssdc_runtime_cfg = dict(  # 中文注释：整理SS-DC运行期配置以匹配SSDCFasterRCNN签名
     enable_ssdc=True,  # 中文注释：显式开启SS-DC以触发相关模块构建
     skip_local_loss=False,  # 中文注释：默认不跳过本地SS-DC损失可由包装器覆盖
-    said=dict(type='SAIDFilterBank'),  # 中文注释：指定SAID滤波器类型保持最小可用配置
+    said=dict(type='SAIDFilterBank', levels=levels),  # 中文注释：指定SAID滤波器类型保持最小可用配置
     coupling=dict(  # 中文注释：指定耦合颈部配置
         type='SSDCouplingNeck',  # 中文注释：使用SS-DC耦合颈部实现
         use_ds_tokens=False,  # 中文注释：关闭域特异令牌以降低显存
-        num_heads=2,  # 中文注释：多头注意力头数可按显存调整
-        max_q_chunk=16),  # 中文注释：查询分块大小平衡显存与速度
+        num_heads=1,  # 中文注释：多头注意力头数可按显存调整
+        max_q_chunk=8),  # 中文注释：查询分块大小平衡显存与速度
     loss_decouple=dict(type='LossDecouple'),  # 中文注释：设置解耦损失最小默认配置
     loss_couple=dict(type='LossCouple'),  # 中文注释：设置耦合损失最小默认配置
     w_decouple=[(0, 0.1), (6000, 0.5)],  # 中文注释：复制阶段性解耦权重调度
     w_couple=[(2000, 0.2), (10000, 0.5)],  # 中文注释：复制阶段性耦合权重调度
     w_di_consistency=0.3,  # 中文注释：设置域不变一致性损失权重
     consistency_gate=[(0, 0.9), (12000, 0.6)],  # 中文注释：设置伪标签余弦门限调度
-    burn_in_iters=0,  # 中文注释：默认无额外SS-DC烧入步保持向后兼容
+    burn_in_iters=500,  # 中文注释：默认无额外SS-DC烧入步保持向后兼容
     use_coupled_feature=True)  # 中文注释：下游检测头使用耦合后的特征
 inner_det.update(  # 中文注释：将内部检测器切换为支持SS-DC的实现
     type='SSDCFasterRCNN',  # 中文注释：指定自定义检测器类型
@@ -51,7 +52,7 @@ model = dict(  # 中文注释：最外层模型封装
         type='MultiBranchDataPreprocessor',  # 中文注释：区分监督/无监督分支
         data_preprocessor=detector.data_preprocessor),  # 中文注释：复用相同归一化
     train_cfg=dict(  # 中文注释：训练阶段设置
-        detector_cfg=dict(type='SemiBaseDiff', burn_up_iters=0),  # 中文注释：半监督扩散框架与零热身
+        detector_cfg=dict(type='SemiBaseDiff', burn_up_iters=500),  # 中文注释：半监督扩散框架与零热身
         ssdc_cfg=dict(  # 中文注释：SS-DC 专用超参与调度
             w_decouple=[(0, 0.1), (6000, 0.5)],  # 中文注释：频域解耦损失权重线性爬升
             w_couple=[(2000, 0.2), (10000, 0.5)],  # 中文注释：谱-空耦合对齐权重热身后启动
