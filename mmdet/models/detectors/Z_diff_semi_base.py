@@ -81,15 +81,15 @@ class SemiBaseDiffDetector(BaseDetector):
                 load_checkpoint(teacher_instance, pretrained_path, map_location='cpu', strict=True)  # 加载预训练权重确保参数一致
             teacher_instance.cuda()  # 将教师模型迁移至GPU以加速推理
             #——————
-            teacher_instance.half()  # 将教师模型转换为半精度以节省显存占用
-            for m in teacher_instance.modules():
-                # 找到带 diff_model 且有 change_precision 接口的模块
-                if hasattr(m, 'diff_model') and hasattr(m.diff_model, 'change_precision'):
-                    # 1. 把 aggregation_network / finecoder 转成 half
-                    m.diff_model.change_precision('half')
-                    # 2. 让 forward 走 self.mode == "half" 分支，不再 .to(torch.float)
-                    if hasattr(m.diff_model, 'mode'):
-                        m.diff_model.mode = 'half'            
+            # teacher_instance.half()  # 将教师模型转换为半精度以节省显存占用
+            # for m in teacher_instance.modules():
+            #     # 找到带 diff_model 且有 change_precision 接口的模块
+            #     if hasattr(m, 'diff_model') and hasattr(m.diff_model, 'change_precision'):
+            #         # 1. 把 aggregation_network / finecoder 转成 half
+            #         m.diff_model.change_precision('half')
+            #         # 2. 让 forward 走 self.mode == "half" 分支，不再 .to(torch.float)
+            #         if hasattr(m.diff_model, 'mode'):
+            #             m.diff_model.mode = 'half'            
             #——————
             is_trainable_teacher = bool(teacher_meta.get('trainable', False) or teacher_meta.get('requires_training', False))  # 中文注释：根据配置标识判断当前教师是否需要参与训练
             if is_trainable_teacher:  # 中文注释：当教师需要训练时跳过冻结流程

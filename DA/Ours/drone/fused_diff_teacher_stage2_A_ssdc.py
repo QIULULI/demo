@@ -40,7 +40,7 @@ detector.data_preprocessor = inner_det['data_preprocessor']  # 中文注释：�
 
 detector['diff_model'].update(  # 中文注释：配置扩散教师路径与冻结策略
     config='configs/diff/fused_teacher_deploy.py',  # 中文注释：Stage-1 融合DIFF教师配置
-    pretrained_model='work_dirs/stage1/rgb_fused_teacher_only.pth',  # 中文注释：Stage-1教师权重
+    pretrained_model='rgb_fused_teacher_only.pth',  # 中文注释：Stage-1教师权重
     freeze_grad=True)  # 中文注释：完全冻结DIFF教师梯度以节省显存
 
 model = dict(  # 中文注释：最外层模型封装
