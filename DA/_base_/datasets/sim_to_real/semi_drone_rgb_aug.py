@@ -110,8 +110,8 @@ test_pipeline = [  # 定义验证测试流水线
         type='PackDetInputs',  # 使用检测打包器
         meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape', 'scale_factor')),  # 保留必要元信息
 ]  # 结束测试流水线
-batch_size = 16  # 设置训练批大小
-num_workers = 16  # 设置加载线程数
+batch_size = 2  # 设置训练批大小
+num_workers = 2  # 设置加载线程数
 labeled_dataset_rgb = dict(  # 定义仿真RGB带标注数据集
     type=dataset_type,  # 使用 COCO 数据集类
     data_root=data_root,  # 指定数据根目录

@@ -122,10 +122,14 @@ class DIFFEncoder(nn.Module):
                                                             feats[2].view((b, -1, h//16, w//16)).to(dtype=torch.float), 
                                                             feats[3].view((b, -1, h//8, w//8)).to(dtype=torch.float)])
         elif self.mode == "half":
-            stride_hf = self.aggregation_network([feats[0].view((b, -1, h//64, w//64)), 
-                                                            feats[1].view((b, -1, h//32, w//32)),
-                                                            feats[2].view((b, -1, h//16, w//16)),
-                                                            feats[3].view((b, -1, h//8, w//8))])
+            # 自动读取 aggregation_network 里参数的 dtype（float32 或 float16）
+            target_dtype = next(self.aggregation_network.parameters()).dtype
+            stride_hf = self.aggregation_network([
+                feats[0].view((b, -1, h//64, w//64)).to(dtype=target_dtype),
+                feats[1].view((b, -1, h//32, w//32)).to(dtype=target_dtype),
+                feats[2].view((b, -1, h//16, w//16)).to(dtype=target_dtype),
+                feats[3].view((b, -1, h//8,  w//8 )).to(dtype=target_dtype),
+            ])
         
         # feature_fine = self.finecoder(stride_hf[0], stride_hf[1], stride_hf[2])
         feature_fine = self.finecoder(stride_hf[0], stride_hf[1], stride_hf[2], stride_hf[3])

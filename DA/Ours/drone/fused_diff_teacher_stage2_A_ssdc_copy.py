@@ -19,8 +19,6 @@ detector = _base_.model  # 从基础配置拷贝域自适应检测器
 diffusion_detector = copy.deepcopy(diffusion_detector_template)  # 中文注释：深拷贝DiffusionDetector模板确保后续覆写不影响原始配置
 diffusion_detector['roi_head']['bbox_head']['num_classes'] = 1  # 中文注释：将类别数收敛为无人机单类任务
 diffusion_detector['backbone']['diff_config']['classes'] = ('drone',)  # 中文注释：为扩散骨干指定单类别语义标签以匹配上游数据集
-# 🌟 新增：只在 stage2 里冻结 DIFF backbone 的梯度
-diffusion_detector['backbone']['diff_config']['freeze_grad'] = True  # 中文注释：开启冻结梯度开关以节省显存与计算
 diffusion_detector['init_cfg'] = dict(  # 中文注释：设置学生初始化权重保持与Stage-1对齐
     type='Pretrained',  # 中文注释：使用预训练权重初始化学生
     checkpoint='best_coco_bbox_mAP_50_iter_20000.pth')  # 中文注释：指定Stage-1学生权重路径

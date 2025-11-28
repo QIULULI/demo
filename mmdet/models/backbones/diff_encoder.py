@@ -47,11 +47,31 @@ class DIFF(BaseModule):
         self.diff_model = None
         assert diff_config is not None
         self.diff_config = diff_config
+
+        # 🌟 新增：从 diff_config 里读一个开关，默认 False
+        self.freeze_backbone_grad = bool(
+            self.diff_config.get('freeze_grad', False)
+        )
+
         self.diff_model = DIFFEncoder(config=self.diff_config)
+
+        # 🌟 如果需要冻结，就关掉参数梯度 & eval
+        if self.freeze_backbone_grad:
+            for p in self.diff_model.parameters():
+                p.requires_grad = False
+            self.diff_model.eval()
 
     def forward(self, x, ref_masks=None, ref_labels=None):
         x = self.imagenet_to_stable_diffusion(x)
-        x = self.diff_model(x.to(dtype=torch.float16), ref_masks, ref_labels)
+        #x = self.diff_model(x.to(dtype=torch.float16), ref_masks, ref_labels)
+        x = x.to(dtype=torch.float16)
+        # 🌟 根据 freeze_backbone_grad 决定是否 no_grad
+        if self.freeze_backbone_grad:
+            with torch.no_grad():
+                x = self.diff_model(x, ref_masks, ref_labels)
+        else:
+            x = self.diff_model(x, ref_masks, ref_labels)
+
         return x
 
     def init_weights(self):
