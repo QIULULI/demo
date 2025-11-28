@@ -20,6 +20,7 @@ from .detr import DETR
 from .dino import DINO
 from .fast_rcnn import FastRCNN
 from .faster_rcnn import FasterRCNN
+from .ssdc_faster_rcnn import SSDCFasterRCNN  # 中文注释：引入支持SS-DC的Faster R-CNN实现
 from .fcos import FCOS
 from .fovea import FOVEA
 from .fsaf import FSAF
@@ -66,7 +67,7 @@ from .Z_domain_generalization_detector import DomainGeneralizationDetector
 from ..dg import DualDiffFusionStage1  # 中文注释: 引入第一阶段扩散融合检测器供外部引用
 __all__ = [
     'ATSS', 'BaseDetector', 'SingleStageDetector', 'TwoStageDetector', 'RPN',
-    'KnowledgeDistillationSingleStageDetector', 'FastRCNN', 'FasterRCNN',
+    'KnowledgeDistillationSingleStageDetector', 'FastRCNN', 'FasterRCNN', 'SSDCFasterRCNN',
     'MaskRCNN', 'CascadeRCNN', 'HybridTaskCascade', 'RetinaNet', 'FCOS',
     'GridRCNN', 'MaskScoringRCNN', 'RepPointsDetector', 'FOVEA', 'FSAF',
     'NASFCOS', 'PointRend', 'GFL', 'CornerNet', 'PAA', 'YOLOV3', 'YOLACT',
