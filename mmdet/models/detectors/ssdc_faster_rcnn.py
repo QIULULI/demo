@@ -93,24 +93,38 @@ class SSDCFasterRCNN(FasterRCNN):  # 中文注释：在标准Faster R-CNN上扩�
         features = self.backbone(img)  # 中文注释：通过骨干网络提取初步特征
         if self.with_neck:  # 中文注释：若定义了特征金字塔则继续处理
             features = self.neck(features)  # 中文注释：将骨干输出送入FPN获得多尺度特征
-        if not self.enable_ssdc or self.said_filter is None or self.coupling_neck is None:  # 中文注释：未启用SS-DC时直接返回原始特征
-            self.ssdc_feature_cache = {}  # 中文注释：重置特征缓存避免读取到历史结果
-            return features  # 中文注释：返回未处理的特征以供后续检测头使用
         feature_tuple = tuple(features) if isinstance(features, (list, tuple)) else (features,)  # 中文注释：统一封装为元组便于遍历
+        storage_key = 'noref'  # 中文注释：当前实现仅缓存无参考分支，保持与DomainAdaptationDetector接口一致
+        if not self.enable_ssdc or self.said_filter is None or self.coupling_neck is None:  # 中文注释：未启用SS-DC时直接返回原始特征
+            self.ssdc_feature_cache = {  # 中文注释：仍按期望的分支键存储基础特征以保持兼容
+                storage_key: {
+                    'raw': feature_tuple,  # 中文注释：缓存原始FPN特征
+                    'inv': None,  # 中文注释：未启用SS-DC时域不变特征为空
+                    'ds': None,  # 中文注释：未启用SS-DC时域特异特征为空
+                    'coupled': feature_tuple,  # 中文注释：耦合特征退化为原始特征
+                    'stats': None,  # 中文注释：无附加统计信息
+                    'is_teacher': bool(is_teacher),  # 中文注释：记录教师标记以便调试
+                    'is_source': bool(is_source),  # 中文注释：记录域来源标记
+                    'current_iter': current_iter  # 中文注释：记录前向迭代索引便于追踪
+                }
+            }
+            return features  # 中文注释：返回未处理的特征以供后续检测头使用
         f_inv_list, f_ds_list = self.said_filter(feature_tuple)  # 中文注释：使用SAID滤波器生成域不变与域特异特征
         coupled_feats, ssdc_stats = self.coupling_neck(feature_tuple, f_inv_list, f_ds_list)  # 中文注释：耦合颈部融合特征并返回统计信息
         coupled_tuple = (  # 中文注释：将耦合输出统一封装为元组
             tuple(coupled_feats) if isinstance(coupled_feats, (list, tuple)) else (coupled_feats,)
         )  # 中文注释：结束耦合输出封装
-        self.ssdc_feature_cache = {  # 中文注释：缓存全部中间结果供域自适应包装器计算SS-DC损失
-            'raw': feature_tuple,  # 中文注释：缓存原始FPN特征
-            'inv': tuple(f_inv_list),  # 中文注释：缓存域不变特征
-            'ds': tuple(f_ds_list),  # 中文注释：缓存域特异特征
-            'coupled': coupled_tuple,  # 中文注释：缓存耦合后特征
-            'stats': ssdc_stats,  # 中文注释：缓存耦合阶段统计信息
-            'is_teacher': bool(is_teacher),  # 中文注释：记录当前缓存是否来自教师分支
-            'is_source': bool(is_source),  # 中文注释：记录当前缓存对应的数据域标识
-            'current_iter': current_iter  # 中文注释：记录前向迭代索引便于调试
+        self.ssdc_feature_cache = {  # 中文注释：按分支键缓存全部中间结果供域自适应包装器计算SS-DC损失
+            storage_key: {
+                'raw': feature_tuple,  # 中文注释：缓存原始FPN特征
+                'inv': tuple(f_inv_list),  # 中文注释：缓存域不变特征
+                'ds': tuple(f_ds_list),  # 中文注释：缓存域特异特征
+                'coupled': coupled_tuple,  # 中文注释：缓存耦合后特征
+                'stats': ssdc_stats,  # 中文注释：缓存耦合阶段统计信息
+                'is_teacher': bool(is_teacher),  # 中文注释：记录当前缓存是否来自教师分支
+                'is_source': bool(is_source),  # 中文注释：记录当前缓存对应的数据域标识
+                'current_iter': current_iter  # 中文注释：记录前向迭代索引便于调试
+            }
         }
         return coupled_tuple if self.use_coupled_feature else feature_tuple  # 中文注释：按配置决定返回耦合或原始特征
 
