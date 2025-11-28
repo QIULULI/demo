@@ -13,12 +13,12 @@ class SSDCouplingNeck(nn.Module):  # 定义光谱-空间耦合颈部模块
     def __init__(self,
                  in_channels: int,  # 指定FPN各层特征通道数通常为256
                  levels: Sequence[str] = ('P2', 'P3', 'P4', 'P5'),  # 指定要处理的FPN层名称顺序
-                 num_heads: int = 4,  # 指定多头注意力的头数建议保持能被通道数整除
+                 num_heads: int = 2,  # 指定多头注意力的头数建议保持能被通道数整除
                  use_ds_tokens: bool = True,  # 是否启用域特异性令牌注入
-                 num_ds_tokens: int = 4,  # 指定每层生成的域特异性令牌数量
+                 num_ds_tokens: int = 2,  # 指定每层生成的域特异性令牌数量
                  attn_dropout: float = 0.0,  # 注意力权重的丢弃概率建议默认0避免不稳定
                  num_feature_levels: Optional[int] = None,  # 显式指定期望的特征层数量用于配置校验
-                 max_q_chunk: int = 256  # 控制按查询维度分块的大小默认256以平衡显存与性能
+                 max_q_chunk: int = 16  # 控制按查询维度分块的大小默认256以平衡显存与性能
                  ) -> None:  # 构造函数返回None
         super().__init__()  # 调用父类初始化确保参数注册
         assert in_channels % num_heads == 0, 'in_channels must be divisible by num_heads'  # 断言通道数可被头数整除
