@@ -50,11 +50,16 @@ class LossDecouple(nn.Module):  # 定义光谱分离损失模块
                 ds_flat = F.normalize(ds.view(ds.size(0), -1), dim=1, eps=self.eps)  # 将高频特征展平并L2归一化并使用eps稳定
                 cosine = (inv_flat * ds_flat).sum(dim=1)  # 计算两者余弦相似度
                 orth_losses.append((cosine.square()).mean())  # 将余弦平方作为正交性惩罚
-                energy_total = feat.square().sum(dim=(1, 2, 3))  # 计算原始特征能量
-                energy_inv = inv.square().sum(dim=(1, 2, 3))  # 计算低频特征能量
-                energy_ds = ds.square().sum(dim=(1, 2, 3))  # 计算高频特征能量
-                energy_residual = energy_inv + energy_ds - energy_total  # 计算能量残差
-                energy_losses.append((energy_residual.square()).mean())  # 使用平方误差约束能量守恒
+                # energy_total = feat.square().sum(dim=(1, 2, 3))  # 计算原始特征能量
+                # energy_inv = inv.square().sum(dim=(1, 2, 3))  # 计算低频特征能量
+                # energy_ds = ds.square().sum(dim=(1, 2, 3))  # 计算高频特征能量
+                # energy_residual = energy_inv + energy_ds - energy_total  # 计算能量残差
+                # energy_losses.append((energy_residual.square()).mean())  # 使用平方误差约束能量守恒
+                energy_total = feat.square().mean(dim=(1, 2, 3)) # 改成平均能量
+                energy_inv   = inv.square().mean(dim=(1, 2, 3)) # 计算低频特征能量
+                energy_ds    = ds.square().mean(dim=(1, 2, 3)) # 计算高频特征能量
+                energy_residual = (energy_inv + energy_ds - energy_total) / (energy_total + self.eps) # 相对误差： (E_inv + E_ds - E_total) / (E_total + eps)
+                energy_losses.append(energy_residual.square().mean()) # 再做平方并在 batch 维上平均             
         loss_idem = self.idem_weight * torch.stack(idem_losses).mean()  # 聚合幂等性损失并施加权重
         loss_orth = self.orth_weight * torch.stack(orth_losses).mean()  # 聚合正交性损失并施加权重
         loss_energy = self.energy_weight * torch.stack(energy_losses).mean()  # 聚合能量损失并施加权重

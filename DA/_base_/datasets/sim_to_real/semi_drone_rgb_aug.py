@@ -1,5 +1,5 @@
 # dataset settings
-batch_size = 2  # 设置训练批大小
+batch_size = 8  # 设置训练批大小
 num_workers = 16  # 设置加载线程数
 dataset_type = 'CocoDataset'  # 指定数据集类型为 COCO 格式
 data_root = 'data/'  # 指定数据根目录，配合 COCO json 中的相对路径使用
