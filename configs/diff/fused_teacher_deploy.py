@@ -7,6 +7,18 @@ classes = ('drone',)
 model = dict(  # 中文注释：模型配置总字典
     type='DiffusionDetector',  # 中文注释：使用单分支扩散检测器类
     init_cfg=dict(type='Pretrained', checkpoint=load_from),  # 中文注释：通过init_cfg加载冻结教师权重
+    # ==== 新增：让 diffusion teacher 跑 SS-DC，只用来算 F_inv ====
+    enable_ssdc=True,
+    ssdc_cfg=dict(
+        enable_ssdc=True,        # 打开 SS-DC 流程
+        skip_local_loss=True,    # teacher 自己不在内部算 SS-DC 的 loss
+        w_decouple=1.0,          # >0 才会在 extract_feat 里真正跑 SAID
+        w_couple=0.0,            # 0 -> 只分解，不耦合，检测头输入还是原始 FPN
+        w_di_consistency=0.0,    # teacher 自己不做 DI 一致性
+        burn_in_iters=0,         # 不需要 burn-in
+        # said_filter / coupling_neck / loss_decouple / loss_couple
+        # 不写就沿用 _base_ 里的默认配置
+    ),
     # ★ 1）backbone 里把类别标签改成 drone 单类
     backbone=dict(
         diff_config=dict(

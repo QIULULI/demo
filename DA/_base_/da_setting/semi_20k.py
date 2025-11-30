@@ -39,7 +39,7 @@ resume = False
 # 如果burn_up_iters<max_iters, 则模型在指定iter进入半监督，源域和目标域一起进行训练，teacher模型进行EMA参数更新
 # 如果burn_up_iters>max_iters, 则模型只进行源域训练
 
-burn_up_iters = 0 #12000
+burn_up_iters = 500 #12000
 train_cfg = dict(type='IterBasedTrainLoop', max_iters=20000, val_interval=1000)
 val_cfg = dict(type='TeacherStudentValLoop')
 test_cfg = dict(type='TestLoop')
@@ -59,7 +59,7 @@ optim_wrapper = dict(
     clip_grad=dict(max_norm=2, norm_type=2))
 
 launcher = 'none'
-auto_scale_lr = dict(enable=True, base_batch_size=32)
+auto_scale_lr = dict(enable=True, base_batch_size=2)
 custom_hooks = [
     dict(type='AdaptiveTeacherHook', burn_up_iters=burn_up_iters, momentum=0.0004),  # 维持域适配阶段的自适应教师动量更新策略
     dict(type='StudentToTeacherExportHook')  # 新增权重导出钩子以在训练结束时将学生权重复制到教师分支
