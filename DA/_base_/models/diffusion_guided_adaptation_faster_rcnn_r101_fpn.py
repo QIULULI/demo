@@ -26,6 +26,6 @@ model = dict(
         unsup_weight=1.0,
         cls_pseudo_thr=0.4, #try 0.3
         min_pseudo_bbox_wh=(1e-2, 1e-2)),
-    semi_test_cfg=dict(predict_on='teacher'), #try student
+    semi_test_cfg=dict(predict_on='student'), #try student
 
 )

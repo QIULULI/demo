@@ -9,8 +9,8 @@ _base_ = [  # 列出需要继承的基础配置文件
     '../../_base_/dg_setting/dg_20k.py',  # 继承20k迭代训练调度与默认钩子设置
 ]  # 基础配置列表结束
 
-#base_cfg = Config.fromfile('/mnt/ssd/lql/Fitness-Generalization-Transferability/DG/_base_/models/faster-rcnn_diff_fpn.py')  # 显式加载基础模型配置文件获取原始结构定义
-base_cfg = Config.fromfile('/userhome/liqiulu/code/FGT-stage2/DG/_base_/models/faster-rcnn_diff_fpn.py')  # 显式加载基础模型配置文件获取原始结构定义
+base_cfg = Config.fromfile('/mnt/ssd/lql/Fitness-Generalization-Transferability/DG/_base_/models/faster-rcnn_diff_fpn.py')  # 显式加载基础模型配置文件获取原始结构定义
+#base_cfg = Config.fromfile('/userhome/liqiulu/code/FGT-stage2/DG/_base_/models/faster-rcnn_diff_fpn.py')  # 显式加载基础模型配置文件获取原始结构定义
 
 base_model_cfg = base_cfg.model  # 提取基础配置中的模型字典以供教师与学生深拷贝复用
 del Config, base_cfg # 清理命名空间避免污染
@@ -145,7 +145,23 @@ val_dataloader = dict(  # 配置验证阶段数据加载器
     ),  # 验证数据集配置结束
 )  # 验证数据加载器定义完成
 
-test_dataloader = val_dataloader  # 测试阶段复用验证加载器配置保持一致
+test_dataloader = dict(  # 配置验证阶段数据加载器
+    batch_size=1,  # 单张图像评估保证结果精确
+    num_workers=8,  # 使用8个线程读取数据
+    persistent_workers=True,  # 开启线程持久化减少切换开销
+    drop_last=False,  # 不丢弃最后一个未满批次
+    sampler=dict(type='DefaultSampler', shuffle=False),  # 顺序遍历验证集确保结果稳定
+    dataset=dict(  # 定义验证数据集细节
+        type=dataset_type,  # COCO格式解析
+        data_root=data_root,  # 指定数据根目录
+        metainfo=dict(classes=classes),  # 注入类别信息
+        ann_file='real_drone_ann/val_visible.json',  # 仿真RGB验证标注路径
+        data_prefix=dict(img='real_drone_rgb/'),  # 验证图像目录前缀
+        test_mode=True,  # 启用测试模式禁用训练增广
+        filter_cfg=dict(filter_empty_gt=True),  # 过滤无标注图像保持评估一致
+        pipeline=test_pipeline,  # 绑定测试流水线
+    ),  # 验证数据集配置结束
+)  # 验证数据加载器定义完成
 
 val_evaluator = dict(  # 配置验证指标
     type='CocoMetric',  # 使用COCO标准评估器

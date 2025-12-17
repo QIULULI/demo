@@ -47,6 +47,14 @@ detector['diff_model'].update(  # 配置扩散教师路径与冻结策略
     pretrained_model='work_dirs/DG/Ours/drone/fused_teacher_stage1_A/rgb_fused1111.pth',  # Stage-1教师权重
     freeze_grad=True)  # 完全冻结DIFF教师梯度以节省显存
 
+# # NOTE:
+# #   Base config defaults to predict_on='teacher'. After removing the student-EMA
+# #   teacher hook in Stage-2, the teacher branch will stay at its initial weights
+# #   (almost never what you want for validation). So we explicitly set it here.
+# #   You can switch to 'student' if you prefer evaluating the student detector.
+# detector.setdefault('semi_test_cfg', {})
+# detector['semi_test_cfg']['predict_on'] = 'diff_detector'
+
 model = dict(  # 最外层模型封装
     _delete_=True,  # 删除并重写基础字段
     type='DomainAdaptationDetector',  # 域自适应检测封装
@@ -60,4 +68,34 @@ model = dict(  # 最外层模型封装
         feature_loss_cfg=dict(  # 兼容原有特征蒸馏开关
             feature_loss_type='mse',  # 蒸馏类型
             feature_loss_weight=1.0)))  # 蒸馏权重
-__all__ = ['_base_', 'model']  # 仅导出基础列表与模型字典避免额外符号泄漏
+
+# -------------------------------------------------------------------------
+# Stage-2 core refactor (IMPORTANT):
+#
+# Replace the default AdaptiveTeacherHook (EMA on model.teacher)
+# with an EMA update on the *real diffusion teacher* (diff_detector).
+# Only update detection heads (RPN/ROI); keep diffusion encoder + fused FPN
+# untouched to preserve IR prior.
+
+custom_hooks = [
+    # ① 保留：student copy 的 EMA teacher（model.teacher）
+    dict(type='AdaptiveTeacherHook', momentum=0.0004, interval=1, skip_buffer=True),
+
+    # ② 新增：对 diff teacher 做 EMA（只更新 head）
+    dict(
+        type='DiffTeacherHeadEMAHook',
+        momentum=0.0004,
+        interval=1,
+        burn_up_iters=burn_cross,  # 让 student 先预热，再开始更新 diff_teacher head（你要的预热逻辑）
+        target_modules=('rpn_head', 'roi_head'),
+        skip_buffers=True,
+        init_from_student=False,
+        update_all_diff_teachers=False,
+        strict=True,
+    ),
+
+    # ③ 可选：保持你项目里原本的导出逻辑
+    dict(type='StudentToTeacherExportHook'),
+]
+
+__all__ = ['_base_', 'model', 'custom_hooks']  # 导出自定义钩子以覆盖base schedule的默认hook
