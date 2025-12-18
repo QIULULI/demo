@@ -1,6 +1,4 @@
 # dataset settings
-batch_size = 8  # 设置训练批大小
-num_workers = 16  # 设置加载线程数
 dataset_type = 'CocoDataset'  # 指定数据集类型为 COCO 格式
 data_root = 'data/'  # 指定数据根目录，配合 COCO json 中的相对路径使用
 classes = ('drone',)  # 定义单类别元信息，仅包含无人机
@@ -112,7 +110,8 @@ test_pipeline = [  # 定义验证测试流水线
         type='PackDetInputs',  # 使用检测打包器
         meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape', 'scale_factor')),  # 保留必要元信息
 ]  # 结束测试流水线
-
+batch_size = 16  # 设置训练批大小
+num_workers = 16  # 设置加载线程数
 labeled_dataset_rgb = dict(  # 定义仿真RGB带标注数据集
     type=dataset_type,  # 使用 COCO 数据集类
     data_root=data_root,  # 指定数据根目录
@@ -139,7 +138,7 @@ unlabeled_dataset = dict(  # 定义无标注目标域数据集
     type=dataset_type,  # 使用 COCO 数据集类
     data_root=data_root,  # 指定数据根目录
     metainfo=dict(classes=classes),  # 设置类别信息
-    ann_file='real_drone_ann/train_visible.json',  # 指向真实域训练标注（仅使用图像路径）
+    ann_file='real_drone_ann/train_visible_full.json',  # 指向真实域训练标注（仅使用图像路径）
     data_prefix=dict(img='real_drone_rgb/'),  # 指向真实图像根目录
     pipeline=unsup_pipeline)  # 使用无监督流水线
 train_dataloader = dict(  # 配置训练数据加载器
@@ -163,7 +162,7 @@ val_dataloader = dict(  # 配置验证加载器
         type=dataset_type,  # 使用 COCO 数据格式
         data_root=data_root,  # 数据根目录
         metainfo=dict(classes=classes),  # 类别信息
-        ann_file='real_drone_ann/val_visible.json',  # 真实域验证标注文件
+        ann_file='real_drone_ann/val_visible_full.json',  # 真实域验证标注文件
         data_prefix=dict(img='real_drone_rgb/'),  # 真实域图像根目录
         test_mode=True,  # 开启测试模式
         filter_cfg=dict(filter_empty_gt=True),  # 过滤无标注图像
@@ -178,18 +177,21 @@ test_dataloader = dict(  # 配置测试加载器
         type=dataset_type,  # 使用 COCO 数据格式
         data_root=data_root,  # 数据根目录
         metainfo=dict(classes=classes),  # 类别信息
-        ann_file='real_drone_ann/test_visible.json',  # 真实域测试标注文件
-        data_prefix=dict(img='real_drone_rgb/'),  # 真实域图像根目录
+        # ann_file='real_drone_ann/test_visible_full.json',  # 真实域测试标注文件
+        ann_file='real_drone_ann_noosd/test_visible.json',        
+        # data_prefix=dict(img='real_drone_rgb/'),  # 真实域图像根目录.
+        data_prefix=dict(img='real_drone_rgb_noosd/'), 
         test_mode=True,  # 开启测试模式
         filter_cfg=dict(filter_empty_gt=True),  # 过滤无标注图像
         pipeline=test_pipeline))  # 使用测试流水线
 val_evaluator = dict(  # 定义验证评估器
     type='CocoMetric',  # 使用 COCO 指标
-    ann_file=data_root + 'real_drone_ann/val_visible.json',  # 指向验证标注文件
+    ann_file=data_root + 'real_drone_ann/val_visible_full.json',  # 指向验证标注文件
     metric='bbox',  # 计算边界框精度
     format_only=False)  # 直接输出指标
 test_evaluator = dict(  # 定义测试评估器
     type='CocoMetric',  # 使用 COCO 指标
-    ann_file=data_root + 'real_drone_ann/test_visible.json',  # 指向测试标注文件
+    # ann_file=data_root + 'real_drone_ann/test_visible_full.json',  # 指向测试标注文件
+    ann_file=data_root + 'real_drone_ann_noosd/test_visible.json',
     metric='bbox',  # 计算边界框精度
     format_only=False)  # 直接输出指标

@@ -13,13 +13,15 @@ class SAIDFilterBank(nn.Module):  # 定义用于光谱自适应幂等分离的�
                  share_mask: bool = True,  # 是否在所有层之间共享截止参数
                  init_cutoff: float = 0.6,  # 设置初始截止频率比例建议值0.6
                  temperature: float = 0.1,  # 设置软掩码温度以控制过渡平滑度
-                 use_hard_mask: bool = False  # 是否采用硬阈值掩码用于消融实验
+                 use_hard_mask: bool = False,  # 是否采用硬阈值掩码用于消融实验
+                 invert_bands: bool = False  # 是否反转频带划分
                  ) -> None:  # 构造函数返回None
         super().__init__()  # 调用父类初始化保障nn.Module正确注册参数
         self.levels = list(levels)  # 保存层级名称列表以便索引与调试
         self.share_mask = share_mask  # 记录是否共享截止参数的布尔配置
         self.temperature = temperature  # 存储软掩码温度便于前向使用
         self.use_hard_mask = use_hard_mask  # 存储是否使用硬掩码
+        self.invert_bands = invert_bands  # 是否反转频带划分
         init_cutoff = float(min(max(init_cutoff, 1e-3), 0.999))  # 限制初始截止比例避免sigmoid饱和
         cutoff_logit = torch.logit(torch.tensor(init_cutoff))  # 将初始截止比例转换为可训练logit
         if self.share_mask:  # 根据是否共享掩码决定参数形状
@@ -63,6 +65,8 @@ class SAIDFilterBank(nn.Module):  # 定义用于光谱自适应幂等分离的�
             high_spec = spec * high_mask.unsqueeze(0).unsqueeze(0)  # 应用高频掩码获取高频频谱
             f_inv = torch.fft.ifft2(low_spec, norm='ortho').real  # 对低频频谱逆变换恢复空间域特征并取实部
             f_ds = torch.fft.ifft2(high_spec, norm='ortho').real  # 对高频频谱逆变换恢复空间域特征并取实部
+            if self.invert_bands:  # 检查是否需要交换频带
+                f_inv, f_ds = f_ds, f_inv  # 交换低频与高频特征以实现反转
             f_inv_list.append(f_inv)  # 记录当前层级的低频特征
             f_ds_list.append(f_ds)  # 记录当前层级的高频特征
         return f_inv_list, f_ds_list  # 返回低频与高频特征列表
