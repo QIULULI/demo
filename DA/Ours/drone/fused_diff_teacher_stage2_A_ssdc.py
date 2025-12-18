@@ -6,8 +6,8 @@ _base_ = [  # 继承基础配置列表
     '../../_base_/da_setting/semi_20k.py',  # 2 万迭代半监督/域自适应训练日程
     '../../_base_/datasets/sim_to_real/semi_drone_rgb_aug.py',  # 仿真 RGB → 真实 RGB 数据集定义
 ]  # 结束基础配置
-burn_cross = 2000  # 定义burn_up_iters以便后续引用
-burn_ssdc = 4000  # 定义SS-DC烧入步数以便后续引用
+burn_cross = 0  # 定义burn_up_iters以便后续引用
+burn_ssdc = 0  # 定义SS-DC烧入步数以便后续引用
 detector = _base_.model  # 从基础配置拷贝域自适应检测器
 inner_det = detector['detector']  # 获取半监督框架内部的学生/教师检测器配置
 inner_det['roi_head']['bbox_head']['num_classes'] = 1  # 将类别数设置为无人机单类任务
@@ -29,7 +29,7 @@ ssdc_runtime_cfg = dict(  # 整理SS-DC运行期配置以匹配SSDCFasterRCNN签
     w_decouple=[(0, 0.1), (6000, 0.5)],  # 复制阶段性解耦权重调度
     w_couple=[(2000, 0.2), (10000, 0.5)],  # 复制阶段性耦合权重调度
     w_di_consistency=0.3,  # 设置域不变一致性损失权重
-    consistency_gate=[(0, 0.9), (12000, 0.6)],  # 设置伪标签余弦门限调度
+    consistency_gate=[(0, 0.3), (12000, 0.5)],  # 设置伪标签余弦门限调度
     burn_in_iters=burn_ssdc,  # 默认无额外SS-DC烧入步保持向后兼容
     use_coupled_feature=True)  # 下游检测头使用耦合后的特征
 inner_det.update(  # 将内部检测器切换为支持SS-DC的实现
@@ -38,6 +38,12 @@ inner_det.update(  # 将内部检测器切换为支持SS-DC的实现
     ssdc_cfg=copy.deepcopy(ssdc_runtime_cfg))  # 深拷贝运行期配置避免共享引用
 inner_det.setdefault('train_cfg', {}).setdefault(  # 确保训练配置存在
     'ssdc_cfg', copy.deepcopy(ssdc_runtime_cfg))  # 在训练配置中同步写入SS-DC字段便于优先级合并
+inner_det['rpn_head']['anchor_generator'] = dict(
+    type='AnchorGenerator',
+    scales=[2, 4, 8],               # 与 Stage-1 保持一致
+    ratios=[0.33, 0.5, 1.0, 2.0],   # 与 Stage-1 保持一致
+    strides=[4, 8, 16, 32, 64]
+)
 detector.data_preprocessor = inner_det['data_preprocessor']  # 复用内部检测器的数据预处理配置保持一致
 
 detector['diff_model'].update(  # 配置扩散教师路径与冻结策略

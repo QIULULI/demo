@@ -700,6 +700,7 @@ class DomainAdaptationDetector(BaseDetector):
             if teacher_cache_override is not None: # 优先尝试从扩散教师提供的伪缓存中读取域不变特征
                 teacher_inv = teacher_cache_override.get('inv') # 取出扩散教师提供的域不变特征
             if teacher_inv is None and teacher_cache is not None: # 若扩散教师未提供则回退到EMA教师缓存
+                print('扩散教师未提供则回退到EMA教师缓存w_couple')
                 teacher_inv = teacher_cache.get('inv') # 读取EMA教师缓存中的域不变特征
             if student_coupled is not None and teacher_inv is not None and getattr(student_detector, 'loss_couple', None) is not None:  # 确保必要组件存在
                 # detached_teacher_inv = [feat.detach() if torch.is_tensor(feat) else feat for feat in teacher_inv]  # 对教师域不变特征执行detach防止反向传播至EMA教师
@@ -714,6 +715,7 @@ class DomainAdaptationDetector(BaseDetector):
             if teacher_cache_override is not None: # 优先尝试从扩散教师提供的伪缓存中读取域不变特征
                 teacher_inv = teacher_cache_override.get('inv') # 取出扩散教师提供的域不变特征
             if teacher_inv is None and teacher_cache is not None: # 若扩散教师未提供则回退到EMA教师缓存
+                print('扩散教师未提供则回退到EMA教师缓存w_di')
                 teacher_inv = teacher_cache.get('inv') # 读取EMA教师缓存中的域不变特征
             if teacher_inv is None:  # 若仍然缺失域不变特征则无法执行一致性损失
                 return losses  # 直接返回当前累计的SS-DC损失
@@ -763,6 +765,7 @@ class DomainAdaptationDetector(BaseDetector):
             if teacher_inv is not None:  # 当从配置成功提取时同步写入缓存
                 self._cached_main_teacher_inv = teacher_inv  # 保留以避免重复解析
         if teacher_inv is None:  # 若最终仍无域不变特征则返回None
+            print('若最终仍无域不变特征则返回None')
             return None  # 外层逻辑将回退到EMA教师缓存
         return {'inv': teacher_inv, 'raw': None, 'ds': None}  # 构造仅包含域不变特征的伪教师缓存以符合LossCouple接口需求
 

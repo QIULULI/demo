@@ -51,14 +51,3 @@ model = dict(  # 中文注释：模型配置总字典
     ),  # 中文注释：辅助配置结束
 )  # 中文注释：模型配置结束
 
-# 小型自检示例（供REPL复制）：  # 中文注释：提供快速配置加载与前向检查参考
-# >>> from mmengine import Config  # 中文注释：导入配置解析器
-# >>> from mmdet.utils import register_all_modules  # 中文注释：注册组件确保构建成功
-# >>> from mmdet.registry import MODELS  # 中文注释：导入模型注册表
-# >>> import torch  # 中文注释：导入PyTorch构造假输入
-# >>> cfg = Config.fromfile('configs/diff/fused_teacher_deploy.py')  # 中文注释：加载当前部署配置
-# >>> register_all_modules()  # 中文注释：注册模型与算子
-# >>> model = MODELS.build(cfg.model)  # 中文注释：构建单分支扩散检测器
-# >>> dummy = torch.randn(1, 3, 224, 224)  # 中文注释：构造小分辨率假输入降低显存占用
-# >>> with torch.no_grad():  # 中文注释：关闭梯度以便快速验证
-# ...     _ = model.extract_feat(dummy)  # 中文注释：执行一次特征提取确认链路连通
