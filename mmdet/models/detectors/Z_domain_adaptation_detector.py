@@ -662,7 +662,9 @@ class DomainAdaptationDetector(BaseDetector):
         w_decouple = self._interp_schedule(self.ssdc_cfg.get('w_decouple', 0.0), current_iter, 0.0)  # 插值获得解耦损失权重
         w_couple = self._interp_schedule(self.ssdc_cfg.get('w_couple', 0.0), current_iter, 0.0)  # 插值获得耦合损失权重
         w_di = self._interp_schedule(self.ssdc_cfg.get('w_di_consistency', 0.0), current_iter, 0.0)  # 获取域不变一致性权重
-        in_burn_in = current_iter < self.burn_up_iters  # 记录是否处于UDA烧入阶段以屏蔽无监督耦合与一致性项
+        ssdc_burn_in = self.ssdc_cfg.get('burn_in_iters', self.burn_up_iters)
+        in_burn_in = current_iter < ssdc_burn_in
+        #in_burn_in = current_iter < self.burn_up_iters  # 记录是否处于UDA烧入阶段以屏蔽无监督耦合与一致性项
         if in_burn_in:  # 当仍在烧入期时禁止耦合与一致性损失但允许解耦监督预训练滤波器
             w_couple = 0.0  # 将耦合权重强制置零避免未稳定时梯度干扰
             w_di = 0.0  # 将域不变一致性权重置零保持仅有监督学习
