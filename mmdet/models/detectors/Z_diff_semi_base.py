@@ -638,9 +638,35 @@ class SemiBaseDiffDetector(BaseDetector):
             # results_list, diff_feature = self.diff_detector.predict(  # 使用默认教师生成伪标签与特征
             #     batch_inputs, batch_data_samples, rescale=False, return_feature=True)  # 传入批量数据并要求返回特征
 
-            results_list = self.diff_detector.predict(  # 使用默认教师生成伪标签但不直接返回特征
-                batch_inputs, batch_data_samples, rescale=False, return_feature=False)  # 关闭特征返回以便手动提取与处理
-            diff_feature = self.diff_detector.extract_feat(batch_inputs)  # 手动提取扩散教师的骨干特征序列
+
+            # results_list = self.diff_detector.predict(  # 使用默认教师生成伪标签但不直接返回特征
+            #     batch_inputs, batch_data_samples, rescale=False, return_feature=False)  # 关闭特征返回以便手动提取与处理
+            # diff_feature = self.diff_detector.extract_feat(batch_inputs)  # 手动提取扩散教师的骨干特征序列
+
+            # =================== 优化逻辑开始 ===================
+            # 获取底层检测器（处理 DualDiffFusion 包装器）
+            underlying_detector = self.diff_detector
+            if not hasattr(underlying_detector, 'roi_head') and hasattr(underlying_detector, 'student_rgb'):
+                underlying_detector = underlying_detector.student_rgb
+            
+            # (1) 提取特征 (只跑一次 Backbone)
+            # 注意：这里调用 self.diff_detector.extract_feat 以兼容包装器的预处理逻辑
+            diff_feature = self.diff_detector.extract_feat(batch_inputs)
+
+            # (2) 手动调用 Head (Standard Two-Stage Logic)
+            # RPN
+            if hasattr(underlying_detector, 'rpn_head') and underlying_detector.rpn_head is not None:
+                rpn_results_list = underlying_detector.rpn_head.predict(
+                    diff_feature, batch_data_samples, rescale=False)
+            else:
+                rpn_results_list = None
+
+            # ROI Head
+            # 返回的是 List[InstanceData]
+            results_list = underlying_detector.roi_head.predict(
+                diff_feature, rpn_results_list, batch_data_samples, rescale=False)
+            # =================== 优化逻辑结束 ===================
+
             said_filter = getattr(self.teacher, 'said_filter', None)  # 读取学生EMA教师上的SAID滤波器以复用解耦能力
             teacher_inv_feature = None  # 初始化域不变特征占位符
             if said_filter is not None:  # 仅当SAID模块存在时才进行域不变特征提取
@@ -649,23 +675,19 @@ class SemiBaseDiffDetector(BaseDetector):
                 #teacher_inv_feature, _ = said_filter(diff_feature)  # 使用学生的SAID对扩散教师特征进行频域解耦
                 if isinstance(teacher_inv_feature, (list, tuple)):  # 确保输出结构统一为元组便于后续访问
                     teacher_inv_feature = tuple(teacher_inv_feature)  # 将列表形式的域不变特征转换为元组保持与缓存一致
+                else:
+                    teacher_inv_feature = None
+
             ############################################修改上方
             batch_info = {}  # 初始化批处理信息占位符
             ############################################修改下方
             # cache = getattr(self.diff_detector, 'ssdc_feature_cache', None)
             # print('diff_detector type:', type(self.diff_detector))
             # print('has ssdc_feature_cache:', cache is not None)
-            # if cache is not None:
-            #     print('ssdc_feature_cache keys:', cache.keys())
-            #     noref = cache.get('noref', None)
-            #     print('noref keys:', None if noref is None else noref.keys())
-            #     inv = None if noref is None else noref.get('inv', None)
-            #     print('inv type:', type(inv), 'len:', (len(inv) if isinstance(inv, (list,tuple)) else None))
-            #     if isinstance(inv, (list,tuple)) and len(inv) > 0:
-            #         print('inv[0] shape:', inv[0].shape)
 
             for data_samples, results in zip(batch_data_samples, results_list):  # 遍历样本与预测结果
-                data_samples.gt_instances = results.pred_instances  # 写入伪实例以供后续训练
+                #data_samples.gt_instances = results.pred_instances  # 写入伪实例以供后续训练
+                data_samples.gt_instances = results
                 teacher_view_boxes = data_samples.gt_instances.bboxes.detach().clone()  # 中文注释：缓存教师视角下的边界框以便后续对齐
                 teacher_view_boxes = teacher_view_boxes.to(device=self.data_preprocessor.device)  # 中文注释：将教师视角框迁移到预处理器所在设备
                 data_samples.gt_instances.teacher_view_bboxes = teacher_view_boxes.clone()  # 中文注释：显式区分教师特征坐标系下的边界框
@@ -676,36 +698,37 @@ class SemiBaseDiffDetector(BaseDetector):
                     teacher_view_boxes, inverse_homography, data_samples.ori_shape)
                 data_samples.gt_instances.bboxes = projected_boxes  # 中文注释：更新原图坐标下的伪标签
                 data_samples.gt_instances.origin_bboxes = projected_boxes.detach().clone()  # 中文注释：缓存原图坐标供后续再映射
+            # # 处理并对齐扩散教师特征 ########################################################
+            # if isinstance(diff_feature, (list, tuple)):  # 若返回的是按层排列的特征序列
+            #     primary_features = list(diff_feature)  # 转换为列表以便后续统一封装
+            # else:  # 若返回单一张量
+            #     print('diff_feature is single tensor, converting to list')
+            #     primary_features = [diff_feature]  # 将单张量包装为单元素列表以保持接口一致
+            # if isinstance(teacher_inv_feature, (list, tuple)) and teacher_inv_feature:  # 中文注释：仅当结构合法且非空时才使用
+            #     sample_count = len(batch_data_samples)  # 中文注释：记录当前批次的样本数量以便拆分特征
+            #     per_level_slices: List[List[Tensor]] = []  # 中文注释：初始化按层切分的特征存储容器
+            #     for level_feat in teacher_inv_feature:  # 中文注释：遍历每一层的特征张量
+            #         per_level_slices.append([level_feat[idx] for idx in range(sample_count)])  # 中文注释：按样本索引切片并缓存
+            #     stacked_inv: List[Tensor] = []  # 中文注释：准备堆叠后的域不变特征列表
+            #     for sample_stack in per_level_slices:  # 中文注释：遍历每一层的切片结果
+            #         stacked_inv.append(torch.stack(sample_stack, dim=0))  # 中文注释：沿批次维度堆叠恢复原有排列
+            #     teacher_inv_feature = tuple(stacked_inv)  # 中文注释：将堆叠结果转换为元组以保持缓存格式一致
+            # else:  # 中文注释：当缓存缺失或格式不符时回退占位
+            #     teacher_inv_feature = None  # 中文注释：标记域不变特征不可用
 
-########################################################################################修改
-            if isinstance(diff_feature, (list, tuple)):  # 若返回的是按层排列的特征序列
-                primary_features = list(diff_feature)  # 转换为列表以便后续统一封装
-            else:  # 若返回单一张量
-                primary_features = [diff_feature for _ in range(len(batch_data_samples))]  # 为每个样本复制一份引用
-            # teacher_cache = getattr(self.diff_detector, 'ssdc_feature_cache', {}).get('noref', {})  # 中文注释：读取扩散教师缓存的域不变特征
-            # teacher_inv_feature = teacher_cache.get('inv')  # 中文注释：尝试获取域不变特征
-
-            if isinstance(teacher_inv_feature, (list, tuple)) and teacher_inv_feature:  # 中文注释：仅当结构合法且非空时才使用
-                sample_count = len(batch_data_samples)  # 中文注释：记录当前批次的样本数量以便拆分特征
-                per_level_slices: List[List[Tensor]] = []  # 中文注释：初始化按层切分的特征存储容器
-                for level_feat in teacher_inv_feature:  # 中文注释：遍历每一层的特征张量
-                    per_level_slices.append([level_feat[idx] for idx in range(sample_count)])  # 中文注释：按样本索引切片并缓存
-                stacked_inv: List[Tensor] = []  # 中文注释：准备堆叠后的域不变特征列表
-                for sample_stack in per_level_slices:  # 中文注释：遍历每一层的切片结果
-                    stacked_inv.append(torch.stack(sample_stack, dim=0))  # 中文注释：沿批次维度堆叠恢复原有排列
-                teacher_inv_feature = tuple(stacked_inv)  # 中文注释：将堆叠结果转换为元组以保持缓存格式一致
-            else:  # 中文注释：当缓存缺失或格式不符时回退占位
-                teacher_inv_feature = None  # 中文注释：标记域不变特征不可用
-############################################
-            # sample_count = len(batch_data_samples)  # 统计批次内样本数量以便逐样本整理特征
-            # if isinstance(diff_detector_features, (list, tuple)) and diff_detector_features:  # 当骨干特征为多尺度序列时按样本切片
-            #     primary_features: List[List[Tensor]] = []  # 初始化主教师逐样本特征列表
-            #     for sample_idx in range(sample_count):  # 遍历每个样本索引
-            #         primary_features.append(  # 为当前样本汇总所有尺度的特征切片
-            #             [level_feat[sample_idx] for level_feat in diff_detector_features])  # 逐层取出对应样本的特征张量
-            # else:  # 若返回单张量或空结构
-            #     primary_features = [diff_detector_features for _ in range(sample_count)]  # 为每个样本复制单尺度特征引用
-############################################                          
+# 修正特征维度对齐 (Sample-first) ########################################################                 
+            batch_size = len(batch_data_samples)
+            if isinstance(diff_feature, (list, tuple)):
+                primary_features = [
+                    [level_feat[i] for level_feat in diff_feature] 
+                    for i in range(batch_size)
+                ]
+            else:
+                primary_features = [
+                    [diff_feature[i]] 
+                    for i in range(batch_size)
+                ]
+########################################################################################   
             distill_feature = {  # 构造主教师输出结构
                 'main_teacher': primary_features,  # 主教师特征列表
                 'main_teacher_inv': teacher_inv_feature  # 中文注释：同步返回扩散教师缓存的域不变特征以供相似度门控使用
@@ -901,13 +924,14 @@ class SemiBaseDiffDetector(BaseDetector):
         """中文注释：联合推理与可训练教师前向以生成伪标签并返回可用于蒸馏的特征。"""
         pseudo_samples, batch_info, distill_feature = self._get_pseudo_instances_diff_inference(batch_inputs, batch_data_samples)  # 中文注释：先运行无梯度推理分支生成伪标签与基础特征
         if not self.trainable_diff_teacher_keys:  # 中文注释：若不存在可训练教师则直接返回推理结果
+            print('不存在可训练教师则直接返回推理结果')
             return pseudo_samples, batch_info, distill_feature  # 中文注释：无需附加信息时直接退出
-        sensor_map = distill_feature.get('sensor_map')  # 中文注释：尝试获取逐样本传感器标签用于匹配可训练教师
-        if sensor_map is None:  # 中文注释：当推理阶段未返回传感器映射时使用样本元信息兜底
-            sensor_map = [sample.metainfo.get('sensor') if hasattr(sample, 'metainfo') else None for sample in pseudo_samples]  # 中文注释：从数据样本元数据提取传感器标签
-        trainable_payload = self._forward_trainable_diff_teachers(batch_inputs, pseudo_samples, sensor_map, distill_feature)  # 中文注释：执行可训练教师的正常前向以获取带梯度的特征与预测
-        if trainable_payload:  # 中文注释：仅在存在可训练教师输出时才扩展特征字典
-            distill_feature['trainable_teachers'] = trainable_payload  # 中文注释：将可训练教师的详细输出写入特征包
+        # sensor_map = distill_feature.get('sensor_map')  # 中文注释：尝试获取逐样本传感器标签用于匹配可训练教师
+        # if sensor_map is None:  # 中文注释：当推理阶段未返回传感器映射时使用样本元信息兜底
+        #     sensor_map = [sample.metainfo.get('sensor') if hasattr(sample, 'metainfo') else None for sample in pseudo_samples]  # 中文注释：从数据样本元数据提取传感器标签
+        # trainable_payload = self._forward_trainable_diff_teachers(batch_inputs, pseudo_samples, sensor_map, distill_feature)  # 中文注释：执行可训练教师的正常前向以获取带梯度的特征与预测
+        # if trainable_payload:  # 中文注释：仅在存在可训练教师输出时才扩展特征字典
+        #     distill_feature['trainable_teachers'] = trainable_payload  # 中文注释：将可训练教师的详细输出写入特征包
         return pseudo_samples, batch_info, distill_feature  # 中文注释：返回融合后的伪标签、批信息与特征
 
     def _forward_trainable_diff_teachers(self,
@@ -1033,7 +1057,8 @@ class SemiBaseDiffDetector(BaseDetector):
                 - masks (Tensor): Has a shape (num_instances, H, W).
         """
         if self.semi_test_cfg.get('predict_on', 'teacher') == 'teacher':
-            return self.teacher(
+            # return self.teacher(
+            return self.diff_detector(
                 batch_inputs, batch_data_samples, mode='predict')
         elif self.semi_test_cfg.get('predict_on', 'teacher') == 'student':
             return self.student(
