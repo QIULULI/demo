@@ -28,10 +28,10 @@ ssdc_runtime_cfg = dict(  # 整理SS-DC运行期配置以匹配SSDCFasterRCNN签
     loss_couple=dict(type='LossCouple'),  # 设置耦合损失最小默认配置
     w_decouple=[(0, 0.1), (6000, 0.5)],  # 复制阶段性解耦权重调度
     # w_couple=[(2000, 0.2), (10000, 0.5)],  # 复制阶段性耦合权重调度
-    w_couple=[(0, 0.0), (4000, 0.01), (5000, 0.1), (12000, 0.5)],  # 修改耦合权重调度以适应烧入期
-    w_di_consistency=0.1,  # 设置域不变一致性损失权重
+    w_couple=[(0, 0.0), (4000, 0.01), (5000, 0.1), (12000, 0.2)],  # 修改耦合权重调度以适应烧入期
+    w_di_consistency=[(0, 0.0), (4000, 0.01), (5000, 0.1), (12000, 0.2)],  # 设置域不变一致性损失权重
     # consistency_gate=[(0, 0.3), (12000, 0.5)],  # 设置伪标签余弦门限调度
-    consistency_gate=[(0, -1.0), (4000, -1.0), (8000, 0.3)],
+    consistency_gate=[(0, -1.0), (4000, -1.0), (8000, 0.1), (15000, 0.3),(18000, 0.5)],  # 修改余弦门限调度以适应烧入期
     burn_in_iters=burn_ssdc,  # 默认无额外SS-DC烧入步保持向后兼容
     use_coupled_feature=True)  # 下游检测头使用耦合后的特征
 inner_det.update(  # 将内部检测器切换为支持SS-DC的实现
@@ -75,7 +75,7 @@ model = dict(  # 最外层模型封装
         ssdc_cfg=copy.deepcopy(ssdc_runtime_cfg),
         feature_loss_cfg=dict(  # 兼容原有特征蒸馏开关
             feature_loss_type='mse',  # 蒸馏类型
-            feature_loss_weight=1.0)))  # 蒸馏权重
+            feature_loss_weight=0.5)))  # 蒸馏权重
 
 # -------------------------------------------------------------------------
 # Stage-2 core refactor (IMPORTANT):
@@ -105,5 +105,5 @@ custom_hooks = [
     # ③ 可选：保持你项目里原本的导出逻辑
     dict(type='StudentToTeacherExportHook'),
 ]
-work_dir = 'work_dirs/stage2-1219'  # 设置工作目录以满足Stage-1融合教师导出规范并确保权重保存路径统一
+work_dir = 'work_dirs/stage2-1220'  # 设置工作目录以满足Stage-1融合教师导出规范并确保权重保存路径统一
 __all__ = ['_base_', 'model', 'custom_hooks']  # 导出自定义钩子以覆盖base schedule的默认hook
