@@ -73,8 +73,10 @@ class SemiBaseDiffDetector(BaseDetector):
                 teacher_model_cfg = teacher_config_obj['model']  # 提取模型结构配置
             elif isinstance(raw_config_entry, dict) and 'model' in raw_config_entry:  # 若原始配置直接给出模型字段
                 teacher_model_cfg = raw_config_entry['model']  # 直接使用内嵌模型配置
+                print('若原始配置直接给出模型字段')
             else:  # 当未提供专用配置时回退到学生检测器结构
                 teacher_model_cfg = detector.deepcopy()  # 复制学生模型配置以保持一致结构
+                print('当未提供专用配置时回退到学生检测器结构')
             teacher_instance = MODELS.build(copy.deepcopy(teacher_model_cfg))  # 根据模型配置构建扩散教师实例
             pretrained_path = teacher_meta.get('pretrained_model')  # 读取预训练权重路径
             if pretrained_path:  # 若存在对应权重
@@ -124,6 +126,96 @@ class SemiBaseDiffDetector(BaseDetector):
         self.semi_test_cfg = semi_test_cfg
         if self.semi_train_cfg.get('freeze_teacher', True) is True:
             self.freeze(self.teacher)
+        self._debug_compare_heads()
+
+    def _debug_compare_heads(self):
+        print("\n" + "="*25 + " [HEAD 结构一致性校验 (增强版)] " + "="*25)
+        
+        # 定义要检查的组件
+        modules_to_check = ['rpn_head', 'roi_head']
+        
+        student = self.student
+        # 根据配置可能是 diff_detector 或 diff_detectors
+        teacher = getattr(self, 'diff_detector', None)
+        
+        if teacher is None:
+            print("   [ERROR] 找不到 self.diff_detector，跳过检查。")
+            return
+
+        is_all_match = True
+
+        for mod_name in modules_to_check:
+            print(f"\n>> 正在检查模块: {mod_name}")
+            
+            # --- 1. 智能查找 Student 模块 ---
+            s_mod = getattr(student, mod_name, None)
+            if s_mod is None:
+                print(f"   [ERROR] Student 缺失 {mod_name}")
+                is_all_match = False
+                continue
+            else:
+                print(f"   [INFO] Student: 找到模块 (位置: self.student.{mod_name})")
+
+            # --- 2. 智能查找 Teacher 模块 (关键修改) ---
+            t_mod = None
+            t_loc_str = ""
+            
+            # 路径A: 直接在根目录找
+            if hasattr(teacher, mod_name):
+                t_mod = getattr(teacher, mod_name)
+                t_loc_str = f"self.diff_detector.{mod_name}"
+            # 路径B: 在 student_rgb 里找 (针对你的模型结构)
+            elif hasattr(teacher, 'student_rgb') and hasattr(teacher.student_rgb, mod_name):
+                t_mod = getattr(teacher.student_rgb, mod_name)
+                t_loc_str = f"self.diff_detector.student_rgb.{mod_name}"
+            
+            if t_mod is None:
+                print(f"   [ERROR] Teacher 缺失 {mod_name}")
+                print(f"           (已检查路径: self.diff_detector.{mod_name} 和 .student_rgb.{mod_name})")
+                is_all_match = False
+                continue
+            else:
+                print(f"   [INFO] Teacher: 找到模块 (位置: {t_loc_str})")
+
+            # --- 3. 获取 state_dict 进行比对 ---
+            s_dict = s_mod.state_dict()
+            t_dict = t_mod.state_dict()
+            
+            s_keys = set(s_dict.keys())
+            t_keys = set(t_dict.keys())
+            
+            # --- 4. 检查参数名 ---
+            if s_keys != t_keys:
+                print(f"   [FAIL] 参数名称不匹配!")
+                missing_in_t = list(s_keys - t_keys)
+                missing_in_s = list(t_keys - s_keys)
+                if missing_in_t: print(f"          Teacher 缺少的 Key: {missing_in_t[:3]} ...")
+                if missing_in_s: print(f"          Student 缺少的 Key: {missing_in_s[:3]} ...")
+                is_all_match = False
+            else:
+                print(f"   [PASS] 参数 Key 名称完全一致 ({len(s_keys)} keys)")
+
+            # --- 5. 检查参数 Shape ---
+            shape_mismatch = False
+            for key in s_keys:
+                if key in t_dict:
+                    s_shape = s_dict[key].shape
+                    t_shape = t_dict[key].shape
+                    if s_shape != t_shape:
+                        print(f"   [FAIL] 形状不匹配: {key}")
+                        print(f"          Student: {s_shape} vs Teacher: {t_shape}")
+                        shape_mismatch = True
+                        is_all_match = False
+            
+            if not shape_mismatch:
+                print(f"   [PASS] 所有参数形状 (Shape) 完全一致")
+
+        print("\n" + "="*70)
+        if is_all_match:
+            print(">>> ✅ 结论: Student 和 Teacher 结构完全兼容！(EMA路径已确认)")
+        else:
+            print(">>> ❌ 结论: 仍存在结构差异，请修复模型定义或跳过不匹配的层。")
+        print("="*70 + "\n")
 
     @staticmethod
     def freeze(model: nn.Module):
@@ -377,6 +469,54 @@ class SemiBaseDiffDetector(BaseDetector):
         Returns:
             dict: A dictionary of loss components
         """
+# ================= [DEBUG START] =================
+        # 这是一个临时调试插桩，用于定位 pseudo box 是否被全清空
+        try:
+            # 1. 获取当前 iter (如果 self.local_iter 不存在，就用内部计数器)
+            if not hasattr(self, '_debug_log_cnt'):
+                self._debug_log_cnt = 0
+            self._debug_log_cnt += 1
+            
+            # 2. 每 50 iter 打印一次，避免刷屏
+            if self._debug_log_cnt % 50 == 0:
+                import torch
+                
+                # 收集所有图片的 scores
+                all_scores = []
+                total_pre_boxes = 0
+                
+                for data_sample in batch_data_samples:
+                    if hasattr(data_sample, 'gt_instances') and hasattr(data_sample.gt_instances, 'scores'):
+                        scores = data_sample.gt_instances.scores
+                        all_scores.append(scores)
+                        total_pre_boxes += len(scores)
+                
+                # 拼接 scores 以便统计
+                if len(all_scores) > 0:
+                    flat_scores = torch.cat(all_scores)
+                    max_score = flat_scores.max().item() if len(flat_scores) > 0 else 0.0
+                    mean_score = flat_scores.mean().item() if len(flat_scores) > 0 else 0.0
+                else:
+                    flat_scores = torch.tensor([])
+                    max_score = 0.0
+                    mean_score = 0.0
+
+                # 获取当前的过滤阈值
+                current_thr = self.semi_train_cfg.get('cls_pseudo_thr', 0.2)
+                
+                # 模拟计算过滤后的数量
+                post_filter_count = (flat_scores > current_thr).sum().item() if len(flat_scores) > 0 else 0
+                
+                print(f"\n[DEBUG-Pseudo] Iter: {self._debug_log_cnt} | "
+                      f"Thr: {current_thr} | "
+                      f"Pre-Filter Boxes: {total_pre_boxes} -> Post-Filter Boxes: {post_filter_count} | "
+                      f"Max Score: {max_score:.4f} | Mean Score: {mean_score:.4f}")
+                
+                if post_filter_count == 0 and total_pre_boxes > 0:
+                    print(f"[DEBUG-WARNING] ！！！所有伪标签都被阈值 {current_thr} 过滤掉了！！！")
+        except Exception as e:
+            print(f"[DEBUG-ERROR] 统计代码出错: {e}")
+        # ================= [DEBUG END] =================
         batch_data_samples = filter_gt_instances(
             batch_data_samples, score_thr=self.semi_train_cfg.cls_pseudo_thr)
         losses = self._call_student_loss(batch_inputs, batch_data_samples, current_iter=current_iter)  # 中文注释：通过统一入口确保current_iter被安全透传
@@ -859,6 +999,7 @@ class SemiBaseDiffDetector(BaseDetector):
                     max_iou, matched_peer_indices = overlaps.max(dim=1)  # 中文注释：为每个主教师候选框选取IoU最高的同伴候选框
                     if self.cross_consistency_iou_thr > 0:  # 中文注释：当设定了IoU阈值时依据该阈值过滤弱匹配
                         valid_mask = max_iou >= self.cross_consistency_iou_thr  # 中文注释：仅保留满足IoU门槛的匹配结果
+                        print('当设定了IoU阈值时依据该阈值过滤弱匹配')
                     else:
                         valid_mask = torch.ones_like(max_iou, dtype=torch.bool)  # 中文注释：未设置阈值时默认全部匹配有效
                     if valid_mask.sum() == 0:  # 中文注释：若没有匹配通过阈值则无法继续计算
@@ -924,7 +1065,7 @@ class SemiBaseDiffDetector(BaseDetector):
         """中文注释：联合推理与可训练教师前向以生成伪标签并返回可用于蒸馏的特征。"""
         pseudo_samples, batch_info, distill_feature = self._get_pseudo_instances_diff_inference(batch_inputs, batch_data_samples)  # 中文注释：先运行无梯度推理分支生成伪标签与基础特征
         if not self.trainable_diff_teacher_keys:  # 中文注释：若不存在可训练教师则直接返回推理结果
-            print('不存在可训练教师则直接返回推理结果')
+            # print('不存在可训练教师则直接返回推理结果')
             return pseudo_samples, batch_info, distill_feature  # 中文注释：无需附加信息时直接退出
         # sensor_map = distill_feature.get('sensor_map')  # 中文注释：尝试获取逐样本传感器标签用于匹配可训练教师
         # if sensor_map is None:  # 中文注释：当推理阶段未返回传感器映射时使用样本元信息兜底
@@ -1057,8 +1198,8 @@ class SemiBaseDiffDetector(BaseDetector):
                 - masks (Tensor): Has a shape (num_instances, H, W).
         """
         if self.semi_test_cfg.get('predict_on', 'teacher') == 'teacher':
-            # return self.teacher(
-            return self.diff_detector(
+            return self.teacher(
+            # return self.diff_detector(
                 batch_inputs, batch_data_samples, mode='predict')
         elif self.semi_test_cfg.get('predict_on', 'teacher') == 'student':
             return self.student(

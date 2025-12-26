@@ -24,7 +24,7 @@ model = dict(
         freeze_teacher=True, #try False
         sup_weight=1.0,
         unsup_weight=1.0,
-        cls_pseudo_thr=0.2, #try 0.3
+        cls_pseudo_thr=0.4, #try 0.3
         min_pseudo_bbox_wh=(1e-2, 1e-2)),
     semi_test_cfg=dict(predict_on='teacher'), #try student
 

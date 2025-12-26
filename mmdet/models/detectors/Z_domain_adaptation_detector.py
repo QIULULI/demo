@@ -526,6 +526,7 @@ class DomainAdaptationDetector(BaseDetector):
         inv_cache = detector.ssdc_feature_cache.get('noref', None)  # 优先读取无参考分支缓存
         if inv_cache is None:  # 若无参考缓存为空则尝试读取参考分支
             inv_cache = detector.ssdc_feature_cache.get('ref', None)  # 回退到参考分支
+            print('当若无参考缓存为空则尝试读取参考分支，回退到参考分支')
         if inv_cache is None:  # 依然缺失时返回None
             return None  # 无法提供域不变特征
         inv_feature = inv_cache.get('inv', None)  # 提取域不变特征列表
@@ -653,11 +654,13 @@ class DomainAdaptationDetector(BaseDetector):
         student_cache = student_detector.ssdc_feature_cache.get('noref', None)  # 读取学生的无参考分支缓存
         if student_cache is None:  # 若无参考缓存缺失则尝试回退到参考分支
             student_cache = student_detector.ssdc_feature_cache.get('ref', None)  # 使用参考分支缓存避免空指针
+            print('当学生无参考缓存为空时则尝试回退到参考分支')
         teacher_cache = None  # 初始化教师缓存占位符
         if teacher_detector is not None and hasattr(teacher_detector, 'ssdc_feature_cache'):  # 若教师具备缓存则读取
             teacher_cache = teacher_detector.ssdc_feature_cache.get('noref', None)  # 优先读取教师无参考分支缓存
             if teacher_cache is None:  # 当教师无参考缓存为空时回退到参考分支
                 teacher_cache = teacher_detector.ssdc_feature_cache.get('ref', None)  # 尝试使用参考分支的缓存特征
+                print('当教师无参考缓存为空时回退到参考分支')
         teacher_cache_override = self._build_teacher_cache_override()  # 若扩散教师已提供域不变特征则构造伪教师缓存供耦合与一致性损失复用
         w_decouple = self._interp_schedule(self.ssdc_cfg.get('w_decouple', 0.0), current_iter, 0.0)  # 插值获得解耦损失权重
         w_couple = self._interp_schedule(self.ssdc_cfg.get('w_couple', 0.0), current_iter, 0.0)  # 插值获得耦合损失权重
@@ -738,6 +741,7 @@ class DomainAdaptationDetector(BaseDetector):
             candidate_inv = diff_feature.get('main_teacher_inv')  # 主教师域不变特征存放在main_teacher_inv键下
         if candidate_inv is None and isinstance(self.ssdc_cfg, dict):  # 若扩散教师未返回则回退到SS-DC配置查找
             candidate_inv = self.ssdc_cfg.get('main_teacher_inv')  # 允许外部组件通过配置直接写入域不变特征
+            print('若扩散教师未返回则回退到SS-DC配置查找')
         self._cached_main_teacher_inv = self._sanitize_teacher_inv(candidate_inv)  # 对候选特征执行detach并缓存
 
     @staticmethod
